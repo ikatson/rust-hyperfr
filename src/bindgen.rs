@@ -2,10 +2,8 @@
 
 use objc::*;
 
-use objc;
 #[allow(non_camel_case_types)]
 pub type id = *mut objc::runtime::Object;
-use block;
 pub const true_: u32 = 1;
 pub const false_: u32 = 0;
 pub const __bool_true_false_are_defined: u32 = 1;
@@ -929,7 +927,7 @@ pub type intmax_t = ::std::os::raw::c_long;
 pub type uintmax_t = ::std::os::raw::c_ulong;
 pub type os_function_t =
     ::std::option::Option<unsafe extern "C" fn(arg1: *mut ::std::os::raw::c_void)>;
-pub type os_block_t = _bindgen_ty_id_6015;
+pub type os_block_t = *mut ::std::os::raw::c_void;
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct _OSUnalignedU16 {
@@ -1127,7 +1125,7 @@ pub struct objc_class {
     _unused: [u8; 0],
 }
 #[repr(transparent)]
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug)]
 pub struct Class(pub id);
 impl std::ops::Deref for Class {
     type Target = objc::runtime::Object;
@@ -1319,11 +1317,11 @@ pub trait PNSObject: Sized + std::ops::Deref {
     {
         msg_send!(*self, isMemberOfClass: aClass)
     }
-    unsafe fn conformsToProtocol_(&self, aProtocol: aProtocol) -> BOOL
+    unsafe fn conformsToProtocol_(&self, proto: aProtocol) -> BOOL
     where
         <Self as std::ops::Deref>::Target: objc::Message + Sized,
     {
-        msg_send!(*self, conformsToProtocol: aProtocol)
+        msg_send!(*self, conformsToProtocol: proto)
     }
     unsafe fn respondsToSelector_(&self, aSelector: objc::runtime::Sel) -> BOOL
     where
@@ -2319,7 +2317,6 @@ extern "C" {
     pub fn hv_vm_protect(ipa: hv_ipa_t, size: size_t, flags: hv_memory_flags_t) -> hv_return_t;
 }
 pub type __builtin_va_list = *mut ::std::os::raw::c_char;
-pub type _bindgen_ty_id_6015 = *const ::block::Block<(), ()>;
 pub type instancetype = id;
 #[repr(transparent)]
 #[derive(Clone)]
