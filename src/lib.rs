@@ -1,7 +1,7 @@
-use std::{convert::TryFrom, thread::JoinHandle};
+use std::{convert::{TryFrom, TryInto}, thread::JoinHandle};
 use address::{Address, Addresses};
 use anyhow::{anyhow, bail};
-use bindgen::NSObject;
+use bindgen::{NSObject, hv_exit_reason_t};
 use bitflags::bitflags;
 
 #[allow(
@@ -101,7 +101,7 @@ impl HfVm {
     }
 
     pub fn vcpu_create_and_run<F>(&mut self, callback: F) -> JoinHandle::<anyhow::Result<()>>
-        where F: FnMut(anyhow::Result<&bindgen::hv_vcpu_exit_t>) -> anyhow::Result<()> + Send + 'static
+        where F: FnMut(anyhow::Result<HfVcpuExit>) -> anyhow::Result<()> + Send + 'static
     {
         // let (tx, rx) = std::sync::mpsc::sync_channel(0);
         let join = std::thread::spawn(move || {
@@ -118,6 +118,45 @@ pub struct VCpu {
     exit_t: *mut bindgen::hv_vcpu_exit_t,
 }
 
+#[derive(Debug)]
+pub enum HvExitReason {
+    HV_EXIT_REASON_CANCELED,
+    HV_EXIT_REASON_EXCEPTION,
+    HV_EXIT_REASON_VTIMER_ACTIVATED,
+    HV_EXIT_REASON_UNKNOWN,
+}
+
+impl TryFrom<bindgen::hv_exit_reason_t> for HvExitReason {
+    type Error = hv_exit_reason_t;
+
+    fn try_from(value: bindgen::hv_exit_reason_t) -> Result<Self, Self::Error> {
+        use HvExitReason::*;
+        let ok = match value {
+            bindgen::hv_exit_reason_t_HV_EXIT_REASON_CANCELED => HV_EXIT_REASON_CANCELED,
+            bindgen::hv_exit_reason_t_HV_EXIT_REASON_EXCEPTION => HV_EXIT_REASON_EXCEPTION,
+            bindgen::hv_exit_reason_t_HV_EXIT_REASON_VTIMER_ACTIVATED => HV_EXIT_REASON_VTIMER_ACTIVATED,
+            bindgen::hv_exit_reason_t_HV_EXIT_REASON_UNKNOWN => HV_EXIT_REASON_UNKNOWN,
+            v => return Err(v)
+        };
+        Ok(ok)
+    }
+}
+
+#[derive(Debug)]
+pub struct HfVcpuExit {
+    pub reason: HvExitReason,
+    pub exception: bindgen::hv_vcpu_exit_exception_t,
+}
+
+impl From<&bindgen::hv_vcpu_exit_t> for HfVcpuExit {
+    fn from(v: &bindgen::hv_vcpu_exit_t) -> Self {
+        Self{
+            reason: v.reason.try_into().unwrap(),
+            exception: v.exception
+        }
+    }
+}
+
 impl VCpu {
     fn new() -> anyhow::Result<Self> {
         let mut vcpu = Self {
@@ -131,13 +170,13 @@ impl VCpu {
             err => bail!("hv_vcpu_create() returned {:?}", err)
         }
     }
-    fn exit_t(&self) -> Option<&bindgen::hv_vcpu_exit_t> {
+    fn exit_t(&self) -> Option<HfVcpuExit> {
         unsafe {
-            self.exit_t.as_ref()
+            self.exit_t.as_ref().map(|v| v.into())
         }
     }
     fn simple_run_loop<F>(self, mut callback: F) -> anyhow::Result<()>
-        where F: FnMut(anyhow::Result<&bindgen::hv_vcpu_exit_t>) -> anyhow::Result<()>
+        where F: FnMut(anyhow::Result<HfVcpuExit>) -> anyhow::Result<()>
     {
         loop {
             let result = unsafe {bindgen::hv_vcpu_run(self.id)};
