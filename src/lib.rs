@@ -1,4 +1,4 @@
-use std::convert::TryFrom;
+use std::{convert::TryFrom, thread::JoinHandle};
 use address::{Address, Addresses};
 use anyhow::{anyhow, bail};
 use bindgen::NSObject;
@@ -97,6 +97,62 @@ impl HfVm {
         match ret {
             HVReturnT::HV_SUCCESS => Ok(()),
             err => bail!("hv_vm_map() returned {:?}", err)
+        }
+    }
+
+    pub fn vcpu_create_and_run<F>(&mut self, callback: F) -> JoinHandle::<anyhow::Result<()>>
+        where F: FnMut(anyhow::Result<&bindgen::hv_vcpu_exit_t>) -> anyhow::Result<()> + Send + 'static
+    {
+        // let (tx, rx) = std::sync::mpsc::sync_channel(0);
+        let join = std::thread::spawn(move || {
+            let vcpu = VCpu::new().unwrap();
+            vcpu.simple_run_loop(callback)
+        });
+        join
+    }
+}
+
+#[derive(Debug)]
+pub struct VCpu {
+    id: u64,
+    exit_t: *mut bindgen::hv_vcpu_exit_t,
+}
+
+impl VCpu {
+    fn new() -> anyhow::Result<Self> {
+        let mut vcpu = Self {
+            id: 0,
+            exit_t: core::ptr::null_mut(),
+        };
+        let result = unsafe {bindgen::hv_vcpu_create(&mut vcpu.id, &mut vcpu.exit_t, null_obj())};
+        let ret = HVReturnT::try_from(result).map_err(|e| anyhow!("unexpected hv_return_t value {:#x} from hv_vcpu_create", e as usize))?;
+        match ret {
+            HVReturnT::HV_SUCCESS => Ok(vcpu),
+            err => bail!("hv_vcpu_create() returned {:?}", err)
+        }
+    }
+    fn exit_t(&self) -> Option<&bindgen::hv_vcpu_exit_t> {
+        unsafe {
+            self.exit_t.as_ref()
+        }
+    }
+    fn simple_run_loop<F>(self, mut callback: F) -> anyhow::Result<()>
+        where F: FnMut(anyhow::Result<&bindgen::hv_vcpu_exit_t>) -> anyhow::Result<()>
+    {
+        loop {
+            let result = unsafe {bindgen::hv_vcpu_run(self.id)};
+            let ret = HVReturnT::try_from(result).map_err(|e| anyhow!("unexpected hv_return_t value {:#x} from hv_vcpu_run", e as usize))?;
+            match ret {
+                HVReturnT::HV_SUCCESS => {
+                    callback(Ok(self.exit_t().unwrap())).unwrap();
+                },
+                err => {
+                    let err1 = anyhow!("hv_vcpu_create() returned {:?}", err);
+                    let err2 = anyhow!("hv_vcpu_create() returned {:?}", err);
+                    callback(Err(err1)).unwrap();
+                    return Err(err2);
+                }
+            }
         }
     }
 }

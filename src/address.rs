@@ -1,3 +1,5 @@
+use std::ops::Add;
+
 fn get_page_size() -> usize {
     let page = unsafe {libc::sysconf(libc::_SC_PAGESIZE)};
     page as usize
@@ -38,6 +40,13 @@ impl Addresses {
         } else {
             addr
         }
+    }
+
+    pub fn next_aligned(&self, address: Address) -> Address {
+        if self.is_aligned(address) {
+            return address
+        }
+        self.align(Address(address.0 + self.page_size))
     }
 
     pub fn align(&self, address: Address) -> Address {
