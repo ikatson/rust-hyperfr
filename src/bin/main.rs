@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::Read;
 
-use hyperfr::{address::Addresses, address::Address, HvMemoryFlags, bindgen as b};
+use hyperfr::{address::Address, address::Addresses, bindgen as b, HvMemoryFlags};
 use memmap::MmapOptions;
 
 fn main() {
@@ -12,7 +12,9 @@ fn main() {
 
     let addresses = Addresses::new();
     let file_len = file.metadata().unwrap().len() as usize;
-    let aligned_len = addresses.next_aligned(Address::new_from_usize(file_len)).as_usize();
+    let aligned_len = addresses
+        .next_aligned(Address::new_from_usize(file_len))
+        .as_usize();
 
     let mut map = MmapOptions::new().len(aligned_len).map_anon().unwrap();
     file.read_exact(&mut map.as_mut()[..file_len]).unwrap();
@@ -22,7 +24,13 @@ fn main() {
 
     let guest_addr = 0x8000;
 
-    vm.map_memory(host_addr, Address::new_from_usize(guest_addr), map.len(), HvMemoryFlags::ALL).unwrap();
+    vm.map_memory(
+        host_addr,
+        Address::new_from_usize(guest_addr),
+        map.len(),
+        HvMemoryFlags::ALL,
+    )
+    .unwrap();
 
     let vcpu = vm.vcpu_create_and_run(|res| {
         dbg!(res);
