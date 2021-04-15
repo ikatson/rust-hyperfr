@@ -1,4 +1,4 @@
-use std::{convert::{TryFrom, TryInto}, thread::JoinHandle};
+use std::{convert::{TryFrom, TryInto}, ops::Add, thread::JoinHandle};
 use address::{Address, Addresses};
 use anyhow::{anyhow, bail};
 use bindgen::{NSObject, hv_exit_reason_t};
@@ -106,7 +106,10 @@ impl HfVm {
         // let (tx, rx) = std::sync::mpsc::sync_channel(0);
         let join = std::thread::spawn(move || {
             let vcpu = VCpu::new().unwrap();
-            vcpu.simple_run_loop(callback)
+            let start_state = VcpuStartState{
+                guest_pc: Address::new_from_usize(0x0000120 + 0x8000),
+            };
+            vcpu.simple_run_loop(start_state, callback)
         });
         join
     }
@@ -159,6 +162,10 @@ impl From<&bindgen::hv_vcpu_exit_t> for HfVcpuExit {
     }
 }
 
+struct VcpuStartState {
+    guest_pc: Address,
+}
+
 impl VCpu {
     fn new() -> anyhow::Result<Self> {
         let mut vcpu = Self {
@@ -177,9 +184,16 @@ impl VCpu {
             self.exit_t.as_ref().map(|v| v.into())
         }
     }
-    fn simple_run_loop<F>(self, mut callback: F) -> anyhow::Result<()>
+    fn simple_run_loop<F>(self, start_state: VcpuStartState, mut callback: F) -> anyhow::Result<()>
         where F: FnMut(anyhow::Result<HfVcpuExit>) -> anyhow::Result<()>
     {
+        let result = unsafe {bindgen::hv_vcpu_set_reg(self.id, bindgen::hv_reg_t_HV_REG_PC, start_state.guest_pc.as_usize() as u64)};
+        let ret = HVReturnT::try_from(result).map_err(|e| anyhow!("unexpected hv_return_t value {:#x} from hv_vcpu_set_reg", e as usize))?;
+        match ret {
+            HVReturnT::HV_SUCCESS => {},
+            err => bail!("hv_vcpu_set_reg() returned {:?}", err)
+        };
+
         loop {
             let result = unsafe {bindgen::hv_vcpu_run(self.id)};
             let ret = HVReturnT::try_from(result).map_err(|e| anyhow!("unexpected hv_return_t value {:#x} from hv_vcpu_run", e as usize))?;
