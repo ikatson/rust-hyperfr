@@ -146,13 +146,15 @@ impl TryFrom<bindgen::hv_exit_reason_t> for HvExitReason {
 pub struct HfVcpuExit {
     pub reason: HvExitReason,
     pub exception: bindgen::hv_vcpu_exit_exception_t,
+    pub decoded_syndrome: Syndrome,
 }
 
 impl From<&bindgen::hv_vcpu_exit_t> for HfVcpuExit {
     fn from(v: &bindgen::hv_vcpu_exit_t) -> Self {
         Self{
             reason: v.reason.try_into().unwrap(),
-            exception: v.exception
+            exception: v.exception,
+            decoded_syndrome: Syndrome::from(v.exception.syndrome)
         }
     }
 }
@@ -192,6 +194,27 @@ impl VCpu {
                     return Err(err2);
                 }
             }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Syndrome {
+    exception_class: u8,
+    is_32_bit_instruction: bool,
+    iss: u32,
+}
+
+impl From<bindgen::hv_exception_syndrome_t> for Syndrome {
+    fn from(s: bindgen::hv_exception_syndrome_t) -> Self {
+        let s = s as u32;
+        let eclass = (s >> 26) as u8;
+        let is_32_bit = (s >> 25) & 1 == 1;
+        let iss = s & 0xffffff;
+        Self{
+            exception_class: eclass,
+            is_32_bit_instruction: is_32_bit,
+            iss,
         }
     }
 }
