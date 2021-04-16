@@ -252,7 +252,17 @@ impl VCpu {
         )
         .context("failed setting initial program counter")?;
 
+        // Copy paste, no clue yet what it does
+        const PSR_MODE_EL1H: u64 = 0x0000_0005;
+        const PSR_F_BIT: u64 = 0x0000_0040;
+        const PSR_I_BIT: u64 = 0x0000_0080;
+        const PSR_A_BIT: u64 = 0x0000_0100;
+        const PSR_D_BIT: u64 = 0x0000_0200;
+        const PSTATE_FAULT_BITS_64: u64 = PSR_MODE_EL1H | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
+        self.set_reg(bindgen::hv_reg_t_HV_REG_CPSR, PSTATE_FAULT_BITS_64).unwrap();
+
         loop {
+            dbg!(self.get_reg(bindgen::hv_reg_t_HV_REG_PC));
             let result = unsafe { bindgen::hv_vcpu_run(self.id) };
             let ret = HVReturnT::try_from(result).map_err(|e| {
                 anyhow!(
