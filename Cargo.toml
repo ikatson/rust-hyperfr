@@ -13,3 +13,6 @@ anyhow = "1"
 libc = "0.2"
 bitflags = "1"
 memmap = "0.7"
+object = "*"
+hexdump = "*"
+vm-memory = {version = "*", features = ["backend-mmap"]}

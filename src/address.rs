@@ -47,11 +47,24 @@ impl Addresses {
         self.align(Address(address.0 + self.page_size))
     }
 
-    pub fn align(&self, address: Address) -> Address {
+    pub fn align<T: Into<Address>>(&self, address: T) -> Address {
+        let address = address.into();
         Address(address.0 & !(self.page_size - 1))
     }
 
-    pub fn is_aligned(&self, address: Address) -> bool {
+    pub fn align_up<T: Into<Address>>(&self, address: T) -> Address {
+        let address = address.into();
+        let aligned_down = address.0 & !(self.page_size - 1);
+        let addr = if aligned_down != address.0 {
+            aligned_down + self.page_size
+        } else {
+            address.0
+        };
+        Address(addr)
+    }
+
+    pub fn is_aligned<T: Into<Address>>(&self, address: T) -> bool {
+        let address = address.into();
         self.align(address) == address
     }
 }
@@ -77,6 +90,18 @@ impl Address {
 impl<T> From<*const T> for Address {
     fn from(ptr: *const T) -> Self {
         Self(ptr as usize)
+    }
+}
+
+impl From<usize> for Address {
+    fn from(addr: usize) -> Self {
+        Self(addr)
+    }
+}
+
+impl From<u64> for Address {
+    fn from(addr: u64) -> Self {
+        Self(addr as usize)
     }
 }
 
