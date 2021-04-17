@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::Read;
 
-use hyperfr::{address::Address, address::Addresses, bindgen as b, HvMemoryFlags};
+use hyperfr::{bindgen as b, HvMemoryFlags};
 use memmap::MmapOptions;
 
 pub const DRAM_MEM_START: usize = 0x8000_0000; // 2 GB.
@@ -15,26 +15,14 @@ fn main() {
     let mut args = std::env::args_os();
     let image = args.nth(1).unwrap();
 
-    let addresses = Addresses::new();
-    // 128 MiB
-    let mut map = MmapOptions::new().len(MEM_SIZE).map_anon().unwrap();
+    let elf = vm.load_elf(&image).unwrap();
 
-    vm.map_memory(
-        Address::from(map.as_ptr()),
-        Address::new_from_usize(DRAM_MEM_START),
-        map.len(),
-        HvMemoryFlags::ALL,
-    )
-    .unwrap();
-
-    let elf = vm.load_elf(&image, addresses, EXEC_START).unwrap();
-
-    let vcpu = vm.vcpu_create_and_run(elf.entrypoint.into(), move |res| {
+    let vcpu = vm.vcpu_create_and_run(elf.entrypoint, move |res| {
         println!("{:#x?}", res);
-        let stack_end = 1024 * 1024usize;
-        let stack_start = stack_end - 80;
-        let stack = &map[stack_start..stack_end];
-        hexdump::hexdump(stack);
+        // let stack_end = 1024 * 1024usize;
+        // let stack_start = stack_end - 80;
+        // let stack = &map[stack_start..stack_end];
+        // hexdump::hexdump(stack);
         Ok(())
     });
     vcpu.join().unwrap();

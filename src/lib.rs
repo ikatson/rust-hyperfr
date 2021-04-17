@@ -1,15 +1,34 @@
-use address::{Address, Addresses};
 use anyhow::{anyhow, bail, Context};
 use bindgen::{hv_exit_reason_t, NSObject};
 use bitflags::bitflags;
+use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress};
 use std::{convert::{TryFrom, TryInto}, ops::Add, path::Path, thread::JoinHandle};
 use std::io::Write;
 
-mod page_table;
+// mod page_table;
 
-pub const DRAM_MEM_START: usize = 0x8000_0000; // 2 GB.
+pub fn get_page_size() -> u64 {
+    let page_size = unsafe {libc::sysconf(libc::_SC_PAGE_SIZE)} as u64;
+    page_size
+}
 
-pub mod address;
+pub fn is_aligned_to_page_size(value: u64) -> bool {
+    align_down_to_page_size(value) == value
+}
+
+pub fn align_down_to_page_size(value: u64) -> u64 {
+    value & !(get_page_size() - 1)
+}
+
+pub fn align_up_to_page_size(value: u64) -> u64 {
+    let aligned_down = align_down_to_page_size(value);
+    if aligned_down != value {
+        aligned_down + get_page_size()
+    } else {
+        value
+    }
+}
+
 #[allow(
     dead_code,
     unused_imports,
@@ -61,13 +80,22 @@ impl TryFrom<bindgen::hv_return_t> for HVReturnT {
     }
 }
 
-pub struct HfVm {}
+pub struct HfVm {
+    memory: GuestMemoryMmap
+}
 
 #[derive(Default)]
 pub struct LoadedElf {
-    pub entrypoint: usize,
-    maps: Vec<memmap::MmapMut>,
+    pub entrypoint: GuestAddress,
 }
+
+pub const DRAM_MEM_START: usize = 0x8000_0000; // 2 GB.
+// This is bad, but seems to fuck up without a page table if set to higher, as the executable is not a PIE one.
+pub const EXEC_START: usize = 0x2000_0000; // 512 MB,
+pub const EXEC_MEM_SIZE: usize = 16 * 1024 * 1024;
+
+// this could be configurable, it's just that we don't care yet.
+pub const MEMORY_SIZE: usize = 32 * 1024 * 1024;
 
 impl HfVm {
     pub fn new() -> anyhow::Result<Self> {
@@ -79,37 +107,50 @@ impl HfVm {
             )
         })?;
         match res {
-            HVReturnT::HV_SUCCESS => Ok(Self {}),
+            HVReturnT::HV_SUCCESS => {
+                let memory = GuestMemoryMmap::from_ranges(&[
+                    (GuestAddress(EXEC_START as u64), EXEC_MEM_SIZE),
+                    (GuestAddress(DRAM_MEM_START as u64), MEMORY_SIZE)
+                ])?;
+                let vm = Self {
+                    memory,
+                };
+                vm.memory.with_regions(|_, region| -> anyhow::Result<()> {
+                    dbg!(&region);
+                    let host_addr = region.get_host_address(MemoryRegionAddress(0))?;
+                    vm.map_memory(host_addr, region.start_addr(), region.size(), HvMemoryFlags::ALL)?;
+                    Ok(())
+                })?;
+                Ok(vm)
+            },
             err => bail!("hv_vm_create() returned {:?}", err),
         }
     }
 
-    pub fn map_memory(
+    fn map_memory(
         // void *addr, hv_ipa_t ipa, size_t size, hv_memory_flags_t flags
-        &mut self,
-        addr: Address,
-        ipa: Address,
+        &self,
+        addr: *mut u8,
+        ipa: GuestAddress,
         size: usize,
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
-        dbg!(addr, ipa, size, flags);
-        let addrs = Addresses::default();
-        if !addrs.is_aligned(addr) {
-            bail!("addr is not aligned to page size")
+        if !is_aligned_to_page_size(addr as u64) {
+            bail!("addr {:x} is not aligned to page size", addr as u64)
         }
-        if !addrs.is_aligned(ipa) {
-            bail!("ipa is not aligned to page size")
+        if !is_aligned_to_page_size(ipa.0) {
+            bail!("ipa {:x} is not aligned to page size", ipa.0)
         }
-        if !addrs.is_aligned(Address::new_from_usize(size)) {
-            bail!("size is not a multiple of page size")
+        if !is_aligned_to_page_size(size as u64) {
+            bail!("size {:x} is not a multiple of page size", size)
         }
 
         // hv_return_t hv_vm_map(void *addr, hv_ipa_t ipa, size_t size, hv_memory_flags_t flags);
         // bindgen::hv_vm_map(addr, ipa, size, flags)
         let result = unsafe {
             bindgen::hv_vm_map(
-                addr.as_usize() as *mut _,
-                ipa.as_usize() as u64,
+                addr as *mut _,
+                ipa.0,
                 size as u64,
                 flags.bits() as u64,
             )
@@ -126,7 +167,7 @@ impl HfVm {
         }
     }
 
-    pub fn load_elf<P: AsRef<Path>>(&mut self, filename: P, addresses: Addresses, offset: usize) -> anyhow::Result<LoadedElf> {
+    pub fn load_elf<P: AsRef<Path>>(&mut self, filename: P) -> anyhow::Result<LoadedElf> {
         let file = std::fs::File::open(filename)?;
         let map = unsafe {memmap::MmapOptions::default().map(&file)}?;
         let obj = object::File::parse(&map)?;
@@ -134,43 +175,47 @@ impl HfVm {
         use object::read::ObjectSection;
 
         let mut result = LoadedElf{
-            entrypoint: obj.entry() as usize + offset,
+            entrypoint: GuestAddress(obj.entry() + EXEC_START as u64),
             ..Default::default()
         };
 
-        let mut min_address = usize::MAX;
-        let mut max_address = usize::MIN;
+        // let mut min_address = u64::MAX;
+        // let mut max_address = u64::MIN;
 
         for section in obj.sections() {
             use object::SectionKind::*;
             match section.kind() {
                 Text | Data | ReadOnlyData => {
-                    min_address = min_address.min(addresses.align(section.address()).as_usize());
-                    max_address = max_address.max(addresses.align_up(section.address() + section.size()).as_usize());
+                    section.address(); // this an offset into the executable virtual space
+                    let data = section.data()?;
+                    let slice = self.memory.get_slice(GuestAddress(EXEC_START as u64 + section.address()), section.size() as usize)?;
+                    slice.copy_from(data);
                 },
                 _ => {}
             }
         }
 
-        println!("Min addr: {:x}, max addr: {:x}", min_address, max_address);
+        // println!("Min addr: {:x}, max addr: {:x}", min_address, max_address);
 
-        let mut mmap = memmap::MmapOptions::default().len(max_address - min_address).map_anon()?;
-        for section in obj.sections() {
-            use object::SectionKind::*;
-            match section.kind() {
-                Text | Data | ReadOnlyData => {
-                    let offset = section.address() as usize - min_address;
-                    let data = &mut mmap.as_mut()[offset..offset + section.size() as usize];
-                    data.copy_from_slice(section.data().unwrap());
-                },
-                other => {
-                    println!("ignoring section {:?} with kind {:?}", section.name(), other);
-                }
-            }
-        }
+        // let mut mmap = memmap::MmapOptions::default().len(max_address - min_address).map_anon()?;
+        // for section in obj.sections() {
+        //     use object::SectionKind::*;
+        //     match section.kind() {
+        //         Text | Data | ReadOnlyData => {
+        //             let offset = section.address() as usize - min_address;
+        //             let data = &mut mmap.as_mut()[offset..offset + section.size() as usize];
+        //             data.copy_from_slice(section.data().unwrap());
+        //         },
+        //         other => {
+        //             println!("ignoring section {:?} with kind {:?}", section.name(), other);
+        //         }
+        //     }
+        // }
 
-        self.map_memory(mmap.as_ptr().into(), (offset + min_address).into(), mmap.len(), HvMemoryFlags::ALL)?;
-        result.maps.push(mmap);
+        // self.memory.get_host_address(addr)
+
+        // self.map_memory(mmap.as_ptr().into(), (offset + min_address).into(), mmap.len(), HvMemoryFlags::ALL)?;
+        // result.maps.push(mmap);
 
         // for section in obj.sections() {
         //     use object::SectionKind::*;
@@ -209,7 +254,7 @@ impl HfVm {
         Ok(result)
     }
 
-    pub fn vcpu_create_and_run<F>(&mut self, entrypoint: Address, callback: F) -> JoinHandle<anyhow::Result<()>>
+    pub fn vcpu_create_and_run<F>(&mut self, entrypoint: GuestAddress, callback: F) -> JoinHandle<anyhow::Result<()>>
     where
         F: FnMut(anyhow::Result<HfVcpuExit>) -> anyhow::Result<()> + Send + 'static,
     {
@@ -274,7 +319,7 @@ impl From<&bindgen::hv_vcpu_exit_t> for HfVcpuExit {
 }
 
 struct VcpuStartState {
-    guest_pc: Address,
+    guest_pc: GuestAddress,
 }
 
 impl VCpu {
@@ -442,7 +487,7 @@ impl VCpu {
         self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SP_EL1, DRAM_MEM_START as u64 + stack_size)?;
         self.set_reg(
             bindgen::hv_reg_t_HV_REG_PC,
-            start_state.guest_pc.as_usize() as u64,
+            start_state.guest_pc.0,
         )
         .context("failed setting initial program counter")?;
 
@@ -457,6 +502,17 @@ impl VCpu {
 
         loop {
             self.dump_all_registers().unwrap();
+
+            let cpuid = self.id;
+            std::thread::spawn(move || {
+                unsafe {
+                    let cpu_ids = &mut [cpuid];
+                    use std::time::Duration;
+                    std::thread::sleep(Duration::from_secs(1));
+                    bindgen::hv_vcpus_exit(cpu_ids.as_mut_ptr(), 1)
+                }
+            });
+
             let result = unsafe { bindgen::hv_vcpu_run(self.id) };
             let ret = HVReturnT::try_from(result).map_err(|e| {
                 anyhow!(
@@ -546,5 +602,25 @@ bitflags! {
         const HV_MEMORY_WRITE        = bindgen::HV_MEMORY_WRITE;
         const HV_MEMORY_EXEC        = bindgen::HV_MEMORY_EXEC;
         const ALL = Self::HV_MEMORY_READ.bits | Self::HV_MEMORY_WRITE.bits | Self::HV_MEMORY_EXEC.bits;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_page_size_16k() {
+        assert_eq!(get_page_size(), 16384)
+    }
+
+    #[test]
+    fn test_align_down_to_page_size() {
+        assert_eq!(align_down_to_page_size(16385), 16384)
+    }
+
+    #[test]
+    fn test_is_aligned_down_to_page_size() {
+        assert_eq!(is_aligned_to_page_size(0x0000000101408000), true);
+        assert_eq!(is_aligned_to_page_size(0x0000000103194000), true);
     }
 }
