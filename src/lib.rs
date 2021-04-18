@@ -91,7 +91,9 @@ pub struct LoadedElf {
 
 pub const DRAM_MEM_START: usize = 0x8000_0000; // 2 GB.
 // This is bad, but seems to fuck up without a page table if set to higher, as the executable is not a PIE one.
-pub const EXEC_START: usize = 0x2000_0000; // 512 MB,
+// pub const EXEC_START: usize = 0x2000_0000; // 512 MB,
+pub const EXEC_START: usize = 0x20_0000; // This should be able to map the executable we have.
+
 pub const EXEC_MEM_SIZE: usize = 16 * 1024 * 1024;
 
 // this could be configurable, it's just that we don't care yet.
@@ -116,7 +118,6 @@ impl HfVm {
                     memory,
                 };
                 vm.memory.with_regions(|_, region| -> anyhow::Result<()> {
-                    dbg!(&region);
                     let host_addr = region.get_host_address(MemoryRegionAddress(0))?;
                     vm.map_memory(host_addr, region.start_addr(), region.size(), HvMemoryFlags::ALL)?;
                     Ok(())
@@ -175,7 +176,7 @@ impl HfVm {
         use object::read::ObjectSection;
 
         let mut result = LoadedElf{
-            entrypoint: GuestAddress(obj.entry() + EXEC_START as u64),
+            entrypoint: GuestAddress(obj.entry()),
             ..Default::default()
         };
 
@@ -186,9 +187,8 @@ impl HfVm {
             use object::SectionKind::*;
             match section.kind() {
                 Text | Data | ReadOnlyData => {
-                    section.address(); // this an offset into the executable virtual space
                     let data = section.data()?;
-                    let slice = self.memory.get_slice(GuestAddress(EXEC_START as u64 + section.address()), section.size() as usize)?;
+                    let slice = self.memory.get_slice(GuestAddress(section.address()), section.size() as usize)?;
                     slice.copy_from(data);
                 },
                 _ => {}
@@ -484,19 +484,34 @@ impl VCpu {
         F: FnMut(anyhow::Result<HfVcpuExit>) -> anyhow::Result<()>,
     {
         let stack_size = 1024 * 1024u64;
-        self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SP_EL1, DRAM_MEM_START as u64 + stack_size)?;
+        self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SP_EL1, DRAM_MEM_START as u64 + stack_size).context("failed setting stack pointer")?;
         self.set_reg(
             bindgen::hv_reg_t_HV_REG_PC,
             start_state.guest_pc.0,
         )
         .context("failed setting initial program counter")?;
 
+        {
+            // Setup translation tables
+            const TG0_GRANULE_16K: u64 = 1 << 15;
+            self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1, TG0_GRANULE_16K)?;
+
+            // TODO: setup T0SZ to 16, so that all 4 levels are used.
+            // Or honestly a little more, so that 3 levels are used, as 4th only supports 1 bit of lookup - i.e. 2 values in the table.
+
+            // TODO: Look up these bits, they are used  The TCR_ELx.{SH0, ORGN0, IRGN0}
+
+            // TODO: If the Effective value of TCR_ELx.DS is 1, block descriptors are not supported.
+
+        }
+
+
         // Copy paste, no clue yet what it does
-        const PSR_MODE_EL1H: u64 = 0x0000_0005;
-        const PSR_F_BIT: u64 = 0x0000_0040;
-        const PSR_I_BIT: u64 = 0x0000_0080;
-        const PSR_A_BIT: u64 = 0x0000_0100;
-        const PSR_D_BIT: u64 = 0x0000_0200;
+        const PSR_MODE_EL1H: u64 = 0x0000_0005; //
+        const PSR_F_BIT: u64 = 0x0000_0040; // bit 6
+        const PSR_I_BIT: u64 = 0x0000_0080; // bit 7
+        const PSR_A_BIT: u64 = 0x0000_0100; // bit 8
+        const PSR_D_BIT: u64 = 0x0000_0200; // bit 9
         const PSTATE_FAULT_BITS_64: u64 = PSR_MODE_EL1H | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
         self.set_reg(bindgen::hv_reg_t_HV_REG_CPSR, PSTATE_FAULT_BITS_64).unwrap();
 
@@ -504,14 +519,15 @@ impl VCpu {
             self.dump_all_registers().unwrap();
 
             let cpuid = self.id;
-            std::thread::spawn(move || {
-                unsafe {
-                    let cpu_ids = &mut [cpuid];
-                    use std::time::Duration;
-                    std::thread::sleep(Duration::from_secs(1));
-                    bindgen::hv_vcpus_exit(cpu_ids.as_mut_ptr(), 1)
-                }
-            });
+
+            // std::thread::spawn(move || {
+            //     unsafe {
+            //         let mut cpu_id = cpuid;
+            //         use std::time::Duration;
+            //         std::thread::sleep(Duration::from_secs(1));
+            //         bindgen::hv_vcpus_exit(&mut cpu_id, 1)
+            //     }
+            // });
 
             let result = unsafe { bindgen::hv_vcpu_run(self.id) };
             let ret = HVReturnT::try_from(result).map_err(|e| {

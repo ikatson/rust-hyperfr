@@ -8,18 +8,44 @@ struct Aarch64TranslationTableEntry {
     data: u64,
 }
 
+struct EntryBlock16k {
+    data: u64
+}
+struct EntryTable16k {
+    data: u64
+}
+
+impl EntryBlock16k {
+    pub fn output_address(&self) -> u64 {
+        (self.data >> 25) & ((1 << 24) - 1)
+    }
+}
+
+impl EntryTable16k {
+    pub fn next_address(&self) -> u64 {
+        (self.data >> 14) & ((1 << 35) - 1)
+    }
+}
+
+enum TableEntry16k {
+    Block(EntryBlock16k),
+    Table(EntryTable16k)
+}
+
 impl Aarch64TranslationTableEntry {
-    fn is_present(&self) -> bool {
-        unimplemented!()
+    fn is_valid(&self) -> bool {
+        self.data & 1 == 1
     }
-    fn is_final(&self) -> bool {
-        unimplemented!()
-    }
-    fn get_next_address(&self) -> Option<u64> {
-        unimplemented!()
-    }
-    fn get_permissions(&self) -> GranulePermissions {
-        unimplemented!()
+    fn get(&self) -> Option<TableEntry> {
+        if self.is_valid() {
+            if (self.data >> 1) & 1 == 0 {
+                Some(EntryBlock{data: self.data})
+            } else {
+                Some(EntryTable{data: self.data})
+            }
+        } else {
+            None
+        }
     }
 }
 
