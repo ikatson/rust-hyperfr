@@ -1,14 +1,21 @@
 use anyhow::{anyhow, bail, Context};
 use bindgen::{hv_exit_reason_t, NSObject};
 use bitflags::bitflags;
-use vm_memory::{Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress};
-use std::{convert::{TryFrom, TryInto}, ops::Add, path::Path, thread::JoinHandle};
 use std::io::Write;
+use std::{
+    convert::{TryFrom, TryInto},
+    ops::Add,
+    path::Path,
+    thread::JoinHandle,
+};
+use vm_memory::{
+    Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress,
+};
 
 // mod page_table;
 
 pub fn get_page_size() -> u64 {
-    let page_size = unsafe {libc::sysconf(libc::_SC_PAGE_SIZE)} as u64;
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } as u64;
     page_size
 }
 
@@ -81,7 +88,7 @@ impl TryFrom<bindgen::hv_return_t> for HVReturnT {
 }
 
 pub struct HfVm {
-    memory: GuestMemoryMmap
+    memory: GuestMemoryMmap,
 }
 
 #[derive(Default)]
@@ -90,8 +97,8 @@ pub struct LoadedElf {
 }
 
 pub const DRAM_MEM_START: usize = 0x8000_0000; // 2 GB.
-// This is bad, but seems to fuck up without a page table if set to higher, as the executable is not a PIE one.
-// pub const EXEC_START: usize = 0x2000_0000; // 512 MB,
+                                               // This is bad, but seems to fuck up without a page table if set to higher, as the executable is not a PIE one.
+                                               // pub const EXEC_START: usize = 0x2000_0000; // 512 MB,
 pub const EXEC_START: usize = 0x20_0000; // This should be able to map the executable we have.
 
 pub const EXEC_MEM_SIZE: usize = 16 * 1024 * 1024;
@@ -112,18 +119,21 @@ impl HfVm {
             HVReturnT::HV_SUCCESS => {
                 let memory = GuestMemoryMmap::from_ranges(&[
                     (GuestAddress(EXEC_START as u64), EXEC_MEM_SIZE),
-                    (GuestAddress(DRAM_MEM_START as u64), MEMORY_SIZE)
+                    (GuestAddress(DRAM_MEM_START as u64), MEMORY_SIZE),
                 ])?;
-                let vm = Self {
-                    memory,
-                };
+                let vm = Self { memory };
                 vm.memory.with_regions(|_, region| -> anyhow::Result<()> {
                     let host_addr = region.get_host_address(MemoryRegionAddress(0))?;
-                    vm.map_memory(host_addr, region.start_addr(), region.size(), HvMemoryFlags::ALL)?;
+                    vm.map_memory(
+                        host_addr,
+                        region.start_addr(),
+                        region.size(),
+                        HvMemoryFlags::ALL,
+                    )?;
                     Ok(())
                 })?;
                 Ok(vm)
-            },
+            }
             err => bail!("hv_vm_create() returned {:?}", err),
         }
     }
@@ -148,14 +158,8 @@ impl HfVm {
 
         // hv_return_t hv_vm_map(void *addr, hv_ipa_t ipa, size_t size, hv_memory_flags_t flags);
         // bindgen::hv_vm_map(addr, ipa, size, flags)
-        let result = unsafe {
-            bindgen::hv_vm_map(
-                addr as *mut _,
-                ipa.0,
-                size as u64,
-                flags.bits() as u64,
-            )
-        };
+        let result =
+            unsafe { bindgen::hv_vm_map(addr as *mut _, ipa.0, size as u64, flags.bits() as u64) };
         let ret = HVReturnT::try_from(result).map_err(|e| {
             anyhow!(
                 "unexpected hv_return_t value {:#x} from hv_vm_map",
@@ -170,12 +174,12 @@ impl HfVm {
 
     pub fn load_elf<P: AsRef<Path>>(&mut self, filename: P) -> anyhow::Result<LoadedElf> {
         let file = std::fs::File::open(filename)?;
-        let map = unsafe {memmap::MmapOptions::default().map(&file)}?;
+        let map = unsafe { memmap::MmapOptions::default().map(&file) }?;
         let obj = object::File::parse(&map)?;
-        use object::Object;
         use object::read::ObjectSection;
+        use object::Object;
 
-        let mut result = LoadedElf{
+        let mut result = LoadedElf {
             entrypoint: GuestAddress(obj.entry()),
             ..Default::default()
         };
@@ -188,9 +192,11 @@ impl HfVm {
             match section.kind() {
                 Text | Data | ReadOnlyData => {
                     let data = section.data()?;
-                    let slice = self.memory.get_slice(GuestAddress(section.address()), section.size() as usize)?;
+                    let slice = self
+                        .memory
+                        .get_slice(GuestAddress(section.address()), section.size() as usize)?;
                     slice.copy_from(data);
-                },
+                }
                 _ => {}
             }
         }
@@ -254,7 +260,11 @@ impl HfVm {
         Ok(result)
     }
 
-    pub fn vcpu_create_and_run<F>(&mut self, entrypoint: GuestAddress, callback: F) -> JoinHandle<anyhow::Result<()>>
+    pub fn vcpu_create_and_run<F>(
+        &mut self,
+        entrypoint: GuestAddress,
+        callback: F,
+    ) -> JoinHandle<anyhow::Result<()>>
     where
         F: FnMut(anyhow::Result<HfVcpuExit>) -> anyhow::Result<()> + Send + 'static,
     {
@@ -407,13 +417,17 @@ impl VCpu {
         macro_rules! dump_reg {
             ($reg:ident) => {
                 println!("{}: {:#x}", stringify!($reg), self.get_reg(bindgen::$reg)?);
-            }
+            };
         }
 
         macro_rules! dump_sys_reg {
             ($reg:ident) => {
-                println!("{}: {:#x}", stringify!($reg), self.get_sys_reg(bindgen::$reg)?);
-            }
+                println!(
+                    "{}: {:#x}",
+                    stringify!($reg),
+                    self.get_sys_reg(bindgen::$reg)?
+                );
+            };
         }
 
         dump_reg!(hv_reg_t_HV_REG_X0);
@@ -484,12 +498,13 @@ impl VCpu {
         F: FnMut(anyhow::Result<HfVcpuExit>) -> anyhow::Result<()>,
     {
         let stack_size = 1024 * 1024u64;
-        self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SP_EL1, DRAM_MEM_START as u64 + stack_size).context("failed setting stack pointer")?;
-        self.set_reg(
-            bindgen::hv_reg_t_HV_REG_PC,
-            start_state.guest_pc.0,
+        self.set_sys_reg(
+            bindgen::hv_sys_reg_t_HV_SYS_REG_SP_EL1,
+            DRAM_MEM_START as u64 + stack_size,
         )
-        .context("failed setting initial program counter")?;
+        .context("failed setting stack pointer")?;
+        self.set_reg(bindgen::hv_reg_t_HV_REG_PC, start_state.guest_pc.0)
+            .context("failed setting initial program counter")?;
 
         {
             // Setup translation tables
@@ -502,9 +517,7 @@ impl VCpu {
             // TODO: Look up these bits, they are used  The TCR_ELx.{SH0, ORGN0, IRGN0}
 
             // TODO: If the Effective value of TCR_ELx.DS is 1, block descriptors are not supported.
-
         }
-
 
         // Copy paste, no clue yet what it does
         const PSR_MODE_EL1H: u64 = 0x0000_0005; //
@@ -512,8 +525,10 @@ impl VCpu {
         const PSR_I_BIT: u64 = 0x0000_0080; // bit 7
         const PSR_A_BIT: u64 = 0x0000_0100; // bit 8
         const PSR_D_BIT: u64 = 0x0000_0200; // bit 9
-        const PSTATE_FAULT_BITS_64: u64 = PSR_MODE_EL1H | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
-        self.set_reg(bindgen::hv_reg_t_HV_REG_CPSR, PSTATE_FAULT_BITS_64).unwrap();
+        const PSTATE_FAULT_BITS_64: u64 =
+            PSR_MODE_EL1H | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
+        self.set_reg(bindgen::hv_reg_t_HV_REG_CPSR, PSTATE_FAULT_BITS_64)
+            .unwrap();
 
         loop {
             self.dump_all_registers().unwrap();
@@ -551,26 +566,26 @@ impl VCpu {
                             match (iss >> 8) as u8 {
                                 NOOP => {
                                     dbg!("NOOP");
-                                },
+                                }
                                 HALT => {
                                     println!("halt received");
                                     return Ok(());
-                                },
+                                }
                                 PRINT_U8 => {
                                     std::io::stdout().write_all(&[iss as u8]).unwrap();
                                 }
                                 PANIC => {
                                     panic!("panic in the guest")
-                                },
+                                }
                                 other => {
                                     panic!("unsupported HVC value {:x}", other);
                                 }
                             }
-                        },
+                        }
                         // some memory failure
                         0b100000 => {
                             println!("memory failure");
-                        },
+                        }
                         0b100100 => {
                             println!("data abort");
                         }
