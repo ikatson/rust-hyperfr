@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context};
 use bindgen::{hv_exit_reason_t, NSObject};
 use bitflags::bitflags;
-use std::io::Write;
+use std::{io::Write, sync::Arc};
 use std::{
     convert::{TryFrom, TryInto},
     ops::Add,
@@ -88,7 +88,7 @@ impl TryFrom<bindgen::hv_return_t> for HVReturnT {
 }
 
 pub struct HfVm {
-    memory: GuestMemoryMmap,
+    memory: Arc<GuestMemoryMmap>,
 }
 
 #[derive(Default)]
@@ -121,7 +121,7 @@ impl HfVm {
                     (GuestAddress(EXEC_START as u64), EXEC_MEM_SIZE),
                     (GuestAddress(DRAM_MEM_START as u64), MEMORY_SIZE),
                 ])?;
-                let vm = Self { memory };
+                let vm = Self { memory: Arc::new(memory) };
                 vm.memory.with_regions(|_, region| -> anyhow::Result<()> {
                     let host_addr = region.get_host_address(MemoryRegionAddress(0))?;
                     vm.map_memory(
@@ -136,6 +136,10 @@ impl HfVm {
             }
             err => bail!("hv_vm_create() returned {:?}", err),
         }
+    }
+
+    pub fn get_memory(&self) -> Arc<GuestMemoryMmap> {
+        self.memory.clone()
     }
 
     fn map_memory(
@@ -262,6 +266,7 @@ impl HfVm {
 
     pub fn vcpu_create_and_run<F>(
         &mut self,
+        memory: Arc<GuestMemoryMmap>,
         entrypoint: GuestAddress,
         callback: F,
     ) -> JoinHandle<anyhow::Result<()>>
@@ -269,7 +274,7 @@ impl HfVm {
         F: FnMut(anyhow::Result<HfVcpuExit>) -> anyhow::Result<()> + Send + 'static,
     {
         let join = std::thread::spawn(move || {
-            let vcpu = VCpu::new().unwrap();
+            let vcpu = VCpu::new(memory).unwrap();
             let start_state = VcpuStartState {
                 guest_pc: entrypoint,
             };
@@ -282,10 +287,11 @@ impl HfVm {
 #[derive(Debug)]
 pub struct VCpu {
     id: u64,
+    memory: Arc<GuestMemoryMmap>,
     exit_t: *mut bindgen::hv_vcpu_exit_t,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum HvExitReason {
     HV_EXIT_REASON_CANCELED,
     HV_EXIT_REASON_EXCEPTION,
@@ -333,9 +339,10 @@ struct VcpuStartState {
 }
 
 impl VCpu {
-    fn new() -> anyhow::Result<Self> {
+    fn new(memory: Arc<GuestMemoryMmap>) -> anyhow::Result<Self> {
         let mut vcpu = Self {
             id: 0,
+            memory,
             exit_t: core::ptr::null_mut(),
         };
         let result = unsafe { bindgen::hv_vcpu_create(&mut vcpu.id, &mut vcpu.exit_t, null_obj()) };
@@ -471,11 +478,12 @@ impl VCpu {
         // Stack pointer.
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_SP_EL1);
 
-        // TOOD: forgot what this one does.
+        // Exception table address.
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_VBAR_EL1);
 
         // The PC to return to from exception.
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_ELR_EL1);
+        dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_FAR_EL1);
 
         // Page table registers.
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1);
@@ -506,10 +514,13 @@ impl VCpu {
         self.set_reg(bindgen::hv_reg_t_HV_REG_PC, start_state.guest_pc.0)
             .context("failed setting initial program counter")?;
 
+        self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_VBAR_EL1, 0x40_0000).context("failed setting VBAR")?;
+
         {
             // Setup translation tables
-            const TG0_GRANULE_16K: u64 = 1 << 15;
-            self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1, TG0_GRANULE_16K)?;
+
+            // const TG0_GRANULE_16K: u64 = 1 << 15;
+            // self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1, TG0_GRANULE_16K)?;
 
             // TODO: setup T0SZ to 16, so that all 4 levels are used.
             // Or honestly a little more, so that 3 levels are used, as 4th only supports 1 bit of lookup - i.e. 2 values in the table.
@@ -531,19 +542,9 @@ impl VCpu {
             .unwrap();
 
         loop {
-            self.dump_all_registers().unwrap();
+            // self.dump_all_registers().unwrap();
 
             let cpuid = self.id;
-
-            // std::thread::spawn(move || {
-            //     unsafe {
-            //         let mut cpu_id = cpuid;
-            //         use std::time::Duration;
-            //         std::thread::sleep(Duration::from_secs(1));
-            //         bindgen::hv_vcpus_exit(&mut cpu_id, 1)
-            //     }
-            // });
-
             let result = unsafe { bindgen::hv_vcpu_run(self.id) };
             let ret = HVReturnT::try_from(result).map_err(|e| {
                 anyhow!(
@@ -554,6 +555,7 @@ impl VCpu {
             match ret {
                 HVReturnT::HV_SUCCESS => {
                     let exit_t = self.exit_t();
+                    assert_eq!(exit_t.reason, HvExitReason::HV_EXIT_REASON_EXCEPTION);
                     match exit_t.decoded_syndrome.exception_class {
                         // HVC
                         0b010110 => {
@@ -563,7 +565,10 @@ impl VCpu {
                             const PRINT_U8: u8 = 2;
                             const PRINT_U64: u8 = 3;
                             const PANIC: u8 = 4;
-                            match (iss >> 8) as u8 {
+                            const EXCEPTION: u8 = 5;
+                            const SYNCHRONOUS_EXCEPTION: u8 = 6;
+                            const PRINT_STRING: u8 = 7;
+                            match iss as u8 {
                                 NOOP => {
                                     dbg!("NOOP");
                                 }
@@ -572,10 +577,29 @@ impl VCpu {
                                     return Ok(());
                                 }
                                 PRINT_U8 => {
-                                    std::io::stdout().write_all(&[iss as u8]).unwrap();
+                                    let byte = self.get_reg(bindgen::hv_reg_t_HV_REG_X0)? as u8;
+                                    dbg!(byte);
+                                    std::io::stdout().write_all(&[byte as u8]).unwrap();
                                 }
                                 PANIC => {
                                     panic!("panic in the guest")
+                                }
+                                EXCEPTION => {
+                                    println!("exception");
+                                    self.dump_all_registers()?;
+                                    panic!("exception")
+                                }
+                                SYNCHRONOUS_EXCEPTION => {
+                                    println!("synchronous exception");
+                                    self.dump_all_registers()?;
+                                    panic!("synchronous exception");
+                                }
+                                PRINT_STRING => {
+                                    let addr = self.get_reg(bindgen::hv_reg_t_HV_REG_X0)?;
+                                    let len = self.get_reg(bindgen::hv_reg_t_HV_REG_X1)?;
+                                    let slice = self.memory.get_slice(GuestAddress(addr), len as usize)?;
+                                    let slice = unsafe {core::slice::from_raw_parts(slice.as_ptr(), len as usize)};
+                                    println!("{}", core::str::from_utf8(slice)?);
                                 }
                                 other => {
                                     panic!("unsupported HVC value {:x}", other);

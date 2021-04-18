@@ -16,9 +16,10 @@ fn main() {
     let image = args.nth(1).unwrap();
 
     let elf = vm.load_elf(&image).unwrap();
+    let memory = vm.get_memory();
 
-    let vcpu = vm.vcpu_create_and_run(elf.entrypoint, move |res| {
-        println!("{:#x?}", res);
+    let vcpu = vm.vcpu_create_and_run(memory, elf.entrypoint, move |res| {
+        // println!("{:#x?}", res);
         // let stack_end = 1024 * 1024usize;
         // let stack_start = stack_end - 80;
         // let stack = &map[stack_start..stack_end];
