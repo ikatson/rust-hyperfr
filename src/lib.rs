@@ -8,9 +8,7 @@ use std::{
     path::Path,
     thread::JoinHandle,
 };
-use vm_memory::{
-    Address, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress,
-};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress};
 
 // mod page_table;
 
@@ -105,6 +103,9 @@ pub const EXEC_MEM_SIZE: usize = 16 * 1024 * 1024;
 
 // this could be configurable, it's just that we don't care yet.
 pub const MEMORY_SIZE: usize = 32 * 1024 * 1024;
+
+pub const STACK_SIZE: u64 = 1024 * 1024;
+pub const STACK_END: u64 = DRAM_MEM_START as u64 + STACK_SIZE;
 
 impl HfVm {
     pub fn new() -> anyhow::Result<Self> {
@@ -497,6 +498,16 @@ impl VCpu {
         Ok(())
     }
 
+    fn print_stack(&mut self) -> anyhow::Result<()> {
+        let sp = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SP_EL1)?;
+        let len = STACK_END - sp;
+        let mut data = vec![0u8; len as usize];
+        println!("STACK AT {:#x}, length {}", sp, len);
+        self.memory.read_slice(&mut data, GuestAddress(sp))?;
+        hexdump::hexdump(&data);
+        Ok(())
+    }
+
     fn simple_run_loop<F>(
         mut self,
         start_state: VcpuStartState,
@@ -505,10 +516,9 @@ impl VCpu {
     where
         F: FnMut(anyhow::Result<HfVcpuExit>) -> anyhow::Result<()>,
     {
-        let stack_size = 1024 * 1024u64;
         self.set_sys_reg(
             bindgen::hv_sys_reg_t_HV_SYS_REG_SP_EL1,
-            DRAM_MEM_START as u64 + stack_size,
+            STACK_END,
         )
         .context("failed setting stack pointer")?;
         self.set_reg(bindgen::hv_reg_t_HV_REG_PC, start_state.guest_pc.0)
@@ -592,6 +602,7 @@ impl VCpu {
                                 SYNCHRONOUS_EXCEPTION => {
                                     println!("synchronous exception");
                                     self.dump_all_registers()?;
+                                    self.print_stack()?;
                                     panic!("synchronous exception");
                                 }
                                 PRINT_STRING => {
