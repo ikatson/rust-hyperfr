@@ -495,6 +495,9 @@ impl VCpu {
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_ID_AA64MMFR1_EL1);
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_ID_AA64MMFR2_EL1);
 
+        // FP state
+        dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_CPACR_EL1);
+
         Ok(())
     }
 
@@ -525,6 +528,13 @@ impl VCpu {
             .context("failed setting initial program counter")?;
 
         self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_VBAR_EL1, 0x40_0000).context("failed setting VBAR")?;
+
+        {
+            // Enable floating point
+            const FPEN_NO_TRAP: u64 = 0b11 << 20; // disable trapping of FP instructions
+            const CPACR_EL1: u64 = FPEN_NO_TRAP;
+            self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_CPACR_EL1, CPACR_EL1)?
+        }
 
         {
             // Setup translation tables
