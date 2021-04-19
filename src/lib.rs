@@ -1,23 +1,21 @@
 use anyhow::{anyhow, bail, Context};
 use bindgen::{hv_exit_reason_t, NSObject};
 use bitflags::bitflags;
+use std::sync::Arc;
 use std::{
     convert::{TryFrom, TryInto},
-    ops::Add,
     path::Path,
     thread::JoinHandle,
 };
-use std::{io::Write, sync::Arc};
 use vm_memory::{
-    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
+    Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
     MemoryRegionAddress,
 };
 
 // mod page_table;
 
 pub fn get_page_size() -> u64 {
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) } as u64;
-    page_size
+    unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) as u64}
 }
 
 pub fn is_aligned_to_page_size(value: u64) -> bool {
@@ -97,10 +95,10 @@ pub struct LoadedElf {
     pub entrypoint: GuestAddress,
 }
 
-pub const DRAM_MEM_START: usize = 0x8000_0000; // 2 GB.
-                                               // This is bad, but seems to fuck up without a page table if set to higher, as the executable is not a PIE one.
-                                               // pub const EXEC_START: usize = 0x2000_0000; // 512 MB,
-pub const EXEC_START: usize = 0x20_0000; // This should be able to map the executable we have.
+pub const DRAM_MEM_START: u64 = 0x8000_0000; // 2 GB.
+                                             // This is bad, but seems to fuck up without a page table if set to higher, as the executable is not a PIE one.
+                                             // pub const EXEC_START: usize = 0x2000_0000; // 512 MB,
+pub const EXEC_START: u64 = 0x20_0000; // This should be able to map the executable we have.
 
 pub const EXEC_MEM_SIZE: usize = 16 * 1024 * 1024;
 
@@ -108,40 +106,43 @@ pub const EXEC_MEM_SIZE: usize = 16 * 1024 * 1024;
 pub const MEMORY_SIZE: usize = 32 * 1024 * 1024;
 
 pub const STACK_SIZE: u64 = 1024 * 1024;
-pub const STACK_END: u64 = DRAM_MEM_START as u64 + STACK_SIZE;
+pub const STACK_END: u64 = DRAM_MEM_START + STACK_SIZE;
+
+fn assert_hv_return_t_ok(v: bindgen::hv_return_t, name: &str) -> anyhow::Result<()> {
+    let ret = HVReturnT::try_from(v).map_err(|e| {
+        anyhow!(
+            "unexpected hv_return_t value {:#x} from {}",
+            e as usize,
+            name
+        )
+    })?;
+    match ret {
+        HVReturnT::HV_SUCCESS => Ok(()),
+        err => bail!("{}() returned {:?}", name, err),
+    }
+}
 
 impl HfVm {
     pub fn new() -> anyhow::Result<Self> {
-        let result = unsafe { bindgen::hv_vm_create(null_obj()) };
-        let res = HVReturnT::try_from(result).map_err(|e| {
-            anyhow!(
-                "unexpected hv_return_t value {:#x} from hv_vm_create",
-                e as usize
-            )
+        assert_hv_return_t_ok(unsafe { bindgen::hv_vm_create(null_obj()) }, "hv_vm_create")?;
+        let memory = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(EXEC_START as u64), EXEC_MEM_SIZE),
+            (GuestAddress(DRAM_MEM_START as u64), MEMORY_SIZE),
+        ])?;
+        let vm = Self {
+            memory: Arc::new(memory),
+        };
+        vm.memory.with_regions(|_, region| -> anyhow::Result<()> {
+            let host_addr = region.get_host_address(MemoryRegionAddress(0))?;
+            vm.map_memory(
+                host_addr,
+                region.start_addr(),
+                region.size(),
+                HvMemoryFlags::ALL,
+            )?;
+            Ok(())
         })?;
-        match res {
-            HVReturnT::HV_SUCCESS => {
-                let memory = GuestMemoryMmap::from_ranges(&[
-                    (GuestAddress(EXEC_START as u64), EXEC_MEM_SIZE),
-                    (GuestAddress(DRAM_MEM_START as u64), MEMORY_SIZE),
-                ])?;
-                let vm = Self {
-                    memory: Arc::new(memory),
-                };
-                vm.memory.with_regions(|_, region| -> anyhow::Result<()> {
-                    let host_addr = region.get_host_address(MemoryRegionAddress(0))?;
-                    vm.map_memory(
-                        host_addr,
-                        region.start_addr(),
-                        region.size(),
-                        HvMemoryFlags::ALL,
-                    )?;
-                    Ok(())
-                })?;
-                Ok(vm)
-            }
-            err => bail!("hv_vm_create() returned {:?}", err),
-        }
+        Ok(vm)
     }
 
     pub fn get_memory(&self) -> Arc<GuestMemoryMmap> {
@@ -166,20 +167,10 @@ impl HfVm {
             bail!("size {:x} is not a multiple of page size", size)
         }
 
-        // hv_return_t hv_vm_map(void *addr, hv_ipa_t ipa, size_t size, hv_memory_flags_t flags);
-        // bindgen::hv_vm_map(addr, ipa, size, flags)
-        let result =
-            unsafe { bindgen::hv_vm_map(addr as *mut _, ipa.0, size as u64, flags.bits() as u64) };
-        let ret = HVReturnT::try_from(result).map_err(|e| {
-            anyhow!(
-                "unexpected hv_return_t value {:#x} from hv_vm_map",
-                e as usize
-            )
-        })?;
-        match ret {
-            HVReturnT::HV_SUCCESS => Ok(()),
-            err => bail!("hv_vm_map() returned {:?}", err),
-        }
+        assert_hv_return_t_ok(
+            unsafe { bindgen::hv_vm_map(addr as *mut _, ipa.0, size as u64, flags.bits() as u64) },
+            "hv_vm_map",
+        )
     }
 
     pub fn load_elf<P: AsRef<Path>>(&mut self, filename: P) -> anyhow::Result<LoadedElf> {
@@ -189,9 +180,8 @@ impl HfVm {
         use object::read::ObjectSection;
         use object::Object;
 
-        let mut result = LoadedElf {
+        let result = LoadedElf {
             entrypoint: GuestAddress(obj.entry()),
-            ..Default::default()
         };
 
         // let mut min_address = u64::MAX;
@@ -270,23 +260,18 @@ impl HfVm {
         Ok(result)
     }
 
-    pub fn vcpu_create_and_run<F>(
+    pub fn vcpu_create_and_run(
         &mut self,
         memory: Arc<GuestMemoryMmap>,
         entrypoint: GuestAddress,
-        callback: F,
-    ) -> JoinHandle<anyhow::Result<()>>
-    where
-        F: FnMut(anyhow::Result<HfVcpuExit>) -> anyhow::Result<()> + Send + 'static,
-    {
-        let join = std::thread::spawn(move || {
+    ) -> JoinHandle<anyhow::Result<()>> {
+        std::thread::spawn(move || {
             let vcpu = VCpu::new(memory).unwrap();
             let start_state = VcpuStartState {
                 guest_pc: entrypoint,
             };
-            vcpu.simple_run_loop(start_state, callback)
-        });
-        join
+            vcpu.simple_run_loop(start_state)
+        })
     }
 }
 
@@ -297,6 +282,7 @@ pub struct VCpu {
     exit_t: *mut bindgen::hv_vcpu_exit_t,
 }
 
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum HvExitReason {
     HV_EXIT_REASON_CANCELED,
@@ -351,78 +337,42 @@ impl VCpu {
             memory,
             exit_t: core::ptr::null_mut(),
         };
-        let result = unsafe { bindgen::hv_vcpu_create(&mut vcpu.id, &mut vcpu.exit_t, null_obj()) };
-        let ret = HVReturnT::try_from(result).map_err(|e| {
-            anyhow!(
-                "unexpected hv_return_t value {:#x} from hv_vcpu_create",
-                e as usize
-            )
-        })?;
-        match ret {
-            HVReturnT::HV_SUCCESS => Ok(vcpu),
-            err => bail!("hv_vcpu_create() returned {:?}", err),
-        }
+        assert_hv_return_t_ok(
+            unsafe { bindgen::hv_vcpu_create(&mut vcpu.id, &mut vcpu.exit_t, null_obj()) },
+            "hv_vcpu_create",
+        )?;
+        Ok(vcpu)
     }
     fn exit_t(&self) -> HfVcpuExit {
         unsafe { self.exit_t.as_ref().unwrap().into() }
     }
     fn set_reg(&mut self, reg: bindgen::hv_reg_t, value: u64) -> anyhow::Result<()> {
-        let result = unsafe { bindgen::hv_vcpu_set_reg(self.id, reg, value) };
-        let ret = HVReturnT::try_from(result).map_err(|e| {
-            anyhow!(
-                "unexpected hv_return_t value {:#x} from hv_vcpu_set_reg",
-                e as usize
-            )
-        })?;
-        match ret {
-            HVReturnT::HV_SUCCESS => {}
-            err => bail!("hv_vcpu_set_reg() returned {:?}", err),
-        };
-        Ok(())
+        assert_hv_return_t_ok(
+            unsafe { bindgen::hv_vcpu_set_reg(self.id, reg, value) },
+            "hv_vcpu_set_reg",
+        )
     }
     fn set_sys_reg(&mut self, reg: bindgen::hv_sys_reg_t, value: u64) -> anyhow::Result<()> {
-        let result = unsafe { bindgen::hv_vcpu_set_sys_reg(self.id, reg, value) };
-        let ret = HVReturnT::try_from(result).map_err(|e| {
-            anyhow!(
-                "unexpected hv_return_t value {:#x} from hv_vcpu_set_sys_reg",
-                e as usize
-            )
-        })?;
-        match ret {
-            HVReturnT::HV_SUCCESS => {}
-            err => bail!("hv_vcpu_set_sys_reg() returned {:?}", err),
-        };
-        Ok(())
+        assert_hv_return_t_ok(
+            unsafe { bindgen::hv_vcpu_set_sys_reg(self.id, reg, value) },
+            "hv_vcpu_set_sys_reg",
+        )
     }
     fn get_reg(&mut self, reg: bindgen::hv_reg_t) -> anyhow::Result<u64> {
         let mut value = 0u64;
-        let result = unsafe { bindgen::hv_vcpu_get_reg(self.id, reg, &mut value) };
-        let ret = HVReturnT::try_from(result).map_err(|e| {
-            anyhow!(
-                "unexpected hv_return_t value {:#x} from hv_vcpu_get_reg",
-                e as usize
-            )
-        })?;
-        match ret {
-            HVReturnT::HV_SUCCESS => {}
-            err => bail!("hv_vcpu_get_reg() returned {:?}", err),
-        };
+        assert_hv_return_t_ok(
+            unsafe { bindgen::hv_vcpu_get_reg(self.id, reg, &mut value) },
+            "hv_vcpu_get_reg",
+        )?;
         Ok(value)
     }
 
     fn get_sys_reg(&mut self, reg: bindgen::hv_sys_reg_t) -> anyhow::Result<u64> {
         let mut value = 0u64;
-        let result = unsafe { bindgen::hv_vcpu_get_sys_reg(self.id, reg, &mut value) };
-        let ret = HVReturnT::try_from(result).map_err(|e| {
-            anyhow!(
-                "unexpected hv_return_t value {:#x} from hv_vcpu_get_reg",
-                e as usize
-            )
-        })?;
-        match ret {
-            HVReturnT::HV_SUCCESS => {}
-            err => bail!("hv_vcpu_get_reg() returned {:?}", err),
-        };
+        assert_hv_return_t_ok(
+            unsafe { bindgen::hv_vcpu_get_sys_reg(self.id, reg, &mut value) },
+            "hv_vcpu_get_sys_reg",
+        )?;
         Ok(value)
     }
 
@@ -510,7 +460,7 @@ impl VCpu {
 
     fn print_stack(&mut self) -> anyhow::Result<()> {
         let sp = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SP_EL1)?;
-        let len = STACK_END - sp;
+        let len = self.get_stack_end() - sp;
         let mut data = vec![0u8; len as usize];
         println!("STACK AT {:#x}, length {}", sp, len);
         self.memory.read_slice(&mut data, GuestAddress(sp))?;
@@ -518,16 +468,16 @@ impl VCpu {
         Ok(())
     }
 
-    fn simple_run_loop<F>(
-        mut self,
-        start_state: VcpuStartState,
-        mut callback: F,
-    ) -> anyhow::Result<()>
-    where
-        F: FnMut(anyhow::Result<HfVcpuExit>) -> anyhow::Result<()>,
-    {
-        self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SP_EL1, STACK_END)
-            .context("failed setting stack pointer")?;
+    fn get_stack_end(&self) -> u64 {
+        DRAM_MEM_START + MEMORY_SIZE as u64 - STACK_SIZE * self.id
+    }
+
+    fn simple_run_loop(mut self, start_state: VcpuStartState) -> anyhow::Result<()> {
+        self.set_sys_reg(
+            bindgen::hv_sys_reg_t_HV_SYS_REG_SP_EL1,
+            self.get_stack_end(),
+        )
+        .context("failed setting stack pointer")?;
         self.set_reg(bindgen::hv_reg_t_HV_REG_PC, start_state.guest_pc.0)
             .context("failed setting initial program counter")?;
 
@@ -557,109 +507,81 @@ impl VCpu {
 
         // Copy paste, no clue yet what it does
         const PSR_MODE_EL1H: u64 = 0x0000_0005; //
-        const PSR_F_BIT: u64 = 0x0000_0040; // bit 6
-        const PSR_I_BIT: u64 = 0x0000_0080; // bit 7
-        const PSR_A_BIT: u64 = 0x0000_0100; // bit 8
-        const PSR_D_BIT: u64 = 0x0000_0200; // bit 9
+                                                // const PSR_F_BIT: u64 = 0x0000_0040; // bit 6
+                                                // const PSR_I_BIT: u64 = 0x0000_0080; // bit 7
+                                                // const PSR_A_BIT: u64 = 0x0000_0100; // bit 8
+                                                // const PSR_D_BIT: u64 = 0x0000_0200; // bit 9
         const PSTATE_FAULT_BITS_64: u64 =
-            PSR_MODE_EL1H | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
+            // PSR_MODE_EL1H | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
+            PSR_MODE_EL1H;
         self.set_reg(bindgen::hv_reg_t_HV_REG_CPSR, PSTATE_FAULT_BITS_64)
             .unwrap();
 
         loop {
-            // self.dump_all_registers().unwrap();
+            assert_hv_return_t_ok(unsafe { bindgen::hv_vcpu_run(self.id) }, "hv_vcpu_run")?;
 
-            let cpuid = self.id;
-            let result = unsafe { bindgen::hv_vcpu_run(self.id) };
-            let ret = HVReturnT::try_from(result).map_err(|e| {
-                anyhow!(
-                    "unexpected hv_return_t value {:#x} from hv_vcpu_run",
-                    e as usize
-                )
-            })?;
-            match ret {
-                HVReturnT::HV_SUCCESS => {
-                    let exit_t = self.exit_t();
-                    assert_eq!(exit_t.reason, HvExitReason::HV_EXIT_REASON_EXCEPTION);
-                    match exit_t.decoded_syndrome.exception_class {
-                        // HVC
-                        0b010110 => {
-                            let iss = exit_t.decoded_syndrome.iss as u16;
-                            const NOOP: u8 = 0;
-                            const HALT: u8 = 1;
-                            const PRINT_U8: u8 = 2;
-                            const PRINT_U64: u8 = 3;
-                            const PANIC: u8 = 4;
-                            const EXCEPTION: u8 = 5;
-                            const SYNCHRONOUS_EXCEPTION: u8 = 6;
-                            const PRINT_STRING: u8 = 7;
-                            match iss as u8 {
-                                NOOP => {
-                                    dbg!("NOOP");
-                                }
-                                HALT => {
-                                    println!("halt received");
-                                    return Ok(());
-                                }
-                                PRINT_U8 => {
-                                    let byte = self.get_reg(bindgen::hv_reg_t_HV_REG_X0)? as u8;
-                                    dbg!(byte);
-                                    std::io::stdout().write_all(&[byte as u8]).unwrap();
-                                }
-                                PANIC => {
-                                    panic!("panic in the guest")
-                                }
-                                EXCEPTION => {
-                                    println!("exception");
-                                    self.dump_all_registers()?;
-                                    panic!("exception")
-                                }
-                                SYNCHRONOUS_EXCEPTION => {
-                                    let el1_syndrome = Syndrome::from(
-                                        self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ESR_EL1)?,
-                                    );
-                                    println!(
-                                        "synchronous exception. Decoded ESR_EL1: {:#x?}",
-                                        el1_syndrome
-                                    );
+            let exit_t = self.exit_t();
+            assert_eq!(exit_t.reason, HvExitReason::HV_EXIT_REASON_EXCEPTION);
+            match exit_t.decoded_syndrome.exception_class {
+                // HVC
+                0b010110 => {
+                    let iss = exit_t.decoded_syndrome.iss as u16;
+                    const NOOP: u8 = 0;
+                    const HALT: u8 = 1;
+                    const PANIC: u8 = 4;
+                    const EXCEPTION: u8 = 5;
+                    const SYNCHRONOUS_EXCEPTION: u8 = 6;
+                    const PRINT_STRING: u8 = 7;
+                    const IRQ: u8 = 8;
+                    match iss as u8 {
+                        NOOP => {
+                            dbg!("NOOP");
+                        }
+                        HALT => {
+                            println!("halt received");
+                            return Ok(());
+                        }
+                        PANIC => {
+                            panic!("panic in the guest")
+                        }
+                        EXCEPTION | SYNCHRONOUS_EXCEPTION | IRQ => {
+                            let name = match iss as u8 {
+                                EXCEPTION => "exception",
+                                SYNCHRONOUS_EXCEPTION => "synchronous exception",
+                                _ => unreachable!(),
+                            };
+                            let el1_syndrome = Syndrome::from(
+                                self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ESR_EL1)?,
+                            );
+                            println!("{}. Decoded ESR_EL1: {:#x?}", name, el1_syndrome);
 
-                                    self.dump_all_registers()?;
-                                    self.print_stack()?;
-                                    panic!("synchronous exception");
-                                }
-                                PRINT_STRING => {
-                                    let addr = self.get_reg(bindgen::hv_reg_t_HV_REG_X0)?;
-                                    let len = self.get_reg(bindgen::hv_reg_t_HV_REG_X1)?;
-                                    let slice =
-                                        self.memory.get_slice(GuestAddress(addr), len as usize)?;
-                                    let slice = unsafe {
-                                        core::slice::from_raw_parts(slice.as_ptr(), len as usize)
-                                    };
-                                    println!("{}", core::str::from_utf8(slice)?);
-                                }
-                                other => {
-                                    panic!("unsupported HVC value {:x}", other);
-                                }
-                            }
+                            self.dump_all_registers()?;
+                            self.print_stack()?;
+                            panic!("{}", name);
                         }
-                        // some memory failure
-                        0b100000 => {
-                            println!("memory failure");
-                        }
-                        0b100100 => {
-                            println!("data abort");
+                        PRINT_STRING => {
+                            let addr = self.get_reg(bindgen::hv_reg_t_HV_REG_X0)?;
+                            let len = self.get_reg(bindgen::hv_reg_t_HV_REG_X1)?;
+                            let slice = self.memory.get_slice(GuestAddress(addr), len as usize)?;
+                            let slice = unsafe {
+                                core::slice::from_raw_parts(slice.as_ptr(), len as usize)
+                            };
+                            println!("{}", core::str::from_utf8(slice)?);
                         }
                         other => {
-                            println!("unsupported exception class {:b}", other)
+                            panic!("unsupported HVC value {:x}", other);
                         }
                     }
-                    callback(Ok(self.exit_t())).unwrap();
                 }
-                err => {
-                    let err1 = anyhow!("hv_vcpu_run() returned {:?}", err);
-                    let err2 = anyhow!("hv_vcpu_run() returned {:?}", err);
-                    callback(Err(err1)).unwrap();
-                    return Err(err2);
+                // some memory failure
+                0b100000 => {
+                    println!("memory failure");
+                }
+                0b100100 => {
+                    println!("data abort");
+                }
+                other => {
+                    println!("unsupported exception class {:b}", other)
                 }
             }
         }
