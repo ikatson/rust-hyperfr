@@ -131,7 +131,10 @@ impl HfVm {
             entrypoint: None,
             exception_vector_table: None,
         };
-        debug!("mapping DRAM, start={:#x}, size={}", DRAM_MEM_START, MEMORY_SIZE);
+        debug!(
+            "mapping DRAM, start={:#x}, size={}",
+            DRAM_MEM_START, MEMORY_SIZE
+        );
         vm.map_new_memory(
             GuestAddress(DRAM_MEM_START as u64),
             MEMORY_SIZE,
@@ -152,10 +155,10 @@ impl HfVm {
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
         if !is_aligned_to_page_size(ipa.0) {
-            bail!("ipa {:x} is not aligned to page size", ipa.0)
+            bail!("ipa {:#x} is not aligned to page size", ipa.0)
         }
         if !is_aligned_to_page_size(size as u64) {
-            bail!("size {:x} is not a multiple of page size", size)
+            bail!("size {:#x} is not a multiple of page size", size)
         }
         debug!(
             "allocating new guest memory, base address {:#x?}, size {:?}",
@@ -177,13 +180,13 @@ impl HfVm {
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
         if !is_aligned_to_page_size(addr as u64) {
-            bail!("addr {:x} is not aligned to page size", addr as u64)
+            bail!("addr {:#x} is not aligned to page size", addr as u64)
         }
         if !is_aligned_to_page_size(ipa.0) {
-            bail!("ipa {:x} is not aligned to page size", ipa.0)
+            bail!("ipa {:#x} is not aligned to page size", ipa.0)
         }
         if !is_aligned_to_page_size(size as u64) {
-            bail!("size {:x} is not a multiple of page size", size)
+            bail!("size {:#x} is not a multiple of page size", size)
         }
 
         debug!(
@@ -551,7 +554,16 @@ impl VCpu {
         )?;
 
         // Testing interrupts
-        // assert_hv_return_t_ok(unsafe {bindgen::hv_vcpu_set_pending_interrupt(self.id, bindgen::hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ, true)}, "hv_vcpu_set_pending_interrupt")?;
+        assert_hv_return_t_ok(
+            unsafe {
+                bindgen::hv_vcpu_set_pending_interrupt(
+                    self.id,
+                    bindgen::hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ,
+                    true,
+                )
+            },
+            "hv_vcpu_set_pending_interrupt",
+        )?;
 
         loop {
             assert_hv_return_t_ok(unsafe { bindgen::hv_vcpu_run(self.id) }, "hv_vcpu_run")?;
