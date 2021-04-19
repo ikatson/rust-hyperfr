@@ -554,16 +554,16 @@ impl VCpu {
         )?;
 
         // Testing interrupts
-        assert_hv_return_t_ok(
-            unsafe {
-                bindgen::hv_vcpu_set_pending_interrupt(
-                    self.id,
-                    bindgen::hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ,
-                    true,
-                )
-            },
-            "hv_vcpu_set_pending_interrupt",
-        )?;
+        // assert_hv_return_t_ok(
+        //     unsafe {
+        //         bindgen::hv_vcpu_set_pending_interrupt(
+        //             self.id,
+        //             bindgen::hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ,
+        //             true,
+        //         )
+        //     },
+        //     "hv_vcpu_set_pending_interrupt",
+        // )?;
 
         loop {
             assert_hv_return_t_ok(unsafe { bindgen::hv_vcpu_run(self.id) }, "hv_vcpu_run")?;
