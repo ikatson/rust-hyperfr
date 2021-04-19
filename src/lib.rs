@@ -1,14 +1,17 @@
 use anyhow::{anyhow, bail, Context};
 use bindgen::{hv_exit_reason_t, NSObject};
 use bitflags::bitflags;
-use std::{io::Write, sync::Arc};
 use std::{
     convert::{TryFrom, TryInto},
     ops::Add,
     path::Path,
     thread::JoinHandle,
 };
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, MemoryRegionAddress};
+use std::{io::Write, sync::Arc};
+use vm_memory::{
+    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion,
+    MemoryRegionAddress,
+};
 
 // mod page_table;
 
@@ -122,7 +125,9 @@ impl HfVm {
                     (GuestAddress(EXEC_START as u64), EXEC_MEM_SIZE),
                     (GuestAddress(DRAM_MEM_START as u64), MEMORY_SIZE),
                 ])?;
-                let vm = Self { memory: Arc::new(memory) };
+                let vm = Self {
+                    memory: Arc::new(memory),
+                };
                 vm.memory.with_regions(|_, region| -> anyhow::Result<()> {
                     let host_addr = region.get_host_address(MemoryRegionAddress(0))?;
                     vm.map_memory(
@@ -498,6 +503,8 @@ impl VCpu {
         // FP state
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_CPACR_EL1);
 
+        dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_ESR_EL1);
+
         Ok(())
     }
 
@@ -519,15 +526,13 @@ impl VCpu {
     where
         F: FnMut(anyhow::Result<HfVcpuExit>) -> anyhow::Result<()>,
     {
-        self.set_sys_reg(
-            bindgen::hv_sys_reg_t_HV_SYS_REG_SP_EL1,
-            STACK_END,
-        )
-        .context("failed setting stack pointer")?;
+        self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SP_EL1, STACK_END)
+            .context("failed setting stack pointer")?;
         self.set_reg(bindgen::hv_reg_t_HV_REG_PC, start_state.guest_pc.0)
             .context("failed setting initial program counter")?;
 
-        self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_VBAR_EL1, 0x40_0000).context("failed setting VBAR")?;
+        self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_VBAR_EL1, 0x40_0000)
+            .context("failed setting VBAR")?;
 
         {
             // Enable floating point
@@ -610,7 +615,14 @@ impl VCpu {
                                     panic!("exception")
                                 }
                                 SYNCHRONOUS_EXCEPTION => {
-                                    println!("synchronous exception");
+                                    let el1_syndrome = Syndrome::from(
+                                        self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ESR_EL1)?,
+                                    );
+                                    println!(
+                                        "synchronous exception. Decoded ESR_EL1: {:#x?}",
+                                        el1_syndrome
+                                    );
+
                                     self.dump_all_registers()?;
                                     self.print_stack()?;
                                     panic!("synchronous exception");
@@ -618,8 +630,11 @@ impl VCpu {
                                 PRINT_STRING => {
                                     let addr = self.get_reg(bindgen::hv_reg_t_HV_REG_X0)?;
                                     let len = self.get_reg(bindgen::hv_reg_t_HV_REG_X1)?;
-                                    let slice = self.memory.get_slice(GuestAddress(addr), len as usize)?;
-                                    let slice = unsafe {core::slice::from_raw_parts(slice.as_ptr(), len as usize)};
+                                    let slice =
+                                        self.memory.get_slice(GuestAddress(addr), len as usize)?;
+                                    let slice = unsafe {
+                                        core::slice::from_raw_parts(slice.as_ptr(), len as usize)
+                                    };
                                     println!("{}", core::str::from_utf8(slice)?);
                                 }
                                 other => {
@@ -654,20 +669,20 @@ impl VCpu {
 #[derive(Debug)]
 pub struct Syndrome {
     exception_class: u8,
-    is_32_bit_instruction: bool,
     iss: u32,
+    original_value: u64,
 }
 
-impl From<bindgen::hv_exception_syndrome_t> for Syndrome {
-    fn from(s: bindgen::hv_exception_syndrome_t) -> Self {
+impl From<u64> for Syndrome {
+    fn from(s: u64) -> Self {
+        let orig = s;
         let s = s as u32;
-        let eclass = (s >> 26) as u8;
-        let is_32_bit = (s >> 25) & 1 == 1;
+        let eclass = ((s >> 26) & 0b111111) as u8;
         let iss = s & 0xffffff;
         Self {
             exception_class: eclass,
-            is_32_bit_instruction: is_32_bit,
             iss,
+            original_value: orig,
         }
     }
 }
