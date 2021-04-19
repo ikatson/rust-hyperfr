@@ -131,6 +131,7 @@ impl HfVm {
             entrypoint: None,
             exception_vector_table: None,
         };
+        debug!("mapping DRAM, start={:#x}, size={}", DRAM_MEM_START, MEMORY_SIZE);
         vm.map_new_memory(
             GuestAddress(DRAM_MEM_START as u64),
             MEMORY_SIZE,
