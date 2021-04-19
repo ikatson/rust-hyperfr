@@ -12,7 +12,7 @@ bindgen:
 run:
 	cargo build
 	codesign --entitlements vz.entitlements -s - target/debug/main
-	target/debug/main /Users/igor/projects/2021-04-os-hypervisor-framework/armos/target/aarch64-unknown-none/release/armos
+	RUST_LOG=debug target/debug/main /Users/igor/projects/2021-04-os-hypervisor-framework/armos/target/aarch64-unknown-none/release/armos
 
 
 .PHONY: test

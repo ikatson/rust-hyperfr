@@ -15,4 +15,6 @@ bitflags = "1"
 memmap = "0.7"
 object = "*"
 hexdump = "*"
+log = "*"
+pretty_env_logger = "*"
 vm-memory = {version = "*", features = ["backend-mmap"]}

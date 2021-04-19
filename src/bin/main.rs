@@ -1,17 +1,19 @@
-pub const DRAM_MEM_START: usize = 0x8000_0000; // 2 GB.
-                                               // This is bad, but seems to fuck up without a page table if set to higher, as the executable is not a PIE one.
-pub const EXEC_START: usize = 0; // 512 MB,
-pub const MAPPED_IO_START: u64 = 1 << 30; // 1 GB
-pub const MEM_SIZE: usize = 32 * 1024 * 1024;
+use anyhow::Context;
 
-fn main() {
-    let mut vm = hyperfr::HfVm::new().unwrap();
+fn main() -> anyhow::Result<()> {
+    pretty_env_logger::init();
+
+    let mut vm = hyperfr::HfVm::new().context("error creating HfVm")?;
     let mut args = std::env::args_os();
-    let image = args.nth(1).unwrap();
+    let image = args
+        .nth(1)
+        .context("first argument missing, required filename of the ELF image of the kernel")?;
 
-    let elf = vm.load_elf(&image).unwrap();
-    let memory = vm.get_memory();
-
-    let vcpu = vm.vcpu_create_and_run(memory, elf.entrypoint);
-    vcpu.join().unwrap().unwrap();
+    vm.load_elf(&image)
+        .with_context(|| format!("error loading ELF image from filename {:?}", &image))?;
+    let join = vm
+        .vcpu_create_and_run(None)
+        .context("error creating and running vcpu")?;
+    join.join().unwrap()?;
+    Ok(())
 }
