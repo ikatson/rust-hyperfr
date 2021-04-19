@@ -126,23 +126,17 @@ fn assert_hv_return_t_ok(v: bindgen::hv_return_t, name: &str) -> anyhow::Result<
 impl HfVm {
     pub fn new() -> anyhow::Result<Self> {
         assert_hv_return_t_ok(unsafe { bindgen::hv_vm_create(null_obj()) }, "hv_vm_create")?;
-        let memory =
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(DRAM_MEM_START as u64), MEMORY_SIZE)])?;
-        let vm = Self {
-            memory: Arc::new(memory),
+        let mut vm = Self {
+            memory: Arc::new(GuestMemoryMmap::new()),
             entrypoint: None,
             exception_vector_table: None,
         };
-        vm.memory.with_regions(|_, region| -> anyhow::Result<()> {
-            let host_addr = region.get_host_address(MemoryRegionAddress(0))?;
-            vm.map_memory(
-                host_addr,
-                region.start_addr(),
-                region.size(),
-                HvMemoryFlags::ALL,
-            )?;
-            Ok(())
-        })?;
+        vm.map_new_memory(
+            GuestAddress(DRAM_MEM_START as u64),
+            MEMORY_SIZE,
+            HvMemoryFlags::ALL,
+        )
+        .context("error mapping DRAM memory")?;
         Ok(vm)
     }
 
@@ -150,7 +144,30 @@ impl HfVm {
         self.memory.clone()
     }
 
-    fn map_memory(
+    fn map_new_memory(
+        &mut self,
+        ipa: GuestAddress,
+        size: usize,
+        flags: HvMemoryFlags,
+    ) -> anyhow::Result<()> {
+        if !is_aligned_to_page_size(ipa.0) {
+            bail!("ipa {:x} is not aligned to page size", ipa.0)
+        }
+        if !is_aligned_to_page_size(size as u64) {
+            bail!("size {:x} is not a multiple of page size", size)
+        }
+        debug!(
+            "allocating new guest memory, base address {:#x?}, size {:?}",
+            ipa.0, size
+        );
+        let map = Arc::new(GuestRegionMmap::new(MmapRegion::new(size)?, ipa)?);
+        let host_address = map.get_host_address(MemoryRegionAddress(0))?;
+        self.memory = Arc::new(self.memory.insert_region(map)?);
+        self.hf_map_memory(host_address, ipa, size, flags)?;
+        Ok(())
+    }
+
+    fn hf_map_memory(
         // void *addr, hv_ipa_t ipa, size_t size, hv_memory_flags_t flags
         &self,
         addr: *mut u8,
@@ -167,6 +184,11 @@ impl HfVm {
         if !is_aligned_to_page_size(size as u64) {
             bail!("size {:x} is not a multiple of page size", size)
         }
+
+        debug!(
+            "calling hv_vm_map: addr={:?}, ipa={:#x}, size={:?}, flags={:?}",
+            addr, ipa.0, size, flags
+        );
 
         assert_hv_return_t_ok(
             unsafe { bindgen::hv_vm_map(addr as *mut _, ipa.0, size as u64, flags.bits() as u64) },
@@ -185,44 +207,22 @@ impl HfVm {
             entrypoint: GuestAddress(obj.entry()),
         };
 
-        let mut min_address = u64::MAX;
-        let mut max_address = u64::MIN;
-        let mut section_found = false;
-
         for section in obj.sections() {
             use object::SectionKind::*;
             match section.kind() {
                 Text | Data | ReadOnlyData => {
-                    section_found = true;
-                    min_address = min_address.min(section.address());
-                    max_address = max_address.max(section.address() + section.size())
-                }
-                _ => {}
-            }
-        }
+                    let flags = match section.kind() {
+                        Text => HvMemoryFlags::HV_MEMORY_READ | HvMemoryFlags::HV_MEMORY_EXEC,
+                        Data => HvMemoryFlags::HV_MEMORY_READ | HvMemoryFlags::HV_MEMORY_WRITE,
+                        ReadOnlyData => HvMemoryFlags::HV_MEMORY_READ,
+                        _ => unreachable!(),
+                    };
+                    let start = align_down_to_page_size(section.address());
+                    let end = align_up_to_page_size(section.address() + section.size());
+                    let size = (end - start) as usize;
+                    debug!("mapping new memory for section {}", section.name()?);
+                    self.map_new_memory(GuestAddress(start), size, flags)?;
 
-        assert!(section_found);
-
-        min_address = align_down_to_page_size(min_address);
-        max_address = align_up_to_page_size(max_address);
-        assert!(max_address > min_address);
-        let size = (max_address - min_address) as usize;
-        let map = Arc::new(GuestRegionMmap::new(
-            MmapRegion::new(size)?,
-            GuestAddress(min_address),
-        )?);
-        self.map_memory(
-            map.as_ptr(),
-            GuestAddress(min_address),
-            size,
-            HvMemoryFlags::ALL,
-        )?;
-        self.memory = Arc::new(self.memory.insert_region(map)?);
-
-        for section in obj.sections() {
-            use object::SectionKind::*;
-            match section.kind() {
-                Text | Data | ReadOnlyData => {
                     let data = section.data()?;
                     let slice = self
                         .memory
@@ -241,64 +241,10 @@ impl HfVm {
                 break;
             }
         }
-        assert!(self.exception_vector_table.is_some());
+        if self.exception_vector_table.is_none() {
+            bail!("did not find symbol \"exception_vector_table\" in the ELF file")
+        }
 
-        // println!("Min addr: {:x}, max addr: {:x}", min_address, max_address);
-
-        // let mut mmap = memmap::MmapOptions::default().len(max_address - min_address).map_anon()?;
-        // for section in obj.sections() {
-        //     use object::SectionKind::*;
-        //     match section.kind() {
-        //         Text | Data | ReadOnlyData => {
-        //             let offset = section.address() as usize - min_address;
-        //             let data = &mut mmap.as_mut()[offset..offset + section.size() as usize];
-        //             data.copy_from_slice(section.data().unwrap());
-        //         },
-        //         other => {
-        //             println!("ignoring section {:?} with kind {:?}", section.name(), other);
-        //         }
-        //     }
-        // }
-
-        // self.memory.get_host_address(addr)
-
-        // self.map_memory(mmap.as_ptr().into(), (offset + min_address).into(), mmap.len(), HvMemoryFlags::ALL)?;
-        // result.maps.push(mmap);
-
-        // for section in obj.sections() {
-        //     use object::SectionKind::*;
-        //     match section.kind() {
-        //         Text | Data | ReadOnlyData => {
-        //             dbg!(section.name().unwrap_or_default(), section.kind());
-        //             let aligned_start = addresses.align(section.address());
-        //             let start_offset = section.address() as usize - aligned_start.as_usize();
-        //             let aligned_end = addresses.align_up(section.address() + section.size());
-        //             let mmap_len = aligned_end.as_usize() - aligned_start.as_usize();
-        //             let mut mmap = memmap::MmapOptions::default().len(mmap_len).map_anon()?;
-        //             let flags = match section.kind() {
-        //                 Text => HvMemoryFlags::HV_MEMORY_EXEC | HvMemoryFlags::HV_MEMORY_READ,
-        //                 Data => HvMemoryFlags::HV_MEMORY_WRITE | HvMemoryFlags::HV_MEMORY_READ,
-        //                 ReadOnlyData => HvMemoryFlags::HV_MEMORY_READ,
-        //                 _ => unreachable!()
-        //             };
-        //             self.map_memory(Address::from(mmap.as_ptr()), offset.into(), mmap_len, flags)?;
-
-        //             let data = &mut mmap.as_mut()[start_offset..(start_offset + section.size() as usize)];
-        //             data.copy_from_slice(section.data().unwrap());
-
-        //             result.maps.push(mmap);
-        //         }
-        //         Tls => unimplemented!(),
-        //         UninitializedTls => unimplemented!(),
-        //         TlsVariables => unimplemented!(),
-        //         other => {
-        //             println!("ignoring section {:?} with kind {:?}", section.name(), other);
-        //         },
-        //     }
-        // }
-
-        // dbg!(obj.entry());
-        // dbg!(obj.object_map());
         Ok(result)
     }
 
@@ -396,7 +342,12 @@ impl VCpu {
     fn exit_t(&self) -> HfVcpuExit {
         unsafe { self.exit_t.as_ref().unwrap().into() }
     }
-    fn set_reg(&mut self, reg: bindgen::hv_reg_t, value: u64, debug_name: Option<&str>) -> anyhow::Result<()> {
+    fn set_reg(
+        &mut self,
+        reg: bindgen::hv_reg_t,
+        value: u64,
+        debug_name: Option<&str>,
+    ) -> anyhow::Result<()> {
         if let Some(name) = debug_name {
             debug!("setting register {} to {:#x}", name, value);
         }
@@ -405,7 +356,12 @@ impl VCpu {
             "hv_vcpu_set_reg",
         )
     }
-    fn set_sys_reg(&mut self, reg: bindgen::hv_sys_reg_t, value: u64, debug_name: Option<&str>) -> anyhow::Result<()> {
+    fn set_sys_reg(
+        &mut self,
+        reg: bindgen::hv_sys_reg_t,
+        value: u64,
+        debug_name: Option<&str>,
+    ) -> anyhow::Result<()> {
         if let Some(name) = debug_name {
             debug!("setting system register {} to {:#x}", name, value);
         }
@@ -539,13 +495,17 @@ impl VCpu {
             Some("SP_EL1"),
         )
         .context("failed setting stack pointer")?;
-        self.set_reg(bindgen::hv_reg_t_HV_REG_PC, start_state.guest_pc.0, Some("PC"))
-            .context("failed setting initial program counter")?;
+        self.set_reg(
+            bindgen::hv_reg_t_HV_REG_PC,
+            start_state.guest_pc.0,
+            Some("PC"),
+        )
+        .context("failed setting initial program counter")?;
 
         self.set_sys_reg(
             bindgen::hv_sys_reg_t_HV_SYS_REG_VBAR_EL1,
             start_state.exception_vector_table.0,
-            Some("VBAR_EL1")
+            Some("VBAR_EL1"),
         )
         .context("failed setting VBAR")?;
 
@@ -553,7 +513,11 @@ impl VCpu {
             // Enable floating point
             const FPEN_NO_TRAP: u64 = 0b11 << 20; // disable trapping of FP instructions
             const CPACR_EL1: u64 = FPEN_NO_TRAP;
-            self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_CPACR_EL1, CPACR_EL1, Some("CPACR_EL1"))?
+            self.set_sys_reg(
+                bindgen::hv_sys_reg_t_HV_SYS_REG_CPACR_EL1,
+                CPACR_EL1,
+                Some("CPACR_EL1"),
+            )?
         }
 
         {
@@ -579,7 +543,11 @@ impl VCpu {
         const PSTATE_FAULT_BITS_64: u64 =
             // PSR_MODE_EL1H | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
             PSR_MODE_EL1H;
-        self.set_reg(bindgen::hv_reg_t_HV_REG_CPSR, PSTATE_FAULT_BITS_64, Some("CPSR"))?;
+        self.set_reg(
+            bindgen::hv_reg_t_HV_REG_CPSR,
+            PSTATE_FAULT_BITS_64,
+            Some("CPSR"),
+        )?;
 
         // Testing interrupts
         // assert_hv_return_t_ok(unsafe {bindgen::hv_vcpu_set_pending_interrupt(self.id, bindgen::hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ, true)}, "hv_vcpu_set_pending_interrupt")?;
