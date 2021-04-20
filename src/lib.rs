@@ -91,7 +91,6 @@ impl TryFrom<bindgen::hv_return_t> for HVReturnT {
 pub struct HfVm {
     memory: Arc<GuestMemoryMmap>,
     entrypoint: Option<GuestAddress>,
-    exception_vector_table: Option<GuestAddress>,
 }
 
 #[derive(Default)]
@@ -129,7 +128,6 @@ impl HfVm {
         let mut vm = Self {
             memory: Arc::new(GuestMemoryMmap::new()),
             entrypoint: None,
-            exception_vector_table: None,
         };
         debug!(
             "mapping DRAM, start={:#x}, size={}",
@@ -238,17 +236,6 @@ impl HfVm {
         }
 
         self.entrypoint = Some(result.entrypoint);
-        for symbol in obj.symbols() {
-            // This is defined in vector.o
-            if symbol.name()? == "exception_vector_table" {
-                self.exception_vector_table = Some(GuestAddress(symbol.address()));
-                break;
-            }
-        }
-        if self.exception_vector_table.is_none() {
-            bail!("did not find symbol \"exception_vector_table\" in the ELF file")
-        }
-
         Ok(result)
     }
 
@@ -260,14 +247,10 @@ impl HfVm {
         let entrypoint = entrypoint
             .or(self.entrypoint)
             .ok_or_else(|| anyhow!("entrypoint not set"))?;
-        let exception_vector_table = self
-            .exception_vector_table
-            .ok_or_else(|| anyhow!("exception_vector_table not set"))?;
         Ok(std::thread::spawn(move || {
             let vcpu = VCpu::new(memory).unwrap();
             let start_state = VcpuStartState {
                 guest_pc: entrypoint,
-                exception_vector_table,
             };
             vcpu.simple_run_loop(start_state)
         }))
@@ -327,7 +310,6 @@ impl From<&bindgen::hv_vcpu_exit_t> for HfVcpuExit {
 
 struct VcpuStartState {
     guest_pc: GuestAddress,
-    exception_vector_table: GuestAddress,
 }
 
 impl VCpu {
@@ -506,13 +488,6 @@ impl VCpu {
         )
         .context("failed setting initial program counter")?;
 
-        self.set_sys_reg(
-            bindgen::hv_sys_reg_t_HV_SYS_REG_VBAR_EL1,
-            start_state.exception_vector_table.0,
-            Some("VBAR_EL1"),
-        )
-        .context("failed setting VBAR")?;
-
         {
             // Enable floating point
             const FPEN_NO_TRAP: u64 = 0b11 << 20; // disable trapping of FP instructions
@@ -552,18 +527,6 @@ impl VCpu {
             PSTATE_FAULT_BITS_64,
             Some("CPSR"),
         )?;
-
-        // Testing interrupts
-        // assert_hv_return_t_ok(
-        //     unsafe {
-        //         bindgen::hv_vcpu_set_pending_interrupt(
-        //             self.id,
-        //             bindgen::hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ,
-        //             true,
-        //         )
-        //     },
-        //     "hv_vcpu_set_pending_interrupt",
-        // )?;
 
         loop {
             assert_hv_return_t_ok(unsafe { bindgen::hv_vcpu_run(self.id) }, "hv_vcpu_run")?;
@@ -627,18 +590,49 @@ impl VCpu {
                     error!("memory failure");
                     self.dump_all_registers()?;
                     self.print_stack()?;
+                    error!("{:#x?}", self.exit_t());
                     panic!("memory failure");
                 }
                 0b100100 => {
                     error!("data abort");
                     self.dump_all_registers()?;
-                    self.print_stack()?;
+
+                    let syn = self.exit_t().decoded_syndrome;
+                    let iss = syn.iss;
+                    error!("{:#x?}", self.exit_t());
+
+                    let is_valid = ((iss >> 24) & 1) == 1;
+                    let sas = ((iss >> 22) & 0b11) as u8;
+                    let len = (1 << sas) as u8;
+                    let sse = ((iss >> 21) & 1) == 1;
+                    let srt = ((iss >> 16) & 31) as u8;
+                    let sf = ((iss >> 15) & 1) == 1;
+                    let ar = ((iss >> 14) & 1) == 1;
+                    let is_write = ((iss >> 6) & 1) == 1;
+                    let value = match is_write {
+                        true => Some(self.get_reg(bindgen::hv_reg_t_HV_REG_X0 + (srt as u32))?),
+                        false => None,
+                    };
+                    error!("data abort: is_valid={} sas={} (len={}) sse={} srt={} (reg=X{}) sf={} ar={} is_write={} value=0x{:x?}", is_valid, sas, len, sse, srt, srt, sf, ar, is_write, value);
+
                     panic!("data abort");
                 }
                 other => {
                     error!("unsupported exception class {:b}", other)
                 }
             }
+
+            // Testing interrupts
+            // assert_hv_return_t_ok(
+            //     unsafe {
+            //         bindgen::hv_vcpu_set_pending_interrupt(
+            //             self.id,
+            //             bindgen::hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ,
+            //             true,
+            //         )
+            //     },
+            //     "hv_vcpu_set_pending_interrupt",
+            // )?;
         }
     }
 }
@@ -647,19 +641,23 @@ impl VCpu {
 pub struct Syndrome {
     exception_class: u8,
     iss: u32,
+    iss2: u8,
+    il_32_bit: bool,
     original_value: u64,
 }
 
 impl From<u64> for Syndrome {
     fn from(s: u64) -> Self {
-        let orig = s;
-        let s = s as u32;
         let eclass = ((s >> 26) & 0b111111) as u8;
-        let iss = s & 0xffffff;
+        let iss = (s & 0x01ff_ffff) as u32;
+        let iss2 = ((s >> 32) & 31) as u8;
+        let il_32_bit = (s >> 25) & 1 > 0;
         Self {
             exception_class: eclass,
             iss,
-            original_value: orig,
+            original_value: s,
+            il_32_bit,
+            iss2,
         }
     }
 }
