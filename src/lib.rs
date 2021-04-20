@@ -212,24 +212,33 @@ impl HfVm {
         for section in obj.sections() {
             use object::SectionKind::*;
             match section.kind() {
-                Text | Data | ReadOnlyData => {
+                Text | Data | ReadOnlyData | UninitializedData => {
                     let flags = match section.kind() {
                         Text => HvMemoryFlags::HV_MEMORY_READ | HvMemoryFlags::HV_MEMORY_EXEC,
                         Data => HvMemoryFlags::HV_MEMORY_READ | HvMemoryFlags::HV_MEMORY_WRITE,
                         ReadOnlyData => HvMemoryFlags::HV_MEMORY_READ,
+                        UninitializedData => {
+                            HvMemoryFlags::HV_MEMORY_READ | HvMemoryFlags::HV_MEMORY_WRITE
+                        }
                         _ => unreachable!(),
                     };
                     let start = align_down_to_page_size(section.address());
                     let end = align_up_to_page_size(section.address() + section.size());
                     let size = (end - start) as usize;
-                    debug!("mapping new memory for section {}", section.name()?);
+                    debug!(
+                        "mapping new memory for section {}, section size {}",
+                        section.name()?,
+                        section.size()
+                    );
                     self.map_new_memory(GuestAddress(start), size, flags)?;
 
                     let data = section.data()?;
-                    let slice = self
-                        .memory
-                        .get_slice(GuestAddress(section.address()), section.size() as usize)?;
-                    slice.copy_from(data);
+                    if !data.is_empty() {
+                        let slice = self
+                            .memory
+                            .get_slice(GuestAddress(section.address()), section.size() as usize)?;
+                        slice.copy_from(data);
+                    }
                 }
                 _ => {}
             }
@@ -312,6 +321,101 @@ struct VcpuStartState {
     guest_pc: GuestAddress,
 }
 
+struct DataAbortFlags(pub u32);
+
+impl DataAbortFlags {
+    fn is_valid(&self) -> bool {
+        ((self.0 >> 24) & 1) == 1
+    }
+    fn sas(&self) -> Option<u8> {
+        if self.is_valid() {
+            Some(((self.0 >> 22) & 0b11) as u8)
+        } else {
+            None
+        }
+    }
+    fn sas_len(&self) -> Option<u8> {
+        self.sas().map(|sas| 1 << sas)
+    }
+    fn sse(&self) -> Option<bool> {
+        if self.is_valid() {
+            Some(((self.0 >> 21) & 1) == 1)
+        } else {
+            None
+        }
+    }
+    fn srt(&self) -> Option<u8> {
+        if self.is_valid() {
+            Some(((self.0 >> 16) & 31) as u8)
+        } else {
+            None
+        }
+    }
+    fn sf(&self) -> Option<bool> {
+        if self.is_valid() {
+            Some(((self.0 >> 15) & 1) == 1)
+        } else {
+            None
+        }
+    }
+    fn af(&self) -> Option<bool> {
+        if self.is_valid() {
+            Some(((self.0 >> 15) & 1) == 1)
+        } else {
+            None
+        }
+    }
+
+    fn is_write(&self) -> bool {
+        ((self.0 >> 6) & 1) == 1
+    }
+
+    fn far_is_valid(&self) -> bool {
+        ((self.0 >> 10) & 1) == 0
+    }
+
+    fn dfsc(&self) -> u8 {
+        (self.0 & 0b11111) as u8
+    }
+}
+
+impl core::fmt::Debug for DataAbortFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("DataAbortFlags[is_valid={}", self.is_valid()))?;
+        if let (Some(sas), Some(length), Some(sse), Some(srt), Some(sf), Some(af)) = (
+            self.sas(),
+            self.sas_len(),
+            self.sse(),
+            self.srt(),
+            self.sf(),
+            self.af(),
+        ) {
+            f.write_fmt(format_args!(
+                ", sas={} (length={}), sse={}, srt={} (register=X{}), sf={}, af={}",
+                sas, length, sse, srt, srt, sf, af,
+            ))?;
+        };
+        if self.dfsc() == 0b010000 {
+            f.write_fmt(format_args!(", far_is_valid={}", self.far_is_valid()))?
+        };
+
+        f.write_fmt(format_args!(
+            ", is_write={}, dfsc={:#b}]",
+            self.is_write(),
+            self.dfsc()
+        ))?;
+
+        Ok(())
+    }
+}
+
+#[repr(C)]
+struct StartParams {
+    dram_start: u64,
+    dram_usable_start: u64,
+    dram_size: u64,
+}
+
 impl VCpu {
     fn new(memory: Arc<GuestMemoryMmap>) -> anyhow::Result<Self> {
         let mut vcpu = Self {
@@ -328,15 +432,8 @@ impl VCpu {
     fn exit_t(&self) -> HfVcpuExit {
         unsafe { self.exit_t.as_ref().unwrap().into() }
     }
-    fn set_reg(
-        &mut self,
-        reg: bindgen::hv_reg_t,
-        value: u64,
-        debug_name: Option<&str>,
-    ) -> anyhow::Result<()> {
-        if let Some(name) = debug_name {
-            debug!("setting register {} to {:#x}", name, value);
-        }
+    fn set_reg(&mut self, reg: bindgen::hv_reg_t, value: u64, name: &str) -> anyhow::Result<()> {
+        debug!("setting register {} to {:#x}", name, value);
         assert_hv_return_t_ok(
             unsafe { bindgen::hv_vcpu_set_reg(self.id, reg, value) },
             "hv_vcpu_set_reg",
@@ -346,11 +443,9 @@ impl VCpu {
         &mut self,
         reg: bindgen::hv_sys_reg_t,
         value: u64,
-        debug_name: Option<&str>,
+        name: &str,
     ) -> anyhow::Result<()> {
-        if let Some(name) = debug_name {
-            debug!("setting system register {} to {:#x}", name, value);
-        }
+        debug!("setting system register {} to {:#x}", name, value);
         assert_hv_return_t_ok(
             unsafe { bindgen::hv_vcpu_set_sys_reg(self.id, reg, value) },
             "hv_vcpu_set_sys_reg",
@@ -474,19 +569,30 @@ impl VCpu {
         DRAM_MEM_START + MEMORY_SIZE as u64 - STACK_SIZE * self.id
     }
 
+    fn debug_data_abort(&mut self, iss: u32) -> anyhow::Result<()> {
+        let dai = DataAbortFlags(iss);
+        let write_value = match (dai.is_write(), dai.srt()) {
+            (true, Some(srt)) => Some(self.get_reg(bindgen::hv_reg_t_HV_REG_X0 + (srt as u32))?),
+            _ => None,
+        };
+        error!(
+            "unhandled data abort: address={:#x?}, flags={:?}, write_value={:#x?}",
+            self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_FAR_EL1)?,
+            &dai,
+            write_value
+        );
+        Ok(())
+    }
+
     fn simple_run_loop(mut self, start_state: VcpuStartState) -> anyhow::Result<()> {
         self.set_sys_reg(
             bindgen::hv_sys_reg_t_HV_SYS_REG_SP_EL1,
             self.get_stack_end(),
-            Some("SP_EL1"),
+            "SP_EL1",
         )
         .context("failed setting stack pointer")?;
-        self.set_reg(
-            bindgen::hv_reg_t_HV_REG_PC,
-            start_state.guest_pc.0,
-            Some("PC"),
-        )
-        .context("failed setting initial program counter")?;
+        self.set_reg(bindgen::hv_reg_t_HV_REG_PC, start_state.guest_pc.0, "PC")
+            .context("failed setting initial program counter")?;
 
         {
             // Enable floating point
@@ -495,7 +601,7 @@ impl VCpu {
             self.set_sys_reg(
                 bindgen::hv_sys_reg_t_HV_SYS_REG_CPACR_EL1,
                 CPACR_EL1,
-                Some("CPACR_EL1"),
+                "CPACR_EL1",
             )?
         }
 
@@ -522,11 +628,27 @@ impl VCpu {
         const PSTATE_FAULT_BITS_64: u64 =
             // PSR_MODE_EL1H | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
             PSR_MODE_EL1H;
-        self.set_reg(
-            bindgen::hv_reg_t_HV_REG_CPSR,
-            PSTATE_FAULT_BITS_64,
-            Some("CPSR"),
-        )?;
+        self.set_reg(bindgen::hv_reg_t_HV_REG_CPSR, PSTATE_FAULT_BITS_64, "CPSR")?;
+
+        {
+            let start_params = StartParams {
+                dram_start: DRAM_MEM_START,
+                dram_usable_start: DRAM_MEM_START + (core::mem::size_of::<StartParams>() as u64),
+                dram_size: MEMORY_SIZE as u64,
+            };
+            let start_params_mem = self.memory.get_slice(
+                GuestAddress(DRAM_MEM_START),
+                core::mem::size_of::<StartParams>(),
+            )?;
+            unsafe {
+                core::ptr::copy(
+                    &start_params,
+                    start_params_mem.as_ptr() as *mut StartParams,
+                    1,
+                )
+            };
+            self.set_reg(bindgen::hv_reg_t_HV_REG_X0, DRAM_MEM_START, "X0")?;
+        }
 
         loop {
             assert_hv_return_t_ok(unsafe { bindgen::hv_vcpu_run(self.id) }, "hv_vcpu_run")?;
@@ -556,7 +678,7 @@ impl VCpu {
                             panic!("panic in the guest")
                         }
                         EXCEPTION | SYNCHRONOUS_EXCEPTION | IRQ => {
-                            let name = match iss as u8 {
+                            let mut name = match iss as u8 {
                                 EXCEPTION => "UNHANDLED exception",
                                 SYNCHRONOUS_EXCEPTION => "SYNCHRONOUS exception",
                                 IRQ => "IRQ",
@@ -565,11 +687,17 @@ impl VCpu {
                             let el1_syndrome = Syndrome::from(
                                 self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ESR_EL1)?,
                             );
-                            error!("{}. Decoded ESR_EL1: {:#x?}", name, el1_syndrome);
 
+                            match el1_syndrome.exception_class {
+                                0b100100 | 0b100101 => {
+                                    self.debug_data_abort(el1_syndrome.iss)?;
+                                    name = "data abort";
+                                }
+                                _ => {}
+                            }
                             self.dump_all_registers()?;
                             self.print_stack()?;
-                            panic!("{}", name);
+                            panic!("Exception in EL1 -> EL1: {}", name);
                         }
                         PRINT_STRING => {
                             let addr = self.get_reg(bindgen::hv_reg_t_HV_REG_X0)?;
@@ -594,30 +722,8 @@ impl VCpu {
                     panic!("memory failure");
                 }
                 0b100100 => {
-                    error!("data abort");
-                    self.dump_all_registers()?;
-
-                    let syn = self.exit_t().decoded_syndrome;
-                    let iss = syn.iss;
-                    error!("{:#x?}", self.exit_t());
-
-                    let is_valid = ((iss >> 24) & 1) == 1;
-                    let sas = ((iss >> 22) & 0b11) as u8;
-                    let len = (1 << sas) as u8;
-                    let sse = ((iss >> 21) & 1) == 1;
-                    let srt = ((iss >> 16) & 31) as u8;
-                    let sf = ((iss >> 15) & 1) == 1;
-                    let ar = ((iss >> 14) & 1) == 1;
-                    let is_write = ((iss >> 6) & 1) == 1;
-                    let value = match is_write {
-                        true => Some(self.get_reg(bindgen::hv_reg_t_HV_REG_X0 + (srt as u32))?),
-                        false => None,
-                    };
-                    error!("data abort: is_valid={} sas={} (len={}) sse={} srt={} (reg=X{}) sf={} ar={} is_write={} value=0x{:x?}", is_valid, sas, len, sse, srt, srt, sf, ar, is_write, value);
-
-                    // panic!("data abort");
-                    let next_pc = self.get_reg(bindgen::hv_reg_t_HV_REG_PC)? + 4;
-                    self.set_reg(bindgen::hv_reg_t_HV_REG_PC, next_pc, Some("PC"))?;
+                    self.debug_data_abort(self.exit_t().decoded_syndrome.iss)?;
+                    panic!("data abort EL1 -> EL2");
                 }
                 other => {
                     error!("unsupported exception class {:b}", other)
@@ -651,7 +757,7 @@ pub struct Syndrome {
 impl From<u64> for Syndrome {
     fn from(s: u64) -> Self {
         let eclass = ((s >> 26) & 0b111111) as u8;
-        let iss = (s & 0x01ff_ffff) as u32;
+        let iss = (s & ((1 << 25) - 1)) as u32;
         let iss2 = ((s >> 32) & 31) as u8;
         let il_32_bit = (s >> 25) & 1 > 0;
         Self {
