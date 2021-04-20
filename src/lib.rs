@@ -578,7 +578,7 @@ impl VCpu {
                             let slice = unsafe {
                                 core::slice::from_raw_parts(slice.as_ptr(), len as usize)
                             };
-                            println!("{}", core::str::from_utf8(slice)?);
+                            print!("{}", core::str::from_utf8(slice)?);
                         }
                         other => {
                             panic!("unsupported HVC value {:x}", other);
@@ -615,7 +615,9 @@ impl VCpu {
                     };
                     error!("data abort: is_valid={} sas={} (len={}) sse={} srt={} (reg=X{}) sf={} ar={} is_write={} value=0x{:x?}", is_valid, sas, len, sse, srt, srt, sf, ar, is_write, value);
 
-                    panic!("data abort");
+                    // panic!("data abort");
+                    let next_pc = self.get_reg(bindgen::hv_reg_t_HV_REG_PC)? + 4;
+                    self.set_reg(bindgen::hv_reg_t_HV_REG_PC, next_pc, Some("PC"))?;
                 }
                 other => {
                     error!("unsupported exception class {:b}", other)
