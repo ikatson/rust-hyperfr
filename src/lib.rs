@@ -203,7 +203,7 @@ impl HfVm {
         let map = unsafe { memmap::MmapOptions::default().map(&file) }?;
         let obj = object::File::parse(&map)?;
         use object::read::ObjectSection;
-        use object::{Object, ObjectSymbol};
+        use object::Object;
 
         let result = LoadedElf {
             entrypoint: GuestAddress(obj.entry()),
