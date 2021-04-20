@@ -200,7 +200,8 @@ impl HfVm {
 
     pub fn load_elf<P: AsRef<Path>>(&mut self, filename: P) -> anyhow::Result<LoadedElf> {
         let file = std::fs::File::open(filename)?;
-        let map = unsafe { memmap::MmapOptions::default().map(&file) }?;
+        let map = unsafe { memmap::MmapOptions::default().map(&file) }
+            .context("error mmmapping ELF file")?;
         let obj = object::File::parse(&map)?;
         use object::read::ObjectSection;
         use object::Object;
@@ -211,6 +212,12 @@ impl HfVm {
 
         for section in obj.sections() {
             use object::SectionKind::*;
+            let section_name = section.name().with_context(|| {
+                format!(
+                    "error determining section name at {:#x?}",
+                    section.address()
+                )
+            })?;
             match section.kind() {
                 Text | Data | ReadOnlyData | UninitializedData => {
                     let flags = match section.kind() {
@@ -227,16 +234,25 @@ impl HfVm {
                     let size = (end - start) as usize;
                     debug!(
                         "mapping new memory for section {}, section size {}",
-                        section.name()?,
+                        section_name,
                         section.size()
                     );
-                    self.map_new_memory(GuestAddress(start), size, flags)?;
+                    self.map_new_memory(GuestAddress(start), size, flags)
+                        .with_context(|| {
+                            format!("error mapping memory for section {}", section_name)
+                        })?;
 
                     let data = section.data()?;
                     if !data.is_empty() {
                         let slice = self
                             .memory
-                            .get_slice(GuestAddress(section.address()), section.size() as usize)?;
+                            .get_slice(GuestAddress(section.address()), section.size() as usize)
+                            .with_context(|| {
+                                format!(
+                                    "error getting the slice of memory for section {}",
+                                    section_name
+                                )
+                            })?;
                         slice.copy_from(data);
                     }
                 }
