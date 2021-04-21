@@ -14,7 +14,7 @@ use vm_memory::{
 
 use log::{debug, error, info};
 
-// mod page_table;
+mod page_table;
 
 pub fn get_page_size() -> u64 {
     unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) as u64 }
@@ -91,6 +91,7 @@ impl TryFrom<bindgen::hv_return_t> for HVReturnT {
 pub struct HfVm {
     memory: Arc<GuestMemoryMmap>,
     entrypoint: Option<GuestAddress>,
+    vbar_el1: Option<GuestAddress>,
 }
 
 #[derive(Default)]
@@ -128,6 +129,7 @@ impl HfVm {
         let mut vm = Self {
             memory: Arc::new(GuestMemoryMmap::new()),
             entrypoint: None,
+            vbar_el1: None,
         };
         debug!(
             "mapping DRAM, start={:#x}, size={}",
@@ -165,7 +167,8 @@ impl HfVm {
         let map = Arc::new(GuestRegionMmap::new(MmapRegion::new(size)?, ipa)?);
         let host_address = map.get_host_address(MemoryRegionAddress(0))?;
         self.memory = Arc::new(self.memory.insert_region(map)?);
-        self.hf_map_memory(host_address, ipa, size, flags)?;
+        self.hf_map_memory(host_address, ipa, size, flags)
+            .context("error mapping memory into VM address space")?;
         Ok(())
     }
 
@@ -218,6 +221,12 @@ impl HfVm {
                     section.address()
                 )
             })?;
+
+            // Assume the exception table is the first piece.
+            if let Text = section.kind() {
+                self.vbar_el1 = Some(GuestAddress(section.address()))
+            }
+
             match section.kind() {
                 Text | Data | ReadOnlyData | UninitializedData => {
                     let flags = match section.kind() {
@@ -242,7 +251,9 @@ impl HfVm {
                             format!("error mapping memory for section {}", section_name)
                         })?;
 
-                    let data = section.data()?;
+                    let data = section.data().with_context(|| {
+                        format!("error getting section data for section {}", section_name)
+                    })?;
                     if !data.is_empty() {
                         let slice = self
                             .memory
@@ -272,10 +283,13 @@ impl HfVm {
         let entrypoint = entrypoint
             .or(self.entrypoint)
             .ok_or_else(|| anyhow!("entrypoint not set"))?;
+
+        let vbar_el1 = self.vbar_el1;
         Ok(std::thread::spawn(move || {
             let vcpu = VCpu::new(memory).unwrap();
             let start_state = VcpuStartState {
                 guest_pc: entrypoint,
+                guest_vbar_el1: vbar_el1,
             };
             vcpu.simple_run_loop(start_state)
         }))
@@ -335,6 +349,7 @@ impl From<&bindgen::hv_vcpu_exit_t> for HfVcpuExit {
 
 struct VcpuStartState {
     guest_pc: GuestAddress,
+    guest_vbar_el1: Option<GuestAddress>,
 }
 
 struct DataAbortFlags(pub u32);
@@ -621,20 +636,6 @@ impl VCpu {
             )?
         }
 
-        {
-            // Setup translation tables
-
-            // const TG0_GRANULE_16K: u64 = 1 << 15;
-            // self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1, TG0_GRANULE_16K)?;
-
-            // TODO: setup T0SZ to 16, so that all 4 levels are used.
-            // Or honestly a little more, so that 3 levels are used, as 4th only supports 1 bit of lookup - i.e. 2 values in the table.
-
-            // TODO: Look up these bits, they are used  The TCR_ELx.{SH0, ORGN0, IRGN0}
-
-            // TODO: If the Effective value of TCR_ELx.DS is 1, block descriptors are not supported.
-        }
-
         // Copy paste, no clue yet what it does
         const PSR_MODE_EL1H: u64 = 0x0000_0005; //
                                                 // const PSR_F_BIT: u64 = 0x0000_0040; // bit 6
@@ -646,10 +647,80 @@ impl VCpu {
             PSR_MODE_EL1H;
         self.set_reg(bindgen::hv_reg_t_HV_REG_CPSR, PSTATE_FAULT_BITS_64, "CPSR")?;
 
+        let usable_memory_start = {
+            // Setup translation tables
+            let pt = page_table::TranslationTable16kAllocator::allocate_recursive_identity_block(
+                GuestAddress(DRAM_MEM_START),
+            );
+            let sz = core::mem::size_of::<page_table::TranslationTableLevel16k>();
+            let addr = GuestAddress(DRAM_MEM_START);
+            let start_params_mem = self.memory.get_slice(addr, sz)?;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    &pt,
+                    start_params_mem.as_ptr() as *mut page_table::TranslationTableLevel16k,
+                    1,
+                )
+            };
+
+            // Set all the required registers.
+            {
+                let mut tcr_el1 = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_TCR_EL1)?;
+                const TG0_GRANULE_16K: u64 = 1 << 15;
+                const IPS_64GB: u64 = 1 << 32; // 64 GB
+                const T0SZ_MIN: u64 = 16; // 48 bit addresses, 4 levels of lookups.
+                const EPD0: u64 = 1 << 7;
+                const NFD0: u64 = 1 << 53;
+                const SH0_OUTER_SHAREABLE: u64 = 0b10 << 12;
+                const ORGN0: u64 = 0b11 << 10;
+                const IRGN0: u64 = 0b10 << 8;
+                tcr_el1 |= TG0_GRANULE_16K
+                    | IPS_64GB
+                    | T0SZ_MIN
+                    | EPD0
+                    | NFD0
+                    | SH0_OUTER_SHAREABLE
+                    | ORGN0
+                    | IRGN0;
+                self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_TCR_EL1, tcr_el1, "TCR_EL1")?;
+            }
+            {
+                let mut sctlr_el1 = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1)?;
+                const STAGE_1_ENABLED: u64 = 1;
+                // sctlr_el1 |= STAGE_1_ENABLED;
+                self.set_sys_reg(
+                    bindgen::hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1,
+                    sctlr_el1,
+                    "SCTLR_EL1",
+                )?;
+            }
+            {
+                self.set_sys_reg(
+                    bindgen::hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1,
+                    addr.0,
+                    "TTBR0_EL1",
+                )?;
+            }
+
+            // assert_hv_return_t_ok(
+            //     unsafe {
+            //         bindgen::hv_vcpu_set_pending_interrupt(
+            //             self.id,
+            //             bindgen::hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ,
+            //             true,
+            //         )
+            //     },
+            //     "hv_vcpu_set_pending_interrupt",
+            // )?;
+
+            addr.0 + (sz as u64)
+        };
+
         {
             let start_params = StartParams {
                 dram_start: DRAM_MEM_START,
-                dram_usable_start: DRAM_MEM_START + (core::mem::size_of::<StartParams>() as u64),
+                dram_usable_start: usable_memory_start
+                    + (core::mem::size_of::<StartParams>() as u64),
                 dram_size: MEMORY_SIZE as u64,
             };
             let start_params_mem = self.memory.get_slice(
@@ -666,10 +737,38 @@ impl VCpu {
             self.set_reg(bindgen::hv_reg_t_HV_REG_X0, DRAM_MEM_START, "X0")?;
         }
 
+        // self.dump_all_registers()?;
+
+        {
+            let mut id = self.id;
+            std::thread::spawn(move || {
+                use std::time::Duration;
+                std::thread::sleep(Duration::from_secs(1));
+                assert_hv_return_t_ok(
+                    unsafe { bindgen::hv_vcpus_exit(&mut id, 1) },
+                    "hv_vcpus_exit",
+                )
+            });
+        }
+
+        // DEBUG: this is the exception table
+        if let Some(vbar_el1) = start_state.guest_vbar_el1 {
+            self.set_sys_reg(
+                bindgen::hv_sys_reg_t_HV_SYS_REG_VBAR_EL1,
+                vbar_el1.0,
+                "VBAR_EL1",
+            )?;
+        }
+
         loop {
             assert_hv_return_t_ok(unsafe { bindgen::hv_vcpu_run(self.id) }, "hv_vcpu_run")?;
 
             let exit_t = self.exit_t();
+            if exit_t.reason != HvExitReason::HV_EXIT_REASON_EXCEPTION {
+                self.dump_all_registers()?;
+                panic!("unexpected exit reason {:?}", exit_t.reason);
+            }
+
             assert_eq!(exit_t.reason, HvExitReason::HV_EXIT_REASON_EXCEPTION);
             match exit_t.decoded_syndrome.exception_class {
                 // HVC
@@ -709,7 +808,12 @@ impl VCpu {
                                     self.debug_data_abort(el1_syndrome.iss)?;
                                     name = "data abort";
                                 }
-                                _ => {}
+                                _ => {
+                                    error!(
+                                        "exception class unknown. Full syndrome: {:#x?}",
+                                        el1_syndrome
+                                    );
+                                }
                             }
                             self.dump_all_registers()?;
                             self.print_stack()?;
