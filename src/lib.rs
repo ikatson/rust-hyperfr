@@ -104,7 +104,7 @@ pub const DRAM_MEM_START: u64 = 0x8000_0000; // 2 GB.
                                              // pub const EXEC_START: usize = 0x2000_0000; // 512 MB,
 
 // this could be configurable, it's just that we don't care yet.
-pub const MEMORY_SIZE: usize = 32 * 1024 * 1024;
+pub const MEMORY_SIZE: usize = 128 * 1024 * 1024;
 
 pub const STACK_SIZE: u64 = 1024 * 1024;
 pub const STACK_END: u64 = DRAM_MEM_START + STACK_SIZE;
@@ -659,19 +659,22 @@ impl VCpu {
 
         let usable_memory_start = {
             // Setup translation tables
-            let pt = page_table::TranslationTable16kAllocator::allocate_recursive_identity_block(
-                GuestAddress(DRAM_MEM_START),
-            );
-            let sz = core::mem::size_of::<page_table::TranslationTableLevel16k>();
-            let addr = GuestAddress(DRAM_MEM_START);
-            let start_params_mem = self.memory.get_slice(addr, sz)?;
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    &pt,
-                    start_params_mem.as_ptr() as *mut page_table::TranslationTableLevel16k,
-                    1,
+            let ttbr = GuestAddress(DRAM_MEM_START);
+            let sz = core::mem::size_of::<page_table::TranslationTableLevel2_16k>();
+            let dram = self.memory.get_slice(ttbr, sz)?;
+            let pt = unsafe {
+                page_table::map_36_bits_of_memory(
+                    dram.as_ptr() as *mut page_table::TranslationTableLevel2_16k,
+                    ttbr,
                 )
-            };
+            }?;
+
+            let addr = ttbr;
+
+            if sz < dram.len() {
+                bail!("cannot copy translation table into the guest: translation table size {} is < dram size {}", sz, dram.len());
+            }
+            unsafe { core::ptr::copy_nonoverlapping(&pt, dram.as_ptr() as *mut _, 1) };
 
             // Set all the required registers.
             {
@@ -684,7 +687,8 @@ impl VCpu {
                 const SH0_OUTER_SHAREABLE: u64 = 0b10 << 12;
                 const ORGN0: u64 = 0b11 << 10;
                 const IRGN0: u64 = 0b10 << 8;
-                tcr_el1 |= TG0_GRANULE_16K | IPS_64GB | T0SZ;
+                const HA: u64 = 1 << 39;
+                tcr_el1 |= TG0_GRANULE_16K | IPS_64GB | T0SZ | HA;
                 // | NFD0
                 // | SH0_OUTER_SHAREABLE
                 // | ORGN0
@@ -911,6 +915,7 @@ impl core::fmt::Debug for InstructionAbortFlags {
             0b000101 => "Translation fault, level 1",
             0b000110 => "Translation fault, level 2",
             0b000111 => "Translation fault, level 3",
+            0b001011 => "Access flag fault, level 3",
             _ => "[OTHER, look at the docs]",
         };
         ds.field("IFSC description", &ifsc_desc);

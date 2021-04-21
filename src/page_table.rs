@@ -1,4 +1,7 @@
-use vm_memory::GuestAddress;
+use std::sync::Arc;
+
+use anyhow::{anyhow, bail};
+use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
 
 // DS field should be equal to 0 for simplicity as we seem to have only 36 bits of address anyway.
 // DS field is used when larger addresses.
@@ -67,24 +70,8 @@ translation table walks.
 Let's consider an example.
 Let's split our address into 11-11-11-14 bits
 
-1111_1111_111__1111_1111_111__1111_1111_111_____1111_1111_1111_11
-
-If I want to set up an identity mapping:
-- All of these should be block entries, not table entries.
-  Each block entry:
-  - Says it's a block
-  - Has a pointer to the next table base address
-
-Theoretically I could setup a recursive block, that:
-- says it's a block
-- loops into itself
-
-1. That should be the simplest translation table possible.
-So let's implement that one first.
-
-// DEBUG:
-- maybe set NFD0? Not sure.
-- maybe EPD0?
+# These 36 bits are the ones I use.
+0000_0000_000__1111_1111_111__1111_1111_111_____1111_1111_1111_11
 
 
 inputsize = 36 # 64 - t0sz = 64 - 28
@@ -113,7 +100,8 @@ addrselectbottom = 25
 
 pub struct TranslationTable16kAllocator {}
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
 struct TranslationTableDescriptor16k(u64);
 
 impl TranslationTableDescriptor16k {
@@ -129,19 +117,79 @@ impl TranslationTableDescriptor16k {
     }
 }
 
-#[derive(Debug)]
-pub struct TranslationTableLevel16k {
-    entries: [TranslationTableDescriptor16k; 2048],
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TranslationTableLevel3_16k {
+    descriptors: [TranslationTableDescriptor16k; 2048],
 }
 
-impl TranslationTable16kAllocator {
-    pub fn allocate_recursive_identity_block(
-        base_address: GuestAddress,
-    ) -> TranslationTableLevel16k {
-        let copy = TranslationTableDescriptor16k::new(base_address);
-        // let copy = TranslationTableDescriptor16k(0);
-        TranslationTableLevel16k {
-            entries: [copy; 2048],
+impl Default for TranslationTableLevel3_16k {
+    fn default() -> Self {
+        Self {
+            descriptors: [TranslationTableDescriptor16k::default(); 2048],
         }
     }
+}
+
+// impl TranslationTable16kAllocator {
+//     pub fn allocate_recursive_identity_block(
+//         base_address: GuestAddress,
+//     ) -> TranslationTableLevel16k {
+//         let copy = TranslationTableDescriptor16k::new(base_address);
+//         let mut table = TranslationTableLevel16k {
+//             entries: [copy; 2048],
+//         };
+//         // each entry in the level 3 table should be identity.
+//         // i.e. 0x0000_0000_
+//         for descr in table.entries.iter_mut() {
+//             // descr.0
+//         }
+//         unimplemented!()
+//     }
+// }
+
+#[repr(C)]
+pub struct TranslationTableLevel2_16k {
+    descriptors: [TranslationTableDescriptor16k; 2048],
+    level_3_tables: [TranslationTableLevel3_16k; 2048],
+}
+
+impl Default for TranslationTableLevel2_16k {
+    fn default() -> Self {
+        Self {
+            descriptors: [TranslationTableDescriptor16k::default(); 2048],
+            level_3_tables: [TranslationTableLevel3_16k::default(); 2048],
+        }
+    }
+}
+
+impl TranslationTableLevel2_16k {
+    fn get_t3_offset(&self, n: usize) -> usize {
+        let base = core::mem::size_of_val(&self.descriptors);
+        base + (n * 2048 * 8)
+    }
+}
+
+pub unsafe fn map_36_bits_of_memory(
+    ptr: *mut TranslationTableLevel2_16k,
+    ttbr: GuestAddress,
+) -> anyhow::Result<()> {
+    let offset = ttbr.0;
+    let table = &mut *ptr as &mut TranslationTableLevel2_16k;
+    for l2 in 0..2048usize {
+        let t3offset = table.get_t3_offset(l2) as u64;
+        let l2desc = &mut table.descriptors[l2];
+        l2desc.0 |= 0b11;
+        l2desc.0 |= offset + t3offset;
+
+        let va = (l2 as u64) << 25;
+        for (l3, l3desc) in table.level_3_tables[l2].descriptors.iter_mut().enumerate() {
+            l3desc.0 |= 0b11;
+            l3desc.0 |= va | ((l3 as u64) << 14);
+            l3desc.0 |= 1 << 10; // AF=1;
+
+            // println!("{}, {}, {:x?}, {:x?}", l2, l3, l2desc.0, l3desc.0);
+        }
+    }
+    Ok(())
 }
