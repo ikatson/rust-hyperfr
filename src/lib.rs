@@ -1,12 +1,12 @@
 use anyhow::{anyhow, bail, Context};
 use bindgen::{hv_exit_reason_t, NSObject};
 use bitflags::bitflags;
-use std::sync::Arc;
 use std::{
     convert::{TryFrom, TryInto},
     path::Path,
     thread::JoinHandle,
 };
+use std::{iter::Inspect, sync::Arc};
 use vm_memory::{
     Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
     MemoryRegionAddress, MmapRegion,
@@ -347,6 +347,7 @@ impl From<&bindgen::hv_vcpu_exit_t> for HfVcpuExit {
     }
 }
 
+#[derive(Copy, Clone)]
 struct VcpuStartState {
     guest_pc: GuestAddress,
     guest_vbar_el1: Option<GuestAddress>,
@@ -503,7 +504,11 @@ impl VCpu {
     fn dump_all_registers(&mut self) -> anyhow::Result<()> {
         macro_rules! dump_reg {
             ($reg:ident) => {
-                debug!("{}: {:#x}", stringify!($reg), self.get_reg(bindgen::$reg)?);
+                debug!(
+                    "{}: {:#x}",
+                    &stringify!($reg)[16..],
+                    self.get_reg(bindgen::$reg)?
+                );
             };
         }
 
@@ -511,7 +516,7 @@ impl VCpu {
             ($reg:ident) => {
                 debug!(
                     "{}: {:#x}",
-                    stringify!($reg),
+                    &stringify!($reg)[24..],
                     self.get_sys_reg(bindgen::$reg)?
                 );
             };
@@ -578,6 +583,11 @@ impl VCpu {
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_CPACR_EL1);
 
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_ESR_EL1);
+
+        debug!(
+            "ESR EL1 decoded: {:#x?}",
+            Syndrome::from(self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ESR_EL1)?)
+        );
 
         Ok(())
     }
@@ -687,7 +697,7 @@ impl VCpu {
             {
                 let mut sctlr_el1 = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1)?;
                 const STAGE_1_ENABLED: u64 = 1;
-                // sctlr_el1 |= STAGE_1_ENABLED;
+                sctlr_el1 |= STAGE_1_ENABLED;
                 self.set_sys_reg(
                     bindgen::hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1,
                     sctlr_el1,
@@ -737,21 +747,9 @@ impl VCpu {
             self.set_reg(bindgen::hv_reg_t_HV_REG_X0, DRAM_MEM_START, "X0")?;
         }
 
-        // self.dump_all_registers()?;
+        // self.enable_soft_debug()?;
+        self.spawn_cancel_thread();
 
-        {
-            let mut id = self.id;
-            std::thread::spawn(move || {
-                use std::time::Duration;
-                std::thread::sleep(Duration::from_secs(1));
-                assert_hv_return_t_ok(
-                    unsafe { bindgen::hv_vcpus_exit(&mut id, 1) },
-                    "hv_vcpus_exit",
-                )
-            });
-        }
-
-        // DEBUG: this is the exception table
         if let Some(vbar_el1) = start_state.guest_vbar_el1 {
             self.set_sys_reg(
                 bindgen::hv_sys_reg_t_HV_SYS_REG_VBAR_EL1,
@@ -794,8 +792,8 @@ impl VCpu {
                         }
                         EXCEPTION | SYNCHRONOUS_EXCEPTION | IRQ => {
                             let mut name = match iss as u8 {
-                                EXCEPTION => "UNHANDLED exception",
-                                SYNCHRONOUS_EXCEPTION => "SYNCHRONOUS exception",
+                                EXCEPTION => "unknown",
+                                SYNCHRONOUS_EXCEPTION => "synchronous",
                                 IRQ => "IRQ",
                                 _ => unreachable!(),
                             };
@@ -817,7 +815,7 @@ impl VCpu {
                             }
                             self.dump_all_registers()?;
                             self.print_stack()?;
-                            panic!("Exception in EL1 -> EL1: {}", name);
+                            panic!("EL1 -> EL1 exception: {}", name);
                         }
                         PRINT_STRING => {
                             let addr = self.get_reg(bindgen::hv_reg_t_HV_REG_X0)?;
@@ -863,15 +861,112 @@ impl VCpu {
             // )?;
         }
     }
+
+    fn spawn_cancel_thread(&mut self) {
+        let mut id = self.id;
+        std::thread::spawn(move || {
+            use std::time::Duration;
+            std::thread::sleep(Duration::from_secs(1));
+            assert_hv_return_t_ok(
+                unsafe { bindgen::hv_vcpus_exit(&mut id, 1) },
+                "hv_vcpus_exit",
+            )
+        });
+    }
+
+    fn enable_soft_debug(mut self) -> anyhow::Result<()> {
+        // Soft debug
+        const KDE: u64 = 1 << 13;
+        const SOFTWARE_STEP_ENABLE: u64 = 1;
+        let mdscr_el1 = KDE | SOFTWARE_STEP_ENABLE;
+        self.set_sys_reg(
+            bindgen::hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1,
+            mdscr_el1,
+            "MDSCR_EL1",
+        )?;
+        Ok(())
+    }
 }
 
-#[derive(Debug)]
 pub struct Syndrome {
     exception_class: u8,
     iss: u32,
     iss2: u8,
     il_32_bit: bool,
     original_value: u64,
+}
+
+const EXC_HVC: u8 = 0b010110;
+const EXC_MMU_LOWER: u8 = 0b100000;
+const EXC_MMU_SAME: u8 = 0b100001;
+const EXC_DATA_ABORT: u8 = 0b100100;
+
+struct InstructionAbortFlags(u32);
+impl core::fmt::Debug for InstructionAbortFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut ds = f.debug_struct("InstructionAbortFlags");
+
+        let ifsc = self.0 & 0b111111;
+        ds.field("ifsc (status code)", &ifsc);
+        if ifsc == 0b100000 {
+            let fnv = ((self.0 >> 10) & 1) == 1;
+            ds.field("fnv", &fnv);
+
+            let set = (self.0 >> 11) & 0b11;
+            let set = match set {
+                0b00 => "recoverable state",
+                0b10 => "uncontainable",
+                0b11 => "restartable state",
+                _ => "[RESERVED]",
+            };
+            ds.field("set", &set);
+        };
+        ds.finish()
+    }
+}
+
+impl Syndrome {
+    fn exc_class_name(&self) -> &'static str {
+        match self.exception_class {
+            // some memory failure
+            EXC_HVC => "HVC",
+            EXC_MMU_LOWER => "Instruction abort (MMU) from lower EL",
+            EXC_MMU_SAME => "Instruction abort (MMU) fault from same EL",
+            EXC_DATA_ABORT => "Data abort",
+            _ => "unknown",
+        }
+    }
+    fn data_abort_flags(&self) -> Option<DataAbortFlags> {
+        match self.exception_class {
+            EXC_DATA_ABORT => Some(DataAbortFlags(self.iss)),
+            _ => None,
+        }
+    }
+    fn instruction_abort_flags(&self) -> Option<InstructionAbortFlags> {
+        match self.exception_class {
+            EXC_MMU_SAME | EXC_MMU_LOWER => Some(InstructionAbortFlags(self.iss)),
+            _ => None,
+        }
+    }
+}
+
+impl core::fmt::Debug for Syndrome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut ds = f.debug_struct("Syndrome");
+        ds.field("exception_class", &self.exception_class)
+            .field("iss", &self.iss)
+            .field("iss2", &self.iss2)
+            .field("il32_bit", &self.il_32_bit)
+            .field("original_value", &self.original_value)
+            .field("exc_class_name()", &self.exc_class_name());
+        if let Some(flags) = self.data_abort_flags() {
+            ds.field("data_abort_flags()", &flags);
+        };
+        if let Some(flags) = self.instruction_abort_flags() {
+            ds.field("instruction_abort_flags()", &flags);
+        };
+        ds.finish()
+    }
 }
 
 impl From<u64> for Syndrome {
