@@ -85,6 +85,30 @@ So let's implement that one first.
 // DEBUG:
 - maybe set NFD0? Not sure.
 - maybe EPD0?
+
+
+inputsize = 36 # 64 - t0sz = 64 - 28
+inputsize_max = 48
+inputsize_min = 16
+ps = 1 # 4 GB
+reversedescriptors = False
+update_AF = False
+update_AP = False
+grainsize = 14
+firstblocklevel = 2
+stride = 11
+level = 2 # 4 - (1 + ((inputsize - grainsize - 1) // stride))
+
+
+// See what that does. Those don't help getting set, but might be important.
+descaddr.memattrs = WalkAttrDecode(TCR_EL1.SH0, TCR_EL1.ORGN0, TCR_EL1.IRGN0, secondstage);
+
+outputsize = 36
+baselowerbound = 14
+
+
+addrselecttop = 35
+addrselectbottom = 25
 */
 
 pub struct TranslationTable16kAllocator {}
@@ -115,6 +139,7 @@ impl TranslationTable16kAllocator {
         base_address: GuestAddress,
     ) -> TranslationTableLevel16k {
         let copy = TranslationTableDescriptor16k::new(base_address);
+        // let copy = TranslationTableDescriptor16k(0);
         TranslationTableLevel16k {
             entries: [copy; 2048],
         }

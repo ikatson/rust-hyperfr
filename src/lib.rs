@@ -676,22 +676,19 @@ impl VCpu {
             // Set all the required registers.
             {
                 let mut tcr_el1 = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_TCR_EL1)?;
-                const TG0_GRANULE_16K: u64 = 1 << 15;
-                const IPS_64GB: u64 = 1 << 32; // 64 GB
-                const T0SZ_MIN: u64 = 16; // 48 bit addresses, 4 levels of lookups.
+                const TG0_GRANULE_16K: u64 = 0b10 << 14;
+                const IPS_64GB: u64 = 0b001 << 32; // 64 GB
+                const T0SZ: u64 = 28; // so that 36 bits remains.
                 const EPD0: u64 = 1 << 7;
                 const NFD0: u64 = 1 << 53;
                 const SH0_OUTER_SHAREABLE: u64 = 0b10 << 12;
                 const ORGN0: u64 = 0b11 << 10;
                 const IRGN0: u64 = 0b10 << 8;
-                tcr_el1 |= TG0_GRANULE_16K
-                    | IPS_64GB
-                    | T0SZ_MIN
-                    | EPD0
-                    | NFD0
-                    | SH0_OUTER_SHAREABLE
-                    | ORGN0
-                    | IRGN0;
+                tcr_el1 |= TG0_GRANULE_16K | IPS_64GB | T0SZ;
+                // | NFD0
+                // | SH0_OUTER_SHAREABLE
+                // | ORGN0
+                // | IRGN0;
                 self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_TCR_EL1, tcr_el1, "TCR_EL1")?;
             }
             {
@@ -754,6 +751,7 @@ impl VCpu {
             self.set_sys_reg(
                 bindgen::hv_sys_reg_t_HV_SYS_REG_VBAR_EL1,
                 vbar_el1.0,
+                // 0xffff_ffff_0000_0000,
                 "VBAR_EL1",
             )?;
         }
@@ -908,6 +906,14 @@ impl core::fmt::Debug for InstructionAbortFlags {
 
         let ifsc = self.0 & 0b111111;
         ds.field("ifsc (status code)", &ifsc);
+        let ifsc_desc = match ifsc {
+            0b000100 => "Translation fault, level 0",
+            0b000101 => "Translation fault, level 1",
+            0b000110 => "Translation fault, level 2",
+            0b000111 => "Translation fault, level 3",
+            _ => "[OTHER, look at the docs]",
+        };
+        ds.field("IFSC description", &ifsc_desc);
         if ifsc == 0b100000 {
             let fnv = ((self.0 >> 10) & 1) == 1;
             ds.field("fnv", &fnv);
