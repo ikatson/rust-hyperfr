@@ -1,12 +1,12 @@
 use anyhow::{anyhow, bail, Context};
 use bindgen::{hv_exit_reason_t, NSObject};
 use bitflags::bitflags;
+use std::sync::Arc;
 use std::{
     convert::{TryFrom, TryInto},
     path::Path,
     thread::JoinHandle,
 };
-use std::{iter::Inspect, sync::Arc};
 use vm_memory::{
     Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
     MemoryRegionAddress, MmapRegion,
@@ -575,6 +575,7 @@ impl VCpu {
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_TTBR1_EL1);
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_TCR_EL1);
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1);
+        dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_MAIR_EL1);
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_ID_AA64MMFR0_EL1);
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_ID_AA64MMFR1_EL1);
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_ID_AA64MMFR2_EL1);
@@ -663,7 +664,7 @@ impl VCpu {
             let sz = core::mem::size_of::<page_table::TranslationTableLevel2_16k>();
             let dram = self.memory.get_slice(ttbr, sz)?;
             let pt = unsafe {
-                page_table::map_36_bits_of_memory(
+                page_table::identity_map_36_bits_of_memory(
                     dram.as_ptr() as *mut page_table::TranslationTableLevel2_16k,
                     ttbr,
                 )
@@ -694,6 +695,19 @@ impl VCpu {
                 // | ORGN0
                 // | IRGN0;
                 self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_TCR_EL1, tcr_el1, "TCR_EL1")?;
+            }
+            {
+                // We need only 1 type of memory - Normal (not device).
+                // 0booooiiii, (oooo != 0000 and iiii != 0000),
+                // oooo = 0b111 = Normal memory, Outer Write-Back Transient, Read allocate policy - Allocate, Write Allocate policy - allocate
+                // iiii = 0b111 = Normal memory, Inner Write-Back Transient, Read allocate policy - Allocate, Write Allocate policy - allocate
+                // I HAVE NO CLUE what this means, but it works with atomics this way :)
+                const MAIR_EL1: u64 = 0b0111_0111;
+                self.set_sys_reg(
+                    bindgen::hv_sys_reg_t_HV_SYS_REG_MAIR_EL1,
+                    MAIR_EL1,
+                    "MAIR_EL1",
+                )?;
             }
             {
                 let mut sctlr_el1 = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SCTLR_EL1)?;
@@ -901,7 +915,8 @@ pub struct Syndrome {
 const EXC_HVC: u8 = 0b010110;
 const EXC_MMU_LOWER: u8 = 0b100000;
 const EXC_MMU_SAME: u8 = 0b100001;
-const EXC_DATA_ABORT: u8 = 0b100100;
+const EXC_DATA_ABORT_LOWER: u8 = 0b100100;
+const EXC_DATA_ABORT_SAME: u8 = 0b100101;
 
 struct InstructionAbortFlags(u32);
 impl core::fmt::Debug for InstructionAbortFlags {
@@ -943,13 +958,14 @@ impl Syndrome {
             EXC_HVC => "HVC",
             EXC_MMU_LOWER => "Instruction abort (MMU) from lower EL",
             EXC_MMU_SAME => "Instruction abort (MMU) fault from same EL",
-            EXC_DATA_ABORT => "Data abort",
+            EXC_DATA_ABORT_LOWER => "Data abort from a lower exception level",
+            EXC_DATA_ABORT_SAME => "Data abort from the same exception level",
             _ => "unknown",
         }
     }
     fn data_abort_flags(&self) -> Option<DataAbortFlags> {
         match self.exception_class {
-            EXC_DATA_ABORT => Some(DataAbortFlags(self.iss)),
+            EXC_DATA_ABORT_LOWER | EXC_DATA_ABORT_SAME => Some(DataAbortFlags(self.iss)),
             _ => None,
         }
     }

@@ -1,7 +1,4 @@
-use std::sync::Arc;
-
-use anyhow::{anyhow, bail};
-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
+use vm_memory::GuestAddress;
 
 // DS field should be equal to 0 for simplicity as we seem to have only 36 bits of address anyway.
 // DS field is used when larger addresses.
@@ -98,8 +95,6 @@ addrselecttop = 35
 addrselectbottom = 25
 */
 
-pub struct TranslationTable16kAllocator {}
-
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 struct TranslationTableDescriptor16k(u64);
@@ -170,7 +165,7 @@ impl TranslationTableLevel2_16k {
     }
 }
 
-pub unsafe fn map_36_bits_of_memory(
+pub unsafe fn identity_map_36_bits_of_memory(
     ptr: *mut TranslationTableLevel2_16k,
     ttbr: GuestAddress,
 ) -> anyhow::Result<()> {
@@ -186,7 +181,15 @@ pub unsafe fn map_36_bits_of_memory(
         for (l3, l3desc) in table.level_3_tables[l2].descriptors.iter_mut().enumerate() {
             l3desc.0 |= 0b11;
             l3desc.0 |= va | ((l3 as u64) << 14);
+
+            // set access flag, otherwise it causes faults that we don't handle.
             l3desc.0 |= 1 << 10; // AF=1;
+
+            // Not sure what this means, but shareable sounds good?
+            l3desc.0 |= 0b10 << 8; // SH
+
+            // We set up MAIR_EL1 to say that index 0 is our main memory.
+            // l3desc.0 = 0b___ << 2; // AttrIndx
 
             // println!("{}, {}, {:x?}, {:x?}", l2, l3, l2desc.0, l3desc.0);
         }
