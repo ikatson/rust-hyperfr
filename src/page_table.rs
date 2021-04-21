@@ -95,6 +95,9 @@ addrselecttop = 35
 addrselectbottom = 25
 */
 
+use crate::HvMemoryFlags;
+use anyhow::bail;
+
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 struct TranslationTableDescriptor16k(u64);
@@ -159,9 +162,78 @@ impl Default for TranslationTableLevel2_16k {
 }
 
 impl TranslationTableLevel2_16k {
-    fn get_t3_offset(&self, n: usize) -> usize {
+    fn is_aligned(value: u64) -> bool {
+        value & ((1 << 14) - 1) == 0
+    }
+    fn get_t3_offset(&self, n: usize) -> u64 {
         let base = core::mem::size_of_val(&self.descriptors);
-        base + (n * 2048 * 8)
+        (base + (n * 2048 * 8)) as u64
+    }
+
+    pub fn setup(
+        &mut self,
+        table_start_ipa: u64,
+        va: GuestAddress,
+        ipa: u64,
+        size: usize,
+        flags: HvMemoryFlags,
+    ) -> anyhow::Result<()> {
+        let size = size as u64;
+        if !Self::is_aligned(table_start_ipa) {
+            bail!(
+                "table_start_ipa {:#x} is not aligned to page size",
+                table_start_ipa
+            )
+        }
+        if !Self::is_aligned(va.0) {
+            bail!("va {:#x} is not aligned to page size", va.0)
+        }
+        if !Self::is_aligned(ipa) {
+            bail!("ipa {:#x} is not aligned to page size", ipa)
+        }
+        if !Self::is_aligned(size) {
+            bail!("size {:#x} is not aligned to page size", size)
+        }
+
+        let top_bit_set = (va.0 >> 55) & 1 == 1;
+        if top_bit_set {
+            assert_eq!(va.0 >> (64 - crate::TXSZ), (1 << crate::TXSZ) - 1)
+        } else {
+            assert_eq!(va.0 >> (64 - crate::TXSZ), 0)
+        }
+
+        let va_bottom = va.0 & ((1 << crate::TXSZ) - 1);
+
+        let l2_range = va_bottom >> (14 + 11);
+        for l2 in 0..=(l2_range as usize) {
+            let t3offset = self.get_t3_offset(l2);
+            let l2desc = &mut self.descriptors[l2];
+            l2desc.0 |= 0b11;
+            l2desc.0 |= table_start_ipa + t3offset;
+
+            let l2_ipa_base: u64 = ipa + ((l2 as u64) << (14 + 11));
+
+            for (l3, l3desc) in self.level_3_tables[l2].descriptors.iter_mut().enumerate() {
+                let page_ipa = l2_ipa_base + ((l3 as u64) << 14);
+                l3desc.0 |= 0b11;
+                l3desc.0 |= page_ipa;
+
+                // set access flag, otherwise it causes faults that we don't handle.
+                l3desc.0 |= 1 << 10; // AF=1;
+
+                // Not sure what this means, but shareable sounds good?
+                l3desc.0 |= 0b10 << 8; // SH
+
+                // We set up MAIR_EL1 to say that index 0 is our main memory.
+                // l3desc.0 = 0b___ << 2; // AttrIndx
+
+                println!(
+                    "ttbr: l2={}, l3={}, l2val={:#x?}, l3val={:#x?}",
+                    l2, l3, l2desc.0, l3desc.0
+                );
+            }
+        }
+        Ok(())
     }
 }
 

@@ -20,11 +20,11 @@ pub fn get_page_size() -> u64 {
     unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) as u64 }
 }
 
-pub fn is_aligned_to_page_size(value: u64) -> bool {
+pub(crate) fn is_aligned_to_page_size(value: u64) -> bool {
     align_down_to_page_size(value) == value
 }
 
-pub fn align_down_to_page_size(value: u64) -> u64 {
+pub(crate) fn align_down_to_page_size(value: u64) -> u64 {
     value & !(get_page_size() - 1)
 }
 
@@ -99,15 +99,28 @@ pub struct LoadedElf {
     pub entrypoint: GuestAddress,
 }
 
-pub const DRAM_MEM_START: u64 = 0x8000_0000; // 2 GB.
-                                             // This is bad, but seems to fuck up without a page table if set to higher, as the executable is not a PIE one.
-                                             // pub const EXEC_START: usize = 0x2000_0000; // 512 MB,
+// Memory structure:
+// VA_START - the virtual memory of the kernel so that it's in TTBR1.
+// At that address we load the kernel itself, including exception vector table.
+// VA_START + 1GB = DRAM
+
+pub const VA_PAGE: u64 = 2 << 14;
+pub const KERNEL_VA_OFFSET: u64 = 0xffff_fff0_0000_0000;
+pub const KERNEL_BINARY_MEMORY_MAX_SIZE: u64 = 128 * 1024 * 1024; // 128 Mib
+pub const KERNEL_BINARY_OFFSET: u64 = 0;
+pub const TTBR_OFFSET: u64 = KERNEL_BINARY_OFFSET + KERNEL_BINARY_MEMORY_MAX_SIZE + VA_PAGE;
+pub const TTBR_SIZE: usize = core::mem::size_of::<page_table::TranslationTableLevel2_16k>() * 2;
+pub const DRAM_OFFSET: u64 = TTBR_OFFSET + TTBR_SIZE as u64 + VA_PAGE;
+pub const STACK_OFFSET: u64 = DRAM_OFFSET + MEMORY_SIZE as u64 + VA_PAGE;
 
 // this could be configurable, it's just that we don't care yet.
-pub const MEMORY_SIZE: usize = 128 * 1024 * 1024;
+// This is 4 GB.
+pub const MEMORY_SIZE: usize = 4 * 1024 * 1024 * 1024;
 
 pub const STACK_SIZE: u64 = 1024 * 1024;
-pub const STACK_END: u64 = DRAM_MEM_START + STACK_SIZE;
+pub const STACK_END: GuestAddress = GuestAddress(KERNEL_VA_OFFSET + STACK_OFFSET + STACK_SIZE);
+
+pub const TXSZ: u64 = 28; // 28 bits are resolved through translation. All the others should be 0 for TTBR0 and 1 for TTBR1.
 
 fn assert_hv_return_t_ok(v: bindgen::hv_return_t, name: &str) -> anyhow::Result<()> {
     let ret = HVReturnT::try_from(v).map_err(|e| {
@@ -131,14 +144,40 @@ impl HfVm {
             entrypoint: None,
             vbar_el1: None,
         };
+
         debug!(
-            "mapping DRAM, start={:#x}, size={}",
-            DRAM_MEM_START, MEMORY_SIZE
+            "mapping translation tables, start={:#x}, size={}",
+            KERNEL_VA_OFFSET + TTBR_OFFSET,
+            TTBR_SIZE
         );
-        vm.map_new_memory(
-            GuestAddress(DRAM_MEM_START as u64),
+        vm.map_new_kernel_memory(
+            GuestAddress(KERNEL_VA_OFFSET + TTBR_OFFSET),
             MEMORY_SIZE,
             HvMemoryFlags::ALL,
+        )
+        .context("error mapping translation table memory")?;
+
+        debug!(
+            "mapping DRAM, start={:#x}, size={}",
+            KERNEL_VA_OFFSET + DRAM_OFFSET,
+            MEMORY_SIZE
+        );
+        vm.map_new_kernel_memory(
+            GuestAddress(KERNEL_VA_OFFSET + DRAM_OFFSET),
+            MEMORY_SIZE,
+            HvMemoryFlags::ALL,
+        )
+        .context("error mapping DRAM memory")?;
+
+        debug!(
+            "mapping kernel stack RAM, start={:#x}, size={}",
+            KERNEL_VA_OFFSET + STACK_OFFSET,
+            STACK_SIZE
+        );
+        vm.map_new_kernel_memory(
+            GuestAddress(KERNEL_VA_OFFSET + STACK_OFFSET),
+            MEMORY_SIZE,
+            HvMemoryFlags::HV_MEMORY_READ | HvMemoryFlags::HV_MEMORY_WRITE,
         )
         .context("error mapping DRAM memory")?;
         Ok(vm)
@@ -148,27 +187,87 @@ impl HfVm {
         self.memory.clone()
     }
 
-    fn map_new_memory(
+    fn map_new_kernel_memory(
         &mut self,
-        ipa: GuestAddress,
+        va: GuestAddress,
         size: usize,
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
-        if !is_aligned_to_page_size(ipa.0) {
-            bail!("ipa {:#x} is not aligned to page size", ipa.0)
+        if !is_aligned_to_page_size(va.0) {
+            bail!("va {:#x} is not aligned to page size", va.0)
         }
         if !is_aligned_to_page_size(size as u64) {
             bail!("size {:#x} is not a multiple of page size", size)
         }
         debug!(
             "allocating new guest memory, base address {:#x?}, size {:?}",
-            ipa.0, size
+            va.0, size
         );
-        let map = Arc::new(GuestRegionMmap::new(MmapRegion::new(size)?, ipa)?);
-        let host_address = map.get_host_address(MemoryRegionAddress(0))?;
-        self.memory = Arc::new(self.memory.insert_region(map)?);
+        let ipa =
+            va.0.checked_sub(KERNEL_VA_OFFSET)
+                .ok_or_else(|| anyhow!("VA {} is less than kernel offset", va.0))?;
+        let map = Arc::new(
+            GuestRegionMmap::new(
+                MmapRegion::new(size).context("error calling MmapRegion::new")?,
+                va,
+            )
+            .context("error calling GuestRegionMmap::new")?,
+        );
+        let host_address = map
+            .get_host_address(MemoryRegionAddress(0))
+            .with_context(|| format!("error getting host address for map at VA {:x?}", va.0))?;
+        self.memory = Arc::new(
+            self.memory
+                .insert_region(map)
+                .context("error calling GuestMemoryMmap::insert_region")?,
+        );
         self.hf_map_memory(host_address, ipa, size, flags)
             .context("error mapping memory into VM address space")?;
+
+        self.configure_page_tables(ipa, va, size, flags)
+            .context("error configuring page tables")?;
+        Ok(())
+    }
+
+    fn get_ttbr_0_ipa(&self) -> u64 {
+        TTBR_OFFSET
+    }
+
+    fn get_ttbr_1_ipa(&self) -> u64 {
+        self.get_ttbr_0_ipa() + TTBR_SIZE as u64
+    }
+
+    fn configure_page_tables(
+        &mut self,
+        ipa: u64,
+        va: GuestAddress,
+        size: usize,
+        flags: HvMemoryFlags,
+    ) -> anyhow::Result<()> {
+        let top_bit_set = (va.0 >> 55) == 1;
+
+        let table_start_ipa = if top_bit_set {
+            self.get_ttbr_1_ipa()
+        } else {
+            self.get_ttbr_0_ipa()
+        };
+
+        let page_table_guest_addr = GuestAddress(KERNEL_VA_OFFSET + table_start_ipa);
+        let page_table_ptr = self
+            .memory
+            .get_slice(page_table_guest_addr, TTBR_SIZE)
+            .with_context(|| {
+                format!(
+                    "error getting slice of memory at {:#x?}",
+                    page_table_guest_addr.0
+                )
+            })?
+            .as_ptr() as *mut page_table::TranslationTableLevel2_16k;
+
+        let table = unsafe { &mut *page_table_ptr as &mut page_table::TranslationTableLevel2_16k };
+        table
+            .setup(table_start_ipa, va, ipa, size, flags)
+            .context("error configuring the Level 2 translation table")?;
         Ok(())
     }
 
@@ -176,15 +275,15 @@ impl HfVm {
         // void *addr, hv_ipa_t ipa, size_t size, hv_memory_flags_t flags
         &self,
         addr: *mut u8,
-        ipa: GuestAddress,
+        ipa: u64,
         size: usize,
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
         if !is_aligned_to_page_size(addr as u64) {
             bail!("addr {:#x} is not aligned to page size", addr as u64)
         }
-        if !is_aligned_to_page_size(ipa.0) {
-            bail!("ipa {:#x} is not aligned to page size", ipa.0)
+        if !is_aligned_to_page_size(ipa) {
+            bail!("ipa {:#x} is not aligned to page size", ipa)
         }
         if !is_aligned_to_page_size(size as u64) {
             bail!("size {:#x} is not a multiple of page size", size)
@@ -192,11 +291,11 @@ impl HfVm {
 
         debug!(
             "calling hv_vm_map: addr={:?}, ipa={:#x}, size={:?}, flags={:?}",
-            addr, ipa.0, size, flags
+            addr, ipa, size, flags
         );
 
         assert_hv_return_t_ok(
-            unsafe { bindgen::hv_vm_map(addr as *mut _, ipa.0, size as u64, flags.bits() as u64) },
+            unsafe { bindgen::hv_vm_map(addr as *mut _, ipa, size as u64, flags.bits() as u64) },
             "hv_vm_map",
         )
     }
@@ -246,7 +345,7 @@ impl HfVm {
                         section_name,
                         section.size()
                     );
-                    self.map_new_memory(GuestAddress(start), size, flags)
+                    self.map_new_kernel_memory(GuestAddress(start), size, flags)
                         .with_context(|| {
                             format!("error mapping memory for section {}", section_name)
                         })?;
@@ -595,7 +694,7 @@ impl VCpu {
 
     fn print_stack(&mut self) -> anyhow::Result<()> {
         let sp = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SP_EL1)?;
-        let len = self.get_stack_end() - sp;
+        let len = self.get_stack_end().0 - sp;
         if len == 0 {
             debug!("STACK AT {:#x} is empty", sp);
             return Ok(());
@@ -607,8 +706,8 @@ impl VCpu {
         Ok(())
     }
 
-    fn get_stack_end(&self) -> u64 {
-        DRAM_MEM_START + MEMORY_SIZE as u64 - STACK_SIZE * self.id
+    fn get_stack_end(&self) -> GuestAddress {
+        GuestAddress(STACK_END.0 - STACK_SIZE * self.id)
     }
 
     fn debug_data_abort(&mut self, iss: u32) -> anyhow::Result<()> {
@@ -629,7 +728,7 @@ impl VCpu {
     fn simple_run_loop(mut self, start_state: VcpuStartState) -> anyhow::Result<()> {
         self.set_sys_reg(
             bindgen::hv_sys_reg_t_HV_SYS_REG_SP_EL1,
-            self.get_stack_end(),
+            self.get_stack_end().0,
             "SP_EL1",
         )
         .context("failed setting stack pointer")?;
@@ -660,7 +759,8 @@ impl VCpu {
 
         let usable_memory_start = {
             // Setup translation tables
-            let ttbr = GuestAddress(DRAM_MEM_START);
+            let ttbr = GuestAddress(0);
+            todo!();
             let sz = core::mem::size_of::<page_table::TranslationTableLevel2_16k>();
             let dram = self.memory.get_slice(ttbr, sz)?;
             let pt = unsafe {
@@ -742,16 +842,16 @@ impl VCpu {
         };
 
         {
+            let dram_start = GuestAddress(KERNEL_VA_OFFSET + DRAM_OFFSET);
             let start_params = StartParams {
-                dram_start: DRAM_MEM_START,
+                dram_start: dram_start.0,
                 dram_usable_start: usable_memory_start
                     + (core::mem::size_of::<StartParams>() as u64),
                 dram_size: MEMORY_SIZE as u64,
             };
-            let start_params_mem = self.memory.get_slice(
-                GuestAddress(DRAM_MEM_START),
-                core::mem::size_of::<StartParams>(),
-            )?;
+            let start_params_mem = self
+                .memory
+                .get_slice(dram_start, core::mem::size_of::<StartParams>())?;
             unsafe {
                 core::ptr::copy(
                     &start_params,
@@ -759,7 +859,7 @@ impl VCpu {
                     1,
                 )
             };
-            self.set_reg(bindgen::hv_reg_t_HV_REG_X0, DRAM_MEM_START, "X0")?;
+            self.set_reg(bindgen::hv_reg_t_HV_REG_X0, dram_start.0, "X0")?;
         }
 
         // self.enable_soft_debug()?;

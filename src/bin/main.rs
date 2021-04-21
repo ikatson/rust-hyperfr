@@ -1,6 +1,6 @@
 use anyhow::Context;
 
-fn main() -> anyhow::Result<()> {
+fn main_result() -> anyhow::Result<()> {
     pretty_env_logger::init();
 
     let mut vm = hyperfr::HfVm::new().context("error creating HfVm")?;
@@ -16,4 +16,8 @@ fn main() -> anyhow::Result<()> {
         .context("error creating and running vcpu")?;
     join.join().unwrap()?;
     Ok(())
+}
+
+fn main() {
+    main_result().unwrap()
 }
