@@ -8,7 +8,7 @@ use std::{
     thread::JoinHandle,
 };
 use vm_memory::{
-    Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
+    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
     MemoryRegionAddress, MmapRegion,
 };
 
@@ -105,20 +105,29 @@ pub struct LoadedElf {
 // VA_START + 1GB = DRAM
 
 pub const VA_PAGE: u64 = 2 << 14;
-pub const KERNEL_VA_OFFSET: u64 = 0xffff_fff0_0000_0000;
+
+pub const DRAM_IPA_START: u64 = 0x80_0000;
+pub const VA_START: GuestAddress = GuestAddress(0xffff_fff0_0000_0000);
+pub const VA_START_OFFSET_DRAM: u64 = DRAM_IPA_START;
+pub const DRAM_VA_START: GuestAddress = GuestAddress(VA_START.0 + VA_START_OFFSET_DRAM);
+
 pub const KERNEL_BINARY_MEMORY_MAX_SIZE: u64 = 128 * 1024 * 1024; // 128 Mib
-pub const KERNEL_BINARY_OFFSET: u64 = 0;
-pub const TTBR_OFFSET: u64 = KERNEL_BINARY_OFFSET + KERNEL_BINARY_MEMORY_MAX_SIZE + VA_PAGE;
+
+pub const DRAM_KERNEL_BINARY_OFFSET: u64 = 0;
+
+pub const DRAM_TTBR_OFFSET: u64 =
+    DRAM_KERNEL_BINARY_OFFSET + KERNEL_BINARY_MEMORY_MAX_SIZE + VA_PAGE;
 pub const TTBR_SIZE: usize = core::mem::size_of::<page_table::TranslationTableLevel2_16k>() * 2;
-pub const DRAM_OFFSET: u64 = TTBR_OFFSET + TTBR_SIZE as u64 + VA_PAGE;
-pub const STACK_OFFSET: u64 = DRAM_OFFSET + MEMORY_SIZE as u64 + VA_PAGE;
+
+pub const DRAM_KERNEL_USABLE_DRAM_OFFSET: u64 = DRAM_TTBR_OFFSET + TTBR_SIZE as u64 + VA_PAGE;
 
 // this could be configurable, it's just that we don't care yet.
 // This is 4 GB.
 pub const MEMORY_SIZE: usize = 4 * 1024 * 1024 * 1024;
 
 pub const STACK_SIZE: u64 = 1024 * 1024;
-pub const STACK_END: GuestAddress = GuestAddress(KERNEL_VA_OFFSET + STACK_OFFSET + STACK_SIZE);
+pub const STACK_END: GuestAddress =
+    GuestAddress(VA_START.0 + VA_START_OFFSET_DRAM + MEMORY_SIZE as u64);
 
 pub const TXSZ: u64 = 28; // 28 bits are resolved through translation. All the others should be 0 for TTBR0 and 1 for TTBR1.
 
@@ -139,47 +148,41 @@ fn assert_hv_return_t_ok(v: bindgen::hv_return_t, name: &str) -> anyhow::Result<
 impl HfVm {
     pub fn new() -> anyhow::Result<Self> {
         assert_hv_return_t_ok(unsafe { bindgen::hv_vm_create(null_obj()) }, "hv_vm_create")?;
+        debug!(
+            "allocating guest memory, VA start: {:x?}, size: {}",
+            DRAM_VA_START.0, MEMORY_SIZE
+        );
         let mut vm = Self {
-            memory: Arc::new(GuestMemoryMmap::new()),
+            memory: Arc::new(
+                GuestMemoryMmap::from_ranges(&[(DRAM_VA_START, MEMORY_SIZE)])
+                    .context("error allocating guest memory")?,
+            ),
             entrypoint: None,
             vbar_el1: None,
         };
-
-        debug!(
-            "mapping translation tables, start={:#x}, size={}",
-            KERNEL_VA_OFFSET + TTBR_OFFSET,
-            TTBR_SIZE
-        );
-        vm.map_new_kernel_memory(
-            GuestAddress(KERNEL_VA_OFFSET + TTBR_OFFSET),
+        vm.hf_map_memory(
+            vm.memory
+                .get_host_address(DRAM_VA_START)
+                .context("error getting host address for guest memory start")?,
+            DRAM_IPA_START,
             MEMORY_SIZE,
             HvMemoryFlags::ALL,
         )
-        .context("error mapping translation table memory")?;
+        .context("error mapping DRAM memory into the guest VM")?;
 
-        debug!(
-            "mapping DRAM, start={:#x}, size={}",
-            KERNEL_VA_OFFSET + DRAM_OFFSET,
-            MEMORY_SIZE
-        );
-        vm.map_new_kernel_memory(
-            GuestAddress(KERNEL_VA_OFFSET + DRAM_OFFSET),
-            MEMORY_SIZE,
+        let usable_memory_size = (MEMORY_SIZE as u64 - DRAM_KERNEL_USABLE_DRAM_OFFSET) as usize;
+
+        // Configure page tables for *Usable* DRAM.
+        // This is the RAM that the kernel is free to use for whatever purpose, e.g. allocating.
+        vm.configure_page_tables(
+            DRAM_IPA_START + DRAM_KERNEL_USABLE_DRAM_OFFSET,
+            DRAM_VA_START
+                .checked_add(DRAM_KERNEL_USABLE_DRAM_OFFSET)
+                .unwrap(),
+            usable_memory_size,
             HvMemoryFlags::ALL,
         )
-        .context("error mapping DRAM memory")?;
-
-        debug!(
-            "mapping kernel stack RAM, start={:#x}, size={}",
-            KERNEL_VA_OFFSET + STACK_OFFSET,
-            STACK_SIZE
-        );
-        vm.map_new_kernel_memory(
-            GuestAddress(KERNEL_VA_OFFSET + STACK_OFFSET),
-            MEMORY_SIZE,
-            HvMemoryFlags::HV_MEMORY_READ | HvMemoryFlags::HV_MEMORY_WRITE,
-        )
-        .context("error mapping DRAM memory")?;
+        .context("error configuring page tables for DRAM")?;
         Ok(vm)
     }
 
@@ -187,54 +190,12 @@ impl HfVm {
         self.memory.clone()
     }
 
-    fn map_new_kernel_memory(
-        &mut self,
-        va: GuestAddress,
-        size: usize,
-        flags: HvMemoryFlags,
-    ) -> anyhow::Result<()> {
-        if !is_aligned_to_page_size(va.0) {
-            bail!("va {:#x} is not aligned to page size", va.0)
-        }
-        if !is_aligned_to_page_size(size as u64) {
-            bail!("size {:#x} is not a multiple of page size", size)
-        }
-        debug!(
-            "allocating new guest memory, base address {:#x?}, size {:?}",
-            va.0, size
-        );
-        let ipa =
-            va.0.checked_sub(KERNEL_VA_OFFSET)
-                .ok_or_else(|| anyhow!("VA {} is less than kernel offset", va.0))?;
-        let map = Arc::new(
-            GuestRegionMmap::new(
-                MmapRegion::new(size).context("error calling MmapRegion::new")?,
-                va,
-            )
-            .context("error calling GuestRegionMmap::new")?,
-        );
-        let host_address = map
-            .get_host_address(MemoryRegionAddress(0))
-            .with_context(|| format!("error getting host address for map at VA {:x?}", va.0))?;
-        self.memory = Arc::new(
-            self.memory
-                .insert_region(map)
-                .context("error calling GuestMemoryMmap::insert_region")?,
-        );
-        self.hf_map_memory(host_address, ipa, size, flags)
-            .context("error mapping memory into VM address space")?;
-
-        self.configure_page_tables(ipa, va, size, flags)
-            .context("error configuring page tables")?;
-        Ok(())
+    fn get_ttbr_0_dram_offset(&self) -> u64 {
+        DRAM_TTBR_OFFSET
     }
 
-    fn get_ttbr_0_ipa(&self) -> u64 {
-        TTBR_OFFSET
-    }
-
-    fn get_ttbr_1_ipa(&self) -> u64 {
-        self.get_ttbr_0_ipa() + TTBR_SIZE as u64
+    fn get_ttbr_1_dram_offset(&self) -> u64 {
+        self.get_ttbr_0_dram_offset() + TTBR_SIZE as u64
     }
 
     fn configure_page_tables(
@@ -246,13 +207,13 @@ impl HfVm {
     ) -> anyhow::Result<()> {
         let top_bit_set = (va.0 >> 55) == 1;
 
-        let table_start_ipa = if top_bit_set {
-            self.get_ttbr_1_ipa()
+        let table_start_dram_offset = if top_bit_set {
+            self.get_ttbr_1_dram_offset()
         } else {
-            self.get_ttbr_0_ipa()
+            self.get_ttbr_0_dram_offset()
         };
 
-        let page_table_guest_addr = GuestAddress(KERNEL_VA_OFFSET + table_start_ipa);
+        let page_table_guest_addr = DRAM_VA_START.checked_add(table_start_dram_offset).unwrap();
         let page_table_ptr = self
             .memory
             .get_slice(page_table_guest_addr, TTBR_SIZE)
@@ -266,7 +227,13 @@ impl HfVm {
 
         let table = unsafe { &mut *page_table_ptr as &mut page_table::TranslationTableLevel2_16k };
         table
-            .setup(table_start_ipa, va, ipa, size, flags)
+            .setup(
+                DRAM_IPA_START + table_start_dram_offset,
+                va,
+                ipa,
+                size,
+                flags,
+            )
             .context("error configuring the Level 2 translation table")?;
         Ok(())
     }
@@ -341,14 +308,15 @@ impl HfVm {
                     let end = align_up_to_page_size(section.address() + section.size());
                     let size = (end - start) as usize;
                     debug!(
-                        "mapping new memory for section {}, section size {}",
+                        "configuring page tables for section {}, section size {}",
                         section_name,
                         section.size()
                     );
-                    self.map_new_kernel_memory(GuestAddress(start), size, flags)
-                        .with_context(|| {
-                            format!("error mapping memory for section {}", section_name)
-                        })?;
+
+                    // TODO: this assumes the ELF is compiled accordingly and is safe to load
+                    // at the specified addresses.
+                    let ipa = section.address() - VA_START.0;
+                    self.configure_page_tables(ipa, GuestAddress(section.address()), size, flags)?;
 
                     let data = section.data().with_context(|| {
                         format!("error getting section data for section {}", section_name)
@@ -384,11 +352,15 @@ impl HfVm {
             .ok_or_else(|| anyhow!("entrypoint not set"))?;
 
         let vbar_el1 = self.vbar_el1;
+        let ttbr0 = GuestAddress(DRAM_VA_START.0 + self.get_ttbr_0_dram_offset());
+        let ttbr1 = GuestAddress(DRAM_VA_START.0 + self.get_ttbr_1_dram_offset());
         Ok(std::thread::spawn(move || {
             let vcpu = VCpu::new(memory).unwrap();
             let start_state = VcpuStartState {
                 guest_pc: entrypoint,
                 guest_vbar_el1: vbar_el1,
+                ttbr0,
+                ttbr1,
             };
             vcpu.simple_run_loop(start_state)
         }))
@@ -446,10 +418,12 @@ impl From<&bindgen::hv_vcpu_exit_t> for HfVcpuExit {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 struct VcpuStartState {
     guest_pc: GuestAddress,
     guest_vbar_el1: Option<GuestAddress>,
+    ttbr0: GuestAddress,
+    ttbr1: GuestAddress,
 }
 
 struct DataAbortFlags(pub u32);
@@ -726,6 +700,7 @@ impl VCpu {
     }
 
     fn simple_run_loop(mut self, start_state: VcpuStartState) -> anyhow::Result<()> {
+        debug!("starting a CPU with start state: {:#x?}", &start_state);
         self.set_sys_reg(
             bindgen::hv_sys_reg_t_HV_SYS_REG_SP_EL1,
             self.get_stack_end().0,
@@ -757,26 +732,7 @@ impl VCpu {
             PSR_MODE_EL1H;
         self.set_reg(bindgen::hv_reg_t_HV_REG_CPSR, PSTATE_FAULT_BITS_64, "CPSR")?;
 
-        let usable_memory_start = {
-            // Setup translation tables
-            let ttbr = GuestAddress(0);
-            todo!();
-            let sz = core::mem::size_of::<page_table::TranslationTableLevel2_16k>();
-            let dram = self.memory.get_slice(ttbr, sz)?;
-            let pt = unsafe {
-                page_table::identity_map_36_bits_of_memory(
-                    dram.as_ptr() as *mut page_table::TranslationTableLevel2_16k,
-                    ttbr,
-                )
-            }?;
-
-            let addr = ttbr;
-
-            if sz < dram.len() {
-                bail!("cannot copy translation table into the guest: translation table size {} is < dram size {}", sz, dram.len());
-            }
-            unsafe { core::ptr::copy_nonoverlapping(&pt, dram.as_ptr() as *mut _, 1) };
-
+        {
             // Set all the required registers.
             {
                 let mut tcr_el1 = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_TCR_EL1)?;
@@ -822,8 +778,13 @@ impl VCpu {
             {
                 self.set_sys_reg(
                     bindgen::hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1,
-                    addr.0,
+                    start_state.ttbr0.0,
                     "TTBR0_EL1",
+                )?;
+                self.set_sys_reg(
+                    bindgen::hv_sys_reg_t_HV_SYS_REG_TTBR1_EL1,
+                    start_state.ttbr1.0,
+                    "TTBR1_EL1",
                 )?;
             }
 
@@ -837,15 +798,14 @@ impl VCpu {
             //     },
             //     "hv_vcpu_set_pending_interrupt",
             // )?;
-
-            addr.0 + (sz as u64)
         };
 
         {
-            let dram_start = GuestAddress(KERNEL_VA_OFFSET + DRAM_OFFSET);
+            let dram_start = DRAM_VA_START;
+            let start_params_offset = DRAM_VA_START.0 + DRAM_KERNEL_USABLE_DRAM_OFFSET;
             let start_params = StartParams {
                 dram_start: dram_start.0,
-                dram_usable_start: usable_memory_start
+                dram_usable_start: start_params_offset
                     + (core::mem::size_of::<StartParams>() as u64),
                 dram_size: MEMORY_SIZE as u64,
             };

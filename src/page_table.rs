@@ -97,6 +97,7 @@ addrselectbottom = 25
 
 use crate::HvMemoryFlags;
 use anyhow::bail;
+use log::debug;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
@@ -178,7 +179,11 @@ impl TranslationTableLevel2_16k {
         size: usize,
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
+        let top_bit_set = (va.0 >> 55) & 1 == 1;
         let size = size as u64;
+
+        debug!("configuring translation tables table_start_ipa={:#x?}, va={:#x?}, ipa={:#x?}, size={}, flags={:?}", table_start_ipa, va.0, ipa, size, flags);
+
         if !Self::is_aligned(table_start_ipa) {
             bail!(
                 "table_start_ipa {:#x} is not aligned to page size",
@@ -194,8 +199,6 @@ impl TranslationTableLevel2_16k {
         if !Self::is_aligned(size) {
             bail!("size {:#x} is not aligned to page size", size)
         }
-
-        let top_bit_set = (va.0 >> 55) & 1 == 1;
         if top_bit_set {
             assert_eq!(va.0 >> (64 - crate::TXSZ), (1 << crate::TXSZ) - 1)
         } else {
