@@ -105,6 +105,7 @@ pub const VA_PAGE: u64 = 1 << 14;
 
 pub const DRAM_IPA_START: u64 = 0x80_0000;
 pub const VA_START: GuestAddress = GuestAddress(0xffff_fff0_0000_0000);
+// pub const VA_START: GuestAddress = GuestAddress(0);
 pub const VA_START_OFFSET_DRAM: u64 = DRAM_IPA_START;
 pub const DRAM_VA_START: GuestAddress = GuestAddress(VA_START.0 + VA_START_OFFSET_DRAM);
 
@@ -131,11 +132,12 @@ pub const VA_REGION_SIZE: u64 = 1 << (64 - TXSZ); // The region size for virtual
 pub const IPS_SIZE: u64 = 1 << 36; // 64 GB address size
 
 pub const TCR_EL1_TG0_GRANULE: u64 = 0b10 << 14;
-pub const TCR_EL1_TG1_GRANULE: u64 = 0b10 << 30;
+pub const TCR_EL1_TG1_GRANULE: u64 = 0b01 << 30;
 pub const TCR_EL1_IPS: u64 = 0b001 << 32; // 64 GB
 pub const TCR_EL1_T0SZ: u64 = TXSZ; // so that 36 bits remains.
 pub const TCR_EL1_T1SZ: u64 = TXSZ << 16;
 pub const TCR_EL1_HA: u64 = 1 << 39;
+pub const TCR_EL1_HD: u64 = 1 << 40;
 
 fn assert_hv_return_t_ok(v: bindgen::hv_return_t, name: &str) -> anyhow::Result<()> {
     let ret = HVReturnT::try_from(v).map_err(|e| {
@@ -413,15 +415,30 @@ impl HfVm {
             .ok_or_else(|| anyhow!("entrypoint not set"))?;
 
         let vbar_el1 = self.vbar_el1;
-        let ttbr0 = GuestAddress(DRAM_IPA_START + self.get_ttbr_0_dram_offset());
-        let ttbr1 = GuestAddress(DRAM_IPA_START + self.get_ttbr_1_dram_offset());
+        let ttbr0 = DRAM_IPA_START + self.get_ttbr_0_dram_offset();
+        let ttbr1 = DRAM_IPA_START + self.get_ttbr_1_dram_offset();
 
-        // panic!(
-        //     "{:#x?}",
-        //     self.simulate_address_lookup(GuestAddress(0xfffffff000800200))
-        //         .unwrap()
-        //         .unwrap()
-        // );
+        // {
+        //     info!(
+        //         "{:#x?}",
+        //         self.simulate_address_lookup(GuestAddress(0xfffffff000800200))
+        //             .unwrap()
+        //             .unwrap()
+        //     );
+
+        //     info!(
+        //         "{:#x?}",
+        //         self.simulate_address_lookup(GuestAddress(0x800200))
+        //             .unwrap()
+        //             .unwrap()
+        //     );
+
+        //     let slice = self.memory.get_slice(DRAM_VA_START, 32).unwrap();
+        //     let buf = &mut [0u8; 32];
+        //     assert_eq!(slice.copy_to(buf), 32);
+        //     hexdump::hexdump(buf);
+        //     panic!("fuck");
+        // }
 
         Ok(std::thread::spawn(move || {
             let vcpu = VCpu::new(memory).unwrap();
@@ -491,8 +508,8 @@ impl From<&bindgen::hv_vcpu_exit_t> for HfVcpuExit {
 struct VcpuStartState {
     guest_pc: GuestAddress,
     guest_vbar_el1: Option<GuestAddress>,
-    ttbr0: GuestAddress,
-    ttbr1: GuestAddress,
+    ttbr0: u64,
+    ttbr1: u64,
 }
 
 struct DataAbortFlags(pub u32);
@@ -806,22 +823,13 @@ impl VCpu {
             {
                 let mut tcr_el1 = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_TCR_EL1)?;
 
-                // const EPD0: u64 = 1 << 7;
-                // const NFD0: u64 = 1 << 53;
-                // const SH0_OUTER_SHAREABLE: u64 = 0b10 << 12;
-                // const ORGN0: u64 = 0b11 << 10;
-                // const IRGN0: u64 = 0b10 << 8;
-
                 tcr_el1 |= TCR_EL1_TG0_GRANULE
                     | TCR_EL1_TG1_GRANULE
                     | TCR_EL1_IPS
                     | TCR_EL1_T0SZ
                     | TCR_EL1_T1SZ
-                    | TCR_EL1_HA;
-                // | NFD0
-                // | SH0_OUTER_SHAREABLE
-                // | ORGN0
-                // | IRGN0;
+                    | TCR_EL1_HA
+                    | TCR_EL1_HD;
                 self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_TCR_EL1, tcr_el1, "TCR_EL1")?;
             }
             {
@@ -850,12 +858,12 @@ impl VCpu {
             {
                 self.set_sys_reg(
                     bindgen::hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1,
-                    start_state.ttbr0.0,
+                    start_state.ttbr0,
                     "TTBR0_EL1",
                 )?;
                 self.set_sys_reg(
                     bindgen::hv_sys_reg_t_HV_SYS_REG_TTBR1_EL1,
-                    start_state.ttbr1.0,
+                    start_state.ttbr1,
                     "TTBR1_EL1",
                 )?;
             }

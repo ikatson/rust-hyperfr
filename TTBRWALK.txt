@@ -1,3 +1,9 @@
+# Downloaded from
+# https://raw.githubusercontent.com/GaloisInc/asl-translator/master/data/arm_defs.asl
+# and modified for our use-case to understand better.
+
+
+// AArch64.TranslationTableWalk()
 // == == == == == == == == == == == == == == ==
 // Returns a result of a translation table walk
 //
@@ -5,58 +11,60 @@
 // caching structures, and so avoid memory accesses that have been expressed in this
 // pseudocode. The use of such TLBs is not expressed in this pseudocode.
 
-TLBRecord AArch64.TranslationTableWalk(bits(48) ipaddress, bits(64) vaddress,
+TLBRecord AArch64.TranslationTableWalk(bits(52) ipaddress, bit s1_nonsecure, bits(64) vaddress,
                                        AccType acctype, boolean iswrite, boolean secondstage,
                                        boolean s2fs1walk, integer size)
-
-    if !secondstage then
-        assert !ELUsingAArch32(S1TranslationRegime());
-    else
-        assert HaveEL(EL2) & & !IsSecure() & & !ELUsingAArch32(EL2) & & PSTATE.EL != EL2;
-
     TLBRecord result;
     AddressDescriptor descaddr;
     bits(64) baseregister;
     bits(64) inputaddr; // Input Address is 'vaddress' for stage 1, 'ipaddress' for stage 2
 
-    descaddr.memattrs.type = MemType_Normal;
-
-    // Derived parameters for the page table walk:
-    // grainsize = Log2(Size of Table) - Size of Table is 4KB, 16KB or 64KB in AArch64
-    // stride = Log2(Address per Level) - Bits of address consumed at each level
-    // firstblocklevel = First level where a block entry is allowed
-    // ps = Physical Address size as encoded in TCR_EL1.IPS or TCR_ELx/VTCR_EL2.PS
-    // inputsize = Log2(Size of Input Address) - Input Address size in bits
-    // level = Level to start walk from
-    // This means that the number of levels after start level = 3-level
+    descaddr.memattrs.type1 = MemType_Normal;
 
     if !secondstage then
         // First stage translation
         inputaddr = ZeroExtend(vaddress);
-        top = AddrTop(inputaddr);
-        else
-            if inputaddr < top > == '0' then
-                inputsize = 64 - UInt(TCR_EL1.T0SZ);
-                if inputsize > 48 then
-                    c = ConstrainUnpredictable();
-                    assert c IN {Constraint_FORCE, Constraint_FAULT};
-                    if c == Constraint_FORCE then inputsize = 48;
-                if inputsize < 25 then
-                    c = ConstrainUnpredictable();
-                    assert c IN {Constraint_FORCE, Constraint_FAULT};
-                    if c == Constraint_FORCE then inputsize = 25;
-                largegrain = TCR_EL1.TG0 == '01';
-                midgrain = TCR_EL1.TG0 == '10';
-                basefound = inputsize >= 25 & & inputsize <= 48 & & IsZero(inputaddr < top: inputsize >);
-                disabled = TCR_EL1.EPD0 == '1';
-                baseregister = TTBR0_EL1;
-                descaddr.memattrs = WalkAttrDecode(
-                    TCR_EL1.SH0, TCR_EL1.ORGN0, TCR_EL1.IRGN0);
+        el = AArch64.AccessUsesEL(acctype);
+        top = AddrTop(inputaddr, (acctype == AccType_IFETCH), el);
 
+        # EL = El1 in a VM
+        else
+            # if inputaddr < top > == '0' then
+            #     inputsize = 64 - UInt(TCR_EL1.T0SZ);
+            #     largegrain = TCR_EL1.TG0 == '01';
+            #     midgrain = TCR_EL1.TG0 == '10';
+            #     inputsize_max = if Have52BitVAExt() & & largegrain then 52 else 48;
+            #     inputsize_min = 64 - (if !HaveSmallPageTblExt() then 39 else if largegrain then 47 else 48);
+            #     if inputsize < inputsize_min then
+            #         c = ConstrainUnpredictable(Unpredictable_RESTnSZ);
+            #         assert c IN {Constraint_FORCE, Constraint_FAULT};
+            #         if c == Constraint_FORCE then inputsize = inputsize_min;
+            #     basefound = inputsize >= inputsize_min & & inputsize <= inputsize_max & & IsZero(inputaddr < top: inputsize >);
+            #     disabled = TCR_EL1.EPD0 == '1' | | (PSTATE.EL == EL0 & & HaveE0PDExt() & & TCR_EL1.E0PD0 == '1');
+            #     disabled = disabled | | (el == EL0 & & acctype == AccType_NONFAULT & & TCR_EL1.NFD0 == '1');
+            #     baseregister = TTBR0_EL1;
+            #     descaddr.memattrs = WalkAttrDecode(
+            #         TCR_EL1.SH0, TCR_EL1.ORGN0, TCR_EL1.IRGN0, secondstage);
+            #     hierattrsdisabled = AArch64.HaveHPDExt() & &  TCR_EL1.HPD0 == '1';
+            else
+                inputsize = 64 - UInt(TCR_EL1.T1SZ);
+                largegrain = TCR_EL1.TG1 == '11'; // TG1 and TG0 encodings differ
+                midgrain = TCR_EL1.TG1 == '01';
+                inputsize_max = if Have52BitVAExt() & & largegrain then 52 else 48;
+                inputsize_min = 64 - (if !HaveSmallPageTblExt() then 39 else if largegrain then 47 else 48);
+                basefound = inputsize >= inputsize_min & & inputsize <= inputsize_max & & IsOnes(inputaddr < top: inputsize > );
+                disabled = TCR_EL1.EPD1 == '1' | | (PSTATE.EL == EL0 & & HaveE0PDExt() & & TCR_EL1.E0PD1 == '1');
+                disabled = disabled | | (el == EL0 & & acctype == AccType_NONFAULT & & TCR_EL1.NFD1 == '1');
+                baseregister = TTBR1_EL1;
+                descaddr.memattrs = WalkAttrDecode(
+                    TCR_EL1.SH1, TCR_EL1.ORGN1, TCR_EL1.IRGN1, secondstage);
+                hierattrsdisabled = AArch64.HaveHPDExt() & &  TCR_EL1.HPD1 == '1';
             ps = TCR_EL1.IPS;
             reversedescriptors = SCTLR_EL1.EE == '1';
             lookupsecure = IsSecure();
             singlepriv = FALSE;
+            update_AF = HaveAccessFlagUpdateExt() & & TCR_EL1.HA == '1';
+            update_AP = HaveDirtyBitModifierExt() & & update_AF & & TCR_EL1.HD == '1';
 
         grainsize = 14; // Log2(16KB page size)
         firstblocklevel = 2; // Largest block is 32MB(2 ^ 25 bytes)
@@ -66,7 +74,7 @@ TLBRecord AArch64.TranslationTableWalk(bits(48) ipaddress, bits(64) vaddress,
 
     if !basefound | | disabled then
         level = 0; // AArch32 reports this as a level 1 fault
-        result.addrdesc.fault = AArch64.TranslationFault(ipaddress, level, acctype, iswrite,
+        result.addrdesc.fault = AArch64.TranslationFault(ipaddress, s1_nonsecure,  level, acctype, iswrite,
                                                          secondstage, s2fs1walk);
         return result;
 
@@ -77,89 +85,109 @@ TLBRecord AArch64.TranslationTableWalk(bits(48) ipaddress, bits(64) vaddress,
         when '011'  outputsize = 42;
         when '100'  outputsize = 44;
         when '101'  outputsize = 48;
-        otherwise   outputsize = 48;
+        when '110'  outputsize = (if Have52BitPAExt() & & largegrain then 52 else 48);
+        otherwise   outputsize = integer IMPLEMENTATION_DEFINED "Reserved Intermediate Physical Address size value";
 
     if outputsize > PAMax() then outputsize = PAMax();
 
-    if outputsize != 48 & & !IsZero(baseregister < 47: outputsize > ) then
+    if outputsize < 48 & & !IsZero(baseregister < 47: outputsize >) then
         level = 0;
-        result.addrdesc.fault = AArch64.AddressSizeFault(ipaddress, level, acctype, iswrite,
+        result.addrdesc.fault = AArch64.AddressSizeFault(ipaddress, s1_nonsecure,  level, acctype, iswrite,
                                                          secondstage, s2fs1walk);
         return result;
 
-    // Bottom bound of the Base address is:
+    // Bottom bound of the Base address is :
     // Log2(8 bytes per entry)+Log2(Number of entries in starting level table)
     // Number of entries in starting level table =
-    // (Size of Input Address)/(Address pre level) ^ (Num level remaining)*(Size of Table))
-    baselowerbound=3 + inputsize - ((3-level)*stride + grainsize); // Log2(Num of entries*8)
-    baseaddress = baseregister < 47: baselowerbound > : Zeros(baselowerbound);
+    // (Size of Input Address)/((Address per level) ^ (Num levels remaining)*(Size of Table))
+    baselowerbound = 3 + inputsize - ((3-level)*stride + grainsize); // Log2(Num of entries*8)
+    if outputsize == 52 then
+        z = (if baselowerbound < 6 then 6 else baselowerbound);
+        baseaddress = baseregister < 5: 2 >: baseregister < 47: z > : Zeros(z);
+    else
+        baseaddress = ZeroExtend(baseregister < 47: baselowerbound >: Zeros(baselowerbound));
 
-    ns_table=if lookupsecure then '0' else '1';
-    ap_table='00';
-    xn_table='0';
-    pxn_table='0';
+    ns_table = if lookupsecure then '0' else '1';
+    ap_table = '00';
+    xn_table = '0';
+    pxn_table = '0';
 
-    addrselecttop=inputsize - 1;
+    addrselecttop = inputsize - 1;
 
+    apply_nvnv1_effect = HaveNVExt() & & EL2Enabled() & & HCR_EL2. < NV, NV1 > == '11' & & S1TranslationRegime() == EL1 & & !secondstage;
     repeat
-        addrselectbottom=(3-level)*stride + grainsize;
+        addrselectbottom = (3-level)*stride + grainsize;
 
-        bits(48) index = ZeroExtend(inputaddr < addrselecttop: addrselectbottom > : '000');
-        descaddr.paddress.physicaladdress=baseaddress OR index;
-        descaddr.paddress.NS=ns_table;
+        bits(52) index = ZeroExtend(inputaddr < addrselecttop: addrselectbottom >: '000');
+        descaddr.paddress.address = baseaddress OR index;
+        descaddr.paddress.NS = ns_table;
 
         // If there are two stages of translation, then the first stage table walk addresses
         // are themselves subject to translation
-        if !HaveEL(EL2) | | secondstage | | IsSecure() | | PSTATE.EL == EL2 then
-            descaddr2=descaddr;
+        if secondstage | | !HasS2Translation() | | (HaveNV2Ext() & & acctype == AccType_NV2REGISTER) then
+            descaddr2 = descaddr;
         else
-            descaddr2=AArch64.SecondStageWalk(
-                descaddr, vaddress, acctype, iswrite, 8);
+            hwupdatewalk = FALSE;
+            descaddr2 = AArch64.SecondStageWalk(
+                descaddr, vaddress, acctype, iswrite, 8, hwupdatewalk);
             // Check for a fault on the stage 2 walk
             if IsFault(descaddr2) then
-                result.addrdesc.fault=descaddr2.fault;
+                result.addrdesc.fault = descaddr2.fault;
                 return result;
 
         // Update virtual address for abort functions
-        descaddr2.vaddress=ZeroExtend(vaddress);
+        descaddr2.vaddress = ZeroExtend(vaddress);
 
-        desc=_Mem[descaddr2, 8, AccType_PTW];
-        if reversedescriptors then desc=BigEndianReverse(desc);
+        accdesc = CreateAccessDescriptorPTW(
+            acctype, secondstage, s2fs1walk, level);
+        desc = _Mem[descaddr2, 8, accdesc];
 
-        if desc < 0 > == '0' | | (desc < 1: 0 > == '01' & & level == 3) then
-            // Fault(00), Reserved(10), or Block(01) at level 3
-            result.addrdesc.fault=AArch64.TranslationFault(ipaddress, level, acctype,
+        if reversedescriptors then desc = BigEndianReverse(desc);
+
+        if desc < 0 > == '0' | | (desc < 1: 0 > == '01' & & (level == 3 | |
+                                                    (HaveBlockBBM() & & IsBlockDescriptorNTBitValid() & & desc < 16 > == '1'))) then
+             // Fault(00), Reserved(10), Block(01) at level 3, or Block(01) with nT bit set.
+            result.addrdesc.fault = AArch64.TranslationFault(ipaddress, s1_nonsecure, level, acctype,
                                                              iswrite, secondstage, s2fs1walk);
             return result;
 
         // Valid Block, Page, or Table entry
-        if desc < 1: 0 > == '01' | | level == 3 then // Block(01) or Page(11)
-            blocktranslate=TRUE;
-        else // Table(11)
-            if outputsize != 48 & & !IsZero(desc < 47: outputsize > ) then
-                result.addrdesc.fault=AArch64.AddressSizeFault(ipaddress, level, acctype,
+        if desc<1:0> == '01' || level == 3 then                 // Block (01) or Page (11)
+            blocktranslate = TRUE;
+        else                                                    // Table (11)
+            if (outputsize < 52 && largegrain && !IsZero(desc<15:12>)) || (outputsize < 48 && !IsZero(desc<47:outputsize>)) then
+                result.addrdesc.fault = AArch64.AddressSizeFault(ipaddress,s1_nonsecure,  level, acctype,
                                                                  iswrite, secondstage, s2fs1walk);
                 return result;
 
-            baseaddress = desc < 47: grainsize > : Zeros(grainsize);
-
+            if outputsize == 52 then
+                baseaddress = desc<15:12>:desc<47:grainsize>:Zeros(grainsize);
+            else
+                baseaddress = ZeroExtend(desc<47:grainsize>:Zeros(grainsize));
             if !secondstage then
                 // Unpack the upper and lower table attributes
-                ns_table = ns_table OR desc < 63 > ;
-                ap_table < 1 > = ap_table < 1 > OR desc < 62 > ;      // read-only
-                xn_table = xn_table OR desc < 60 > ;
-                // pxn_table and ap_table[0] apply only in EL1 & 0 translation regimes
-                if !singlepriv then
-                    ap_table < 0 > = ap_table < 0 > OR desc < 61 > ;  // privileged
-                    pxn_table = pxn_table OR desc < 59 > ;
+                ns_table    = ns_table    OR desc<63>;
+            if !secondstage && !hierattrsdisabled then
+                ap_table<1> = ap_table<1> OR desc<62>;       // read-only
 
-            level=level + 1;
-            addrselecttop=addrselectbottom - 1; blocktranslate=FALSE;
+                if apply_nvnv1_effect then
+                    pxn_table   = pxn_table   OR desc<60>;
+                else
+                    xn_table    = xn_table    OR desc<60>;
+                // pxn_table and ap_table[0] apply in EL1&0 or EL2&0 translation regimes
+                if !singlepriv then
+                    if !apply_nvnv1_effect then
+                        pxn_table   = pxn_table   OR desc<59>;
+                        ap_table<0> = ap_table<0> OR desc<61>;   // privileged
+
+            level = level + 1;
+            addrselecttop = addrselectbottom - 1;
+            blocktranslate = FALSE;
     until blocktranslate;
 
     // Check block size is supported at this level
     if level < firstblocklevel then
-        result.addrdesc.fault=AArch64.TranslationFault(ipaddress, level, acctype,
+        result.addrdesc.fault = AArch64.TranslationFault(ipaddress, s1_nonsecure, level, acctype,
                                                          iswrite, secondstage, s2fs1walk);
         return result;
 
@@ -173,45 +201,67 @@ TLBRecord AArch64.TranslationTableWalk(bits(48) ipaddress, bits(64) vaddress,
 
     if contiguousbitcheck && desc<52> == '1' then
         if boolean IMPLEMENTATION_DEFINED "Translation fault on misprogrammed contiguous bit" then
-            result.addrdesc.fault = AArch64.TranslationFault(ipaddress, level, acctype,
+            result.addrdesc.fault = AArch64.TranslationFault(ipaddress, s1_nonsecure, level, acctype,
                                                              iswrite, secondstage, s2fs1walk);
             return result;
 
     // Check the output address is inside the supported range
-    if outputsize != 48 && !IsZero(desc<47:outputsize>) then
-        result.addrdesc.fault = AArch64.AddressSizeFault(ipaddress, level, acctype,
+    if (outputsize < 52 && largegrain && !IsZero(desc<15:12>)) || (outputsize < 48 && !IsZero(desc<47:outputsize>)) then
+        result.addrdesc.fault = AArch64.AddressSizeFault(ipaddress,s1_nonsecure,  level, acctype,
                                                          iswrite, secondstage, s2fs1walk);
         return result;
 
-    // Check the access flag
-    if desc<10> == '0' then
-        result.addrdesc.fault = AArch64.AccessFlagFault(ipaddress, level, acctype,
-                                                        iswrite, secondstage, s2fs1walk);
-        return result;
-
     // Unpack the descriptor into address and upper and lower block attributes
-    outputaddress = desc<47:addrselectbottom>:inputaddr<addrselectbottom-1:0>;
-    xn = desc<54>;
-    pxn = desc<53>;
+    if outputsize == 52 then
+        outputaddress = desc<15:12>:desc<47:addrselectbottom>:inputaddr<addrselectbottom-1:0>;
+    else
+        outputaddress = ZeroExtend(desc<47:addrselectbottom>:inputaddr<addrselectbottom-1:0>);
+    // Check Access Flag
+    if desc<10> == '0' then
+        if !update_AF then
+            result.addrdesc.fault = AArch64.AccessFlagFault(ipaddress,s1_nonsecure,  level, acctype,
+                                                            iswrite, secondstage, s2fs1walk);
+            return result;
+        else
+            result.descupdate.AF = TRUE;
+
+    if update_AP && desc<51> == '1' then
+        // If hw update of access permission field is configured consider AP[2] as '0' / S2AP[2] as '1'
+        if !secondstage && desc<7> == '1' then
+            desc<7> = '0';
+            result.descupdate.AP = TRUE;
+        elsif secondstage && desc<7> == '0' then
+            desc<7> = '1';
+            result.descupdate.AP = TRUE;
+
+    // Required descriptor if AF or AP[2]/S2AP[2] needs update
+    result.descupdate.descaddr = descaddr;
+
+    if apply_nvnv1_effect then
+        pxn = desc<54>;                                       // Bit[54] of the block/page descriptor holds PXN instead of UXN
+        xn = '0';                                             // XN is '0'
+        ap = desc<7>:'01';                                    // Bit[6] of the block/page descriptor is treated as '0' regardless of value programmed
+    else
+        xn = desc<54>;                                        // Bit[54] of the block/page descriptor holds UXN
+        pxn = desc<53>;                                       // Bit[53] of the block/page descriptor holds PXN
+        ap = desc<7:6>:'1';                                   // Bits[7:6] of the block/page descriptor hold AP[2:1]
     contiguousbit = desc<52>;
     nG = desc<11>;
     sh = desc<9:8>;
-    ap = desc<7:6>:'1';
-    memattr = desc<5:2>;                // AttrIndx and NS bit in stage 1
+    memattr = desc<5:2>;                                      // AttrIndx and NS bit in stage 1
 
-    result.domain = bits(4) UNKNOWN;    // Domains not used
+    result.domain = bits(4) UNKNOWN;                          // Domains not used
     result.level = level;
     result.blocksize = 2^((3-level)*stride + grainsize);
 
     // Stage 1 translation regimes also inherit attributes from the tables
     if !secondstage then
-        result.perms.xn = xn OR xn_table;
-        result.perms.ap<2> = ap<2> OR ap_table<1>; // Force read-only
-
-        // PXN, nG and AP[1] apply only in EL1&0 stage 1 translation regimes
+        result.perms.xn      = xn OR xn_table;
+        result.perms.ap<2>   = ap<2> OR ap_table<1>;          // Force read-only
+        // PXN, nG and AP[1] apply in EL1&0 or EL2&0 stage 1 translation regimes
         if !singlepriv then
-            result.perms.ap<1> = ap<1> AND NOT(ap_table<0>); // Force privileged only
-            result.perms.pxn = pxn OR pxn_table;
+            result.perms.ap<1> = ap<1> AND NOT(ap_table<0>);  // Force privileged only
+            result.perms.pxn   = pxn OR pxn_table;
             // Pages from Non-secure tables are marked non-global in Secure EL1&0
             if IsSecure() then
                 result.nG = nG OR ns_table;
@@ -221,19 +271,26 @@ TLBRecord AArch64.TranslationTableWalk(bits(48) ipaddress, bits(64) vaddress,
             result.perms.ap<1> = '1';
             result.perms.pxn   = '0';
             result.nG          = '0';
-        result.perms.ap<0> = '1';
-        result.addrdesc.memattrs = AArch64.S1AttrDecode(sh, memattr<2:0>, acctype); result.addrdesc.paddress.NS = memattr<3> OR ns_table;
+        result.GP = desc<50>;                                 // Stage 1 block or pages might be guarded
+        result.perms.ap<0>   = '1';
+        result.addrdesc.memattrs = AArch64.S1AttrDecode(sh, memattr<2:0>, acctype);
+        result.addrdesc.paddress.NS = memattr<3> OR ns_table;
     else
         result.perms.ap<2:1> = ap<2:1>;
         result.perms.ap<0>   = '1';
         result.perms.xn      = xn;
+        if HaveExtendedExecuteNeverExt() then result.perms.xxn = desc<53>;
         result.perms.pxn     = '0';
         result.nG            = '0';
-        result.addrdesc.memattrs = S2AttrDecode(sh, memattr, acctype);
-        result.addrdesc.paddress.NS = '1';
+        if s2fs1walk then
+            result.addrdesc.memattrs = S2AttrDecode(sh, memattr, AccType_PTW);
+        else
+            result.addrdesc.memattrs = S2AttrDecode(sh, memattr, acctype);
+        result.addrdesc.paddress.NS = nsaccess;
 
-    result.addrdesc.paddress.physicaladdress = outputaddress;
+    result.addrdesc.paddress.address = outputaddress;
     result.addrdesc.fault = AArch64.NoFault();
     result.contiguous = contiguousbit == '1';
+    if HaveCommonNotPrivateTransExt() then result.CnP = baseregister<0>;
 
     return result;

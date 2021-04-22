@@ -93,6 +93,15 @@ baselowerbound = 14
 
 addrselecttop = 35
 addrselectbottom = 25
+
+
+
+// For TTBR1 walk:
+top = 55
+inputsize = 36
+inputsize_max = 48
+inputsize_min = 16
+
 */
 
 use crate::HvMemoryFlags;
@@ -102,19 +111,6 @@ use log::debug;
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 struct TranslationTableDescriptor16k(u64);
-
-impl TranslationTableDescriptor16k {
-    fn new(base_address: GuestAddress) -> Self {
-        let mut value = 0u64;
-        value |= 0b11; // valid + table bits
-
-        // Bits 47:14 included
-        assert_eq!(base_address.0 & !((1 << 14) - 1), base_address.0);
-
-        value |= base_address.0;
-        Self(value)
-    }
-}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -162,6 +158,10 @@ impl Default for TranslationTableLevel2_16k {
     }
 }
 
+const fn bits(val: u64, start_inclusive: u64, end_inclusive: u64) -> u64 {
+    val & ((1 << (start_inclusive + 1)) - 1) & !((1 << end_inclusive) - 1)
+}
+
 impl TranslationTableLevel2_16k {
     fn is_aligned(value: u64) -> bool {
         value & ((1 << 14) - 1) == 0
@@ -182,6 +182,10 @@ impl TranslationTableLevel2_16k {
 
         let l3_idx = ((va.0 >> 14) & ((1 << 11) - 1)) as usize;
         let l3 = &self.level_3_tables[l2_idx as usize].descriptors[l3_idx as usize];
+
+        if l3.0 & 0b11 != 0b11 {
+            return None;
+        }
 
         let ipa = l3.0 & ((1 << 48) - 1) & !((1 << 14) - 1);
         Some(ipa + (va.0 & ((1 << 14) - 1)))
@@ -261,12 +265,22 @@ impl TranslationTableLevel2_16k {
         if !Self::is_aligned(size) {
             bail!("size {:#x} is not aligned to page size", size)
         }
+
+        // Just a double-check for debugging
+        // In pseudo-code this was:
+        // if !IsZero(baseregister < 47: outputsize > ) -> throw AddressFault
+        assert_eq!(bits(table_start_ipa, 47, 36), 0);
+
         if top_bit_set {
-            // Make sure all bits up to TXSZ are ones.
-            assert_eq!(va.0 >> (64 - crate::TXSZ), (1 << crate::TXSZ) - 1)
+            // Make sure all bits <top:inputsize> are ones.
+            // where inputsize = 64 - TxSZ and top=55
+            assert_eq!(
+                bits(va.0, 55, 64 - crate::TXSZ),
+                bits(u64::MAX, 55, 64 - crate::TXSZ)
+            )
         } else {
             // Make sure all bits up to TXSZ are zeroes.
-            assert_eq!(va.0 >> (64 - crate::TXSZ), 0)
+            assert_eq!(bits(va.0, 55, 64 - crate::TXSZ), 0)
         }
 
         let mut ipa = ipa;
