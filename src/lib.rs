@@ -568,11 +568,37 @@ impl DataAbortFlags {
     fn dfsc(&self) -> u8 {
         (self.0 & 0b11111) as u8
     }
+
+    fn dfsc_desc(&self) -> &'static str {
+        match self.dfsc() {
+            0b000000 => {
+                "Address size fault, level 0 of translation or translation table base register."
+            }
+            0b000001 => "Address size fault, level 1",
+            0b000010 => "Address size fault, level 2",
+            0b000011 => "Address size fault, level 3",
+            0b000100 => "Translation fault, level 0",
+            0b000101 => "Translation fault, level 1",
+            0b000110 => "Translation fault, level 2",
+            0b000111 => "Translation fault, level 3",
+            0b001001 => "Access flag fault, level 1",
+            0b001010 => "Access flag fault, level 2",
+            0b001011 => "Access flag fault, level 3",
+            0b001000 => "Access flag fault, level 0",
+            0b001100 => "Permission fault, level 0",
+            0b001101 => "Permission fault, level 1",
+            0b001110 => "Permission fault, level 2",
+            0b001111 => "Permission fault, level 3",
+            _ => "unknown",
+        }
+    }
 }
 
 impl core::fmt::Debug for DataAbortFlags {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("DataAbortFlags[is_valid={}", self.is_valid()))?;
+        let mut ds = f.debug_struct("DataAbortFlags");
+
+        ds.field("ISV (is_valid)", &self.is_valid());
         if let (Some(sas), Some(length), Some(sse), Some(srt), Some(sf), Some(af)) = (
             self.sas(),
             self.sas_len(),
@@ -581,22 +607,22 @@ impl core::fmt::Debug for DataAbortFlags {
             self.sf(),
             self.af(),
         ) {
-            f.write_fmt(format_args!(
-                ", sas={} (length={}), sse={}, srt={} (register=X{}), sf={}, af={}",
-                sas, length, sse, srt, srt, sf, af,
-            ))?;
+            ds.field("sas", &sas)
+                .field("sas_length()", &length)
+                .field("sse", &sse)
+                .field("srt", &srt)
+                .field("register()", &format_args!("X{}", srt))
+                .field("sf", &sf)
+                .field("af", &af);
         };
         if self.dfsc() == 0b010000 {
-            f.write_fmt(format_args!(", far_is_valid={}", self.far_is_valid()))?
+            ds.field("far_is_valid", &self.far_is_valid());
         };
 
-        f.write_fmt(format_args!(
-            ", is_write={}, dfsc={:#b}]",
-            self.is_write(),
-            self.dfsc()
-        ))?;
-
-        Ok(())
+        ds.field("is_write", &self.is_write())
+            .field("dfsc", &format_args!("{:#b}", self.dfsc()))
+            .field("dfsc_description()", &self.dfsc_desc())
+            .finish()
     }
 }
 
@@ -777,7 +803,7 @@ impl VCpu {
             _ => None,
         };
         error!(
-            "unhandled data abort: address={:#x?}, flags={:?}, write_value={:#x?}",
+            "unhandled data abort: address={:#x?}, flags={:#?}, write_value={:#x?}",
             self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_FAR_EL1)?,
             &dai,
             write_value
@@ -1068,11 +1094,17 @@ impl core::fmt::Debug for InstructionAbortFlags {
             0b000000 => {
                 "Address size fault, level 0 of translation or translation table base register"
             }
+            0b000001 => "Address size fault, level 1",
+            0b000010 => "Address size fault, level 2",
+            0b000011 => "Address size fault, level 3",
             0b000100 => "Translation fault, level 0",
             0b000101 => "Translation fault, level 1",
             0b000110 => "Translation fault, level 2",
             0b000111 => "Translation fault, level 3",
             0b001011 => "Access flag fault, level 3",
+            0b001101 => "Permission fault, level 1",
+            0b001110 => "Permission fault, level 2",
+            0b001111 => "Permission fault, level 3",
             _ => "[OTHER, look at the docs]",
         };
         ds.field("IFSC description", &ifsc_desc);

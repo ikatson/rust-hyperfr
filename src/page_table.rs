@@ -106,7 +106,7 @@ inputsize_min = 16
 
 use crate::HvMemoryFlags;
 use anyhow::bail;
-use log::debug;
+use log::{debug, trace};
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
@@ -212,7 +212,7 @@ impl TranslationTableLevel2_16k {
             l2desc.0 |= 0b11;
             l2desc.0 |= table_start_ipa + t3offset;
 
-            println!(
+            trace!(
                 "table_start_ipa={:#x?}, l2={}, l3addr={:#x?}",
                 table_start_ipa,
                 l2,
@@ -294,9 +294,10 @@ impl TranslationTableLevel2_16k {
             let l3_desc = &mut self.level_3_tables[l2_idx as usize].descriptors[l3_idx as usize];
 
             if l3_desc.0 & 0b11 > 0 {
-                panic!(
+                bail!(
                     "page l2={},l3={} was already configured previously",
-                    l2_idx, l3_idx
+                    l2_idx,
+                    l3_idx
                 );
             }
 
@@ -305,63 +306,28 @@ impl TranslationTableLevel2_16k {
             v |= 0b10 << 8; // SH
             v |= ipa;
 
+            if !(flags.contains(HvMemoryFlags::HV_MEMORY_EXEC)) {
+                v |= 1 << 53; // Privileged execute never
+            }
+
+            // AP bits AP[2:1], bits[7:6] Data Access Permissions bits, see Memory access control on page D5-2731.
+            if !flags.contains(HvMemoryFlags::HV_MEMORY_WRITE) {
+                v |= 0b10 << 6;
+            }
+
             l3_desc.0 = v;
 
-            println!(
+            trace!(
                 "va={:#x?}, ttbr: l2_idx={}, l3_idx={}, l3val={:#x?}",
-                va.0, l2_idx, l3_idx, v
+                va.0,
+                l2_idx,
+                l3_idx,
+                v
             );
 
             va = GuestAddress(va.0 + page);
             ipa += page;
         }
-
-        // let va_bottom = va.0 & ((1 << crate::TXSZ) - 1);
-        // let va_top = va_bottom + size;
-        // debug!("va_bottom={:#x?}, va_top={:#x?}", va_bottom, va_top);
-
-        // let l2_range = (va_bottom >> (14 + 11))..=(va_top >> (14 + 11));
-        // for l2 in l2_range {
-        //     let t3offset = self.get_t3_offset(l2 as usize);
-        //     let l2desc = &mut self.descriptors[l2 as usize];
-        //     l2desc.0 |= 0b11;
-        //     l2desc.0 |= table_start_ipa + t3offset;
-
-        //     let l2_va_base: u64 = va_bottom | ((l2 as u64) << (14 + 11));
-        //     let l2_ipa_base: u64 = ipa | ((l2 as u64) << (14 + 11));
-
-        //     for (l3, l3desc) in self.level_3_tables[l2 as usize]
-        //         .descriptors
-        //         .iter_mut()
-        //         .enumerate()
-        //         .filter(|(idx, _)| {
-        //             let l3_va_base = l2_va_base | ((*idx as u64) << 14);
-        //             // println!("l3_va_base={:#x?}", l3_va_base);
-        //             l3_va_base >= va_bottom && l3_va_base < va_top
-        //         })
-        //     {
-        //         if l3desc.0 & 1 == 1 {
-        //             bail!("level 3 descriptor {} already configured: l2={}, l3={}, l2val={:#x?}, l3val={:#x?}", l3, l2, l3, l2desc.0, l3desc.0);
-        //         }
-        //         let page_ipa = l2_ipa_base + ((l3 as u64) << 14);
-        //         l3desc.0 |= 0b11;
-        //         l3desc.0 |= page_ipa;
-
-        //         // set access flag, otherwise it causes faults that we don't handle.
-        //         l3desc.0 |= 1 << 10; // AF=1;
-
-        //         // Not sure what this means, but shareable sounds good?
-        //         l3desc.0 |= 0b10 << 8; // SH
-
-        //         // We set up MAIR_EL1 to say that index 0 is our main memory.
-        //         // l3desc.0 = 0b___ << 2; // AttrIndx
-
-        //         println!(
-        //             "ttbr: l2={}, l3={}, l2val={:#x?}, l3val={:#x?}",
-        //             l2, l3, l2desc.0, l3desc.0
-        //         );
-        //     }
-        // }
         Ok(())
     }
 }
