@@ -7,9 +7,36 @@ use std::{
     path::Path,
     thread::JoinHandle,
 };
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use log::{debug, error, info};
+
+#[derive(Copy, Clone, Debug)]
+pub struct GuestIpaAddress(u64);
+impl GuestIpaAddress {
+    const fn add(&self, offset: Offset) -> GuestIpaAddress {
+        GuestIpaAddress(self.0 + offset.0)
+    }
+    const fn as_guest_address(&self) -> GuestAddress {
+        GuestAddress(self.0)
+    }
+}
+
+#[derive(Copy, Clone, Default, Debug)]
+pub struct GuestVaAddress(u64);
+impl GuestVaAddress {
+    const fn add(&self, offset: Offset) -> GuestVaAddress {
+        GuestVaAddress(self.0 + offset.0)
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct Offset(u64);
+impl Offset {
+    const fn add(&self, offset: Offset) -> Offset {
+        Offset(self.0 + offset.0)
+    }
+}
 
 pub mod page_table;
 
@@ -87,13 +114,13 @@ impl TryFrom<bindgen::hv_return_t> for HVReturnT {
 
 pub struct HfVm {
     memory: Arc<GuestMemoryMmap>,
-    entrypoint: Option<GuestAddress>,
-    vbar_el1: Option<GuestAddress>,
+    entrypoint: Option<GuestVaAddress>,
+    vbar_el1: Option<GuestVaAddress>,
 }
 
 #[derive(Default)]
 pub struct LoadedElf {
-    pub entrypoint: GuestAddress,
+    pub entrypoint: GuestVaAddress,
 }
 
 // Memory structure:
@@ -103,29 +130,30 @@ pub struct LoadedElf {
 
 pub const VA_PAGE: u64 = 1 << 14;
 
-pub const DRAM_IPA_START: u64 = 0x80_0000;
-pub const VA_START: GuestAddress = GuestAddress(0xffff_fff0_0000_0000);
-// pub const VA_START: GuestAddress = GuestAddress(0);
-pub const VA_START_OFFSET_DRAM: u64 = DRAM_IPA_START;
-pub const DRAM_VA_START: GuestAddress = GuestAddress(VA_START.0 + VA_START_OFFSET_DRAM);
+pub const DRAM_IPA_START: GuestIpaAddress = GuestIpaAddress(0x80_0000);
+pub const VA_START: GuestVaAddress = GuestVaAddress(0xffff_fff0_0000_0000);
+pub const DRAM_VA_START: GuestVaAddress = VA_START.add(Offset(DRAM_IPA_START.0));
 
 pub const KERNEL_BINARY_MEMORY_MAX_SIZE: u64 = 8 * 1024 * 1024; // 8 Mib
 
-pub const DRAM_KERNEL_BINARY_OFFSET: u64 = 0;
+pub const DRAM_KERNEL_BINARY_OFFSET: Offset = Offset(0);
 
-pub const DRAM_TTBR_OFFSET: u64 =
-    DRAM_KERNEL_BINARY_OFFSET + KERNEL_BINARY_MEMORY_MAX_SIZE + VA_PAGE;
+pub const DRAM_TTBR_OFFSET: Offset = DRAM_KERNEL_BINARY_OFFSET
+    .add(Offset(KERNEL_BINARY_MEMORY_MAX_SIZE))
+    .add(Offset(VA_PAGE));
+
 pub const TTBR_SIZE: usize = core::mem::size_of::<page_table::TranslationTableLevel2_16k>();
 
-pub const DRAM_KERNEL_USABLE_DRAM_OFFSET: u64 = DRAM_TTBR_OFFSET + (TTBR_SIZE * 2) as u64 + VA_PAGE;
+pub const DRAM_KERNEL_USABLE_DRAM_OFFSET: Offset = DRAM_TTBR_OFFSET
+    .add(Offset(TTBR_SIZE as u64 * 2))
+    .add(Offset(VA_PAGE));
 
 // this could be configurable, it's just that we don't care yet.
 // This is 32 MiB, we just don't need more.
 pub const MEMORY_SIZE: usize = 256 * 1024 * 1024;
 
 pub const STACK_SIZE: u64 = 1024 * 1024;
-pub const STACK_END: GuestAddress =
-    GuestAddress(VA_START.0 + VA_START_OFFSET_DRAM + MEMORY_SIZE as u64);
+pub const STACK_END: GuestVaAddress = DRAM_VA_START.add(Offset(MEMORY_SIZE as u64));
 
 pub const TXSZ: u64 = 28;
 pub const VA_REGION_SIZE: u64 = 1 << (64 - TXSZ); // The region size for virtual addresses.
@@ -157,12 +185,12 @@ impl HfVm {
     pub fn new() -> anyhow::Result<Self> {
         assert_hv_return_t_ok(unsafe { bindgen::hv_vm_create(null_obj()) }, "hv_vm_create")?;
         debug!(
-            "allocating guest memory, VA start: {:x?}, size: {}",
-            DRAM_VA_START.0, MEMORY_SIZE
+            "allocating guest memory, IPA start: {:x?}, size: {}",
+            DRAM_IPA_START.0, MEMORY_SIZE
         );
         let mut vm = Self {
             memory: Arc::new(
-                GuestMemoryMmap::from_ranges(&[(DRAM_VA_START, MEMORY_SIZE)])
+                GuestMemoryMmap::from_ranges(&[(DRAM_IPA_START.as_guest_address(), MEMORY_SIZE)])
                     .context("error allocating guest memory")?,
             ),
             entrypoint: None,
@@ -170,7 +198,7 @@ impl HfVm {
         };
         vm.hf_map_memory(
             vm.memory
-                .get_host_address(DRAM_VA_START)
+                .get_host_address(DRAM_IPA_START.as_guest_address())
                 .context("error getting host address for guest memory start")?,
             DRAM_IPA_START,
             MEMORY_SIZE,
@@ -178,7 +206,7 @@ impl HfVm {
         )
         .context("error mapping DRAM memory into the guest VM")?;
 
-        let usable_memory_size = (MEMORY_SIZE as u64 - DRAM_KERNEL_USABLE_DRAM_OFFSET) as usize;
+        let usable_memory_size = (MEMORY_SIZE as u64 - DRAM_KERNEL_USABLE_DRAM_OFFSET.0) as usize;
 
         vm.initial_configure_page_tables_l2()
             .context("error in initial page table configuration")?;
@@ -186,10 +214,8 @@ impl HfVm {
         // Configure page tables for *Usable* DRAM.
         // This is the RAM that the kernel is free to use for whatever purpose, e.g. allocating.
         vm.configure_page_tables(
-            DRAM_IPA_START + DRAM_KERNEL_USABLE_DRAM_OFFSET,
-            DRAM_VA_START
-                .checked_add(DRAM_KERNEL_USABLE_DRAM_OFFSET)
-                .unwrap(),
+            DRAM_IPA_START.add(DRAM_KERNEL_USABLE_DRAM_OFFSET),
+            DRAM_VA_START.add(DRAM_KERNEL_USABLE_DRAM_OFFSET),
             usable_memory_size,
             HvMemoryFlags::ALL,
         )
@@ -201,42 +227,45 @@ impl HfVm {
         self.memory.clone()
     }
 
-    fn get_ttbr_0_dram_offset(&self) -> u64 {
+    fn get_ttbr_0_dram_offset(&self) -> Offset {
         DRAM_TTBR_OFFSET
     }
 
-    fn get_ttbr_1_dram_offset(&self) -> u64 {
-        self.get_ttbr_0_dram_offset() + TTBR_SIZE as u64
+    fn get_ttbr_1_dram_offset(&self) -> Offset {
+        self.get_ttbr_0_dram_offset().add(Offset(TTBR_SIZE as u64))
     }
 
     fn initial_configure_page_tables_l2(&mut self) -> anyhow::Result<()> {
         for table_start_dram_offset in
-            &[self.get_ttbr_0_dram_offset(), self.get_ttbr_1_dram_offset()]
+            (&[self.get_ttbr_0_dram_offset(), self.get_ttbr_1_dram_offset()])
+                .iter()
+                .copied()
         {
-            let page_table_guest_addr =
-                DRAM_VA_START.checked_add(*table_start_dram_offset).unwrap();
+            let page_table_guest_ipa = DRAM_IPA_START.add(table_start_dram_offset);
             let page_table_ptr =
                 self.memory
-                    .get_slice(page_table_guest_addr, TTBR_SIZE)
+                    .get_slice(page_table_guest_ipa.as_guest_address(), TTBR_SIZE)
                     .with_context(|| {
                         format!(
                             "error getting slice of memory at {:#x?}, size {}",
-                            page_table_guest_addr.0, TTBR_SIZE
+                            page_table_guest_ipa.0, TTBR_SIZE
                         )
                     })?
                     .as_ptr() as *mut page_table::TranslationTableLevel2_16k;
 
             let table =
                 unsafe { &mut *page_table_ptr as &mut page_table::TranslationTableLevel2_16k };
-            let table_start_ipa = DRAM_IPA_START + *table_start_dram_offset;
             table
-                .setup_l2(table_start_ipa)
+                .setup_l2(page_table_guest_ipa)
                 .context("error setting up L2 tables")?;
         }
         Ok(())
     }
 
-    pub fn simulate_address_lookup(&self, va: GuestAddress) -> anyhow::Result<Option<u64>> {
+    fn get_translation_table_for_va(
+        &mut self,
+        va: GuestVaAddress,
+    ) -> anyhow::Result<(GuestIpaAddress, &mut page_table::TranslationTableLevel2_16k)> {
         let top_bit_set = (va.0 >> 55) & 1 == 1;
 
         let table_start_dram_offset = if top_bit_set {
@@ -245,58 +274,33 @@ impl HfVm {
             self.get_ttbr_0_dram_offset()
         };
 
-        let page_table_guest_addr = DRAM_VA_START.checked_add(table_start_dram_offset).unwrap();
-        let page_table_ptr = self
+        let table_ipa = DRAM_IPA_START.add(table_start_dram_offset);
+        let table_ptr = self
             .memory
-            .get_slice(page_table_guest_addr, TTBR_SIZE)
-            .with_context(|| {
-                format!(
-                    "error getting slice of memory at {:#x?}",
-                    page_table_guest_addr.0
-                )
-            })?
+            .get_slice(table_ipa.as_guest_address(), TTBR_SIZE)
+            .with_context(|| format!("error getting slice of memory at {:#x?}", table_ipa.0))?
             .as_ptr() as *mut page_table::TranslationTableLevel2_16k;
 
-        let table = unsafe { &*page_table_ptr as &page_table::TranslationTableLevel2_16k };
-        Ok(table.simulate_lookup(DRAM_IPA_START + table_start_dram_offset, va))
+        let table = unsafe { &mut *table_ptr as &mut page_table::TranslationTableLevel2_16k };
+        Ok((table_ipa, table))
+    }
+
+    pub fn simulate_address_lookup(&mut self, va: GuestVaAddress) -> anyhow::Result<Option<u64>> {
+        let (ipa, table) = self.get_translation_table_for_va(va)?;
+        Ok(table.simulate_lookup(ipa, va))
     }
 
     fn configure_page_tables(
         &mut self,
-        ipa: u64,
-        va: GuestAddress,
+        ipa: GuestIpaAddress,
+        va: GuestVaAddress,
         size: usize,
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
-        let top_bit_set = (va.0 >> 55) & 1 == 1;
+        let (table_ipa, table) = self.get_translation_table_for_va(va)?;
 
-        let table_start_dram_offset = if top_bit_set {
-            self.get_ttbr_1_dram_offset()
-        } else {
-            self.get_ttbr_0_dram_offset()
-        };
-
-        let page_table_guest_addr = DRAM_VA_START.checked_add(table_start_dram_offset).unwrap();
-        let page_table_ptr = self
-            .memory
-            .get_slice(page_table_guest_addr, TTBR_SIZE)
-            .with_context(|| {
-                format!(
-                    "error getting slice of memory at {:#x?}",
-                    page_table_guest_addr.0
-                )
-            })?
-            .as_ptr() as *mut page_table::TranslationTableLevel2_16k;
-
-        let table = unsafe { &mut *page_table_ptr as &mut page_table::TranslationTableLevel2_16k };
         table
-            .setup(
-                DRAM_IPA_START + table_start_dram_offset,
-                va,
-                ipa,
-                size,
-                flags,
-            )
+            .setup(table_ipa, va, ipa, size, flags)
             .context("error configuring the Level 2 translation table")?;
         Ok(())
     }
@@ -305,15 +309,15 @@ impl HfVm {
         // void *addr, hv_ipa_t ipa, size_t size, hv_memory_flags_t flags
         &self,
         addr: *mut u8,
-        ipa: u64,
+        ipa: GuestIpaAddress,
         size: usize,
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
         if !is_aligned_to_page_size(addr as u64) {
             bail!("addr {:#x} is not aligned to page size", addr as u64)
         }
-        if !is_aligned_to_page_size(ipa) {
-            bail!("ipa {:#x} is not aligned to page size", ipa)
+        if !is_aligned_to_page_size(ipa.0) {
+            bail!("ipa {:#x} is not aligned to page size", ipa.0)
         }
         if !is_aligned_to_page_size(size as u64) {
             bail!("size {:#x} is not a multiple of page size", size)
@@ -321,11 +325,11 @@ impl HfVm {
 
         debug!(
             "calling hv_vm_map: addr={:?}, ipa={:#x}, size={:?}, flags={:?}",
-            addr, ipa, size, flags
+            addr, ipa.0, size, flags
         );
 
         assert_hv_return_t_ok(
-            unsafe { bindgen::hv_vm_map(addr as *mut _, ipa, size as u64, flags.bits() as u64) },
+            unsafe { bindgen::hv_vm_map(addr as *mut _, ipa.0, size as u64, flags.bits() as u64) },
             "hv_vm_map",
         )
     }
@@ -338,9 +342,7 @@ impl HfVm {
         use object::read::ObjectSection;
         use object::Object;
 
-        let result = LoadedElf {
-            entrypoint: GuestAddress(obj.entry()),
-        };
+        let mut first_page = None;
 
         for section in obj.sections() {
             use object::SectionKind::*;
@@ -351,9 +353,24 @@ impl HfVm {
                 )
             })?;
 
-            // Assume the exception table is the first piece.
+            let start = align_down_to_page_size(section.address());
+            let end = align_up_to_page_size(section.address() + section.size());
+            let size = (end - start) as usize;
+            let first_page = match first_page {
+                Some(addr) => addr,
+                None => {
+                    first_page = Some(start);
+                    start
+                }
+            };
+            // TODO: this assumes the ELF is compiled accordingly and is safe to load
+            // at the specified addresses.
+            let ipa = DRAM_IPA_START.add(Offset(start - first_page));
+            let guest_address = DRAM_VA_START.add(Offset(start - first_page));
+
+            // TODO: assumes the exception table is the first piece.
             if let Text = section.kind() {
-                self.vbar_el1 = Some(GuestAddress(section.address()))
+                self.vbar_el1 = Some(GuestVaAddress(section.address() - first_page))
             }
 
             match section.kind() {
@@ -367,19 +384,17 @@ impl HfVm {
                         }
                         _ => unreachable!(),
                     };
-                    let start = align_down_to_page_size(section.address());
-                    let end = align_up_to_page_size(section.address() + section.size());
-                    let size = (end - start) as usize;
-                    debug!(
-                        "configuring page tables for section {}, section size {}",
-                        section_name,
-                        section.size()
-                    );
 
-                    // TODO: this assumes the ELF is compiled accordingly and is safe to load
-                    // at the specified addresses.
-                    let ipa = section.address() - VA_START.0;
-                    self.configure_page_tables(ipa, GuestAddress(section.address()), size, flags)?;
+                    debug!(
+                        "configuring translation tables for section {}, section size {}, translated size {}, binary section address {:#x?}, IPA {:#x?}, guest address {:#x?}",
+                        section_name,
+                        section.size(),
+                        size,
+                        section.address(),
+                        ipa.0,
+                        guest_address.0,
+                    );
+                    self.configure_page_tables(ipa, guest_address, size, flags)?;
 
                     let data = section.data().with_context(|| {
                         format!("error getting section data for section {}", section_name)
@@ -387,7 +402,7 @@ impl HfVm {
                     if !data.is_empty() {
                         let slice = self
                             .memory
-                            .get_slice(GuestAddress(section.address()), section.size() as usize)
+                            .get_slice(ipa.as_guest_address(), section.size() as usize)
                             .with_context(|| {
                                 format!(
                                     "error getting the slice of memory for section {}",
@@ -401,13 +416,17 @@ impl HfVm {
             }
         }
 
-        self.entrypoint = Some(result.entrypoint);
-        Ok(result)
+        let entrypoint = DRAM_VA_START.add(Offset(
+            obj.entry() - first_page.ok_or_else(|| anyhow!("no sections in the binary"))?,
+        ));
+        debug!("entrypoint is {:#x?}", entrypoint.0);
+        self.entrypoint = Some(entrypoint);
+        Ok(LoadedElf { entrypoint })
     }
 
     pub fn vcpu_create_and_run(
         &self,
-        entrypoint: Option<GuestAddress>,
+        entrypoint: Option<GuestVaAddress>,
     ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
         let memory = self.memory.clone();
         let entrypoint = entrypoint
@@ -415,8 +434,8 @@ impl HfVm {
             .ok_or_else(|| anyhow!("entrypoint not set"))?;
 
         let vbar_el1 = self.vbar_el1;
-        let ttbr0 = DRAM_IPA_START + self.get_ttbr_0_dram_offset();
-        let ttbr1 = DRAM_IPA_START + self.get_ttbr_1_dram_offset();
+        let ttbr0 = DRAM_IPA_START.add(self.get_ttbr_0_dram_offset());
+        let ttbr1 = DRAM_IPA_START.add(self.get_ttbr_1_dram_offset());
 
         // {
         //     info!(
@@ -506,10 +525,10 @@ impl From<&bindgen::hv_vcpu_exit_t> for HfVcpuExit {
 
 #[derive(Copy, Clone, Debug)]
 struct VcpuStartState {
-    guest_pc: GuestAddress,
-    guest_vbar_el1: Option<GuestAddress>,
-    ttbr0: u64,
-    ttbr1: u64,
+    guest_pc: GuestVaAddress,
+    guest_vbar_el1: Option<GuestVaAddress>,
+    ttbr0: GuestIpaAddress,
+    ttbr1: GuestIpaAddress,
 }
 
 struct DataAbortFlags(pub u32);
@@ -628,8 +647,8 @@ impl core::fmt::Debug for DataAbortFlags {
 
 #[repr(C)]
 struct StartParams {
-    dram_start: u64,
-    dram_usable_start: u64,
+    dram_start: GuestVaAddress,
+    dram_usable_start: GuestVaAddress,
     dram_size: u64,
 }
 
@@ -787,7 +806,13 @@ impl VCpu {
         }
         let mut data = vec![0u8; len as usize];
         debug!("STACK AT {:#x}, length {}", sp, len);
-        self.memory.read_slice(&mut data, GuestAddress(sp))?;
+
+        let offset = sp - DRAM_VA_START.0;
+
+        self.memory.read_slice(
+            &mut data,
+            DRAM_IPA_START.add(Offset(offset)).as_guest_address(),
+        )?;
         hexdump::hexdump(&data);
         Ok(())
     }
@@ -884,12 +909,12 @@ impl VCpu {
             {
                 self.set_sys_reg(
                     bindgen::hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1,
-                    start_state.ttbr0,
+                    start_state.ttbr0.0,
                     "TTBR0_EL1",
                 )?;
                 self.set_sys_reg(
                     bindgen::hv_sys_reg_t_HV_SYS_REG_TTBR1_EL1,
-                    start_state.ttbr1,
+                    start_state.ttbr1.0,
                     "TTBR1_EL1",
                 )?;
             }
@@ -907,17 +932,21 @@ impl VCpu {
         };
 
         {
-            let dram_start = DRAM_VA_START;
-            let start_params_offset = DRAM_VA_START.0 + DRAM_KERNEL_USABLE_DRAM_OFFSET;
+            let start_params_dram_offset = DRAM_KERNEL_USABLE_DRAM_OFFSET;
+            let start_params_end_offset =
+                start_params_dram_offset.add(Offset(core::mem::size_of::<StartParams>() as u64));
+
             let start_params = StartParams {
-                dram_start: dram_start.0,
-                dram_usable_start: start_params_offset
-                    + (core::mem::size_of::<StartParams>() as u64),
+                dram_start: DRAM_VA_START,
+                dram_usable_start: DRAM_VA_START.add(start_params_end_offset),
                 dram_size: MEMORY_SIZE as u64,
             };
-            let start_params_mem = self
-                .memory
-                .get_slice(dram_start, core::mem::size_of::<StartParams>())?;
+            let start_params_mem = self.memory.get_slice(
+                DRAM_IPA_START
+                    .add(start_params_dram_offset)
+                    .as_guest_address(),
+                core::mem::size_of::<StartParams>(),
+            )?;
             unsafe {
                 core::ptr::copy(
                     &start_params,
@@ -925,7 +954,11 @@ impl VCpu {
                     1,
                 )
             };
-            self.set_reg(bindgen::hv_reg_t_HV_REG_X0, dram_start.0, "X0")?;
+            self.set_reg(
+                bindgen::hv_reg_t_HV_REG_X0,
+                DRAM_IPA_START.add(start_params_dram_offset).0,
+                "X0",
+            )?;
         }
 
         // self.enable_soft_debug()?;
