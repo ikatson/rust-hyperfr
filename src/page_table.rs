@@ -169,7 +169,7 @@ impl TranslationTableLevel2_16k {
         &self,
         table_start_ipa: crate::GuestIpaAddress,
         va: crate::GuestVaAddress,
-    ) -> Option<u64> {
+    ) -> Option<GuestIpaAddress> {
         debug!(
             "simulate_lookup, table_start_ipa={:#x?}, va={:#x?}",
             table_start_ipa.0, va.0
@@ -190,7 +190,7 @@ impl TranslationTableLevel2_16k {
         }
 
         let ipa = l3.0 & ((1 << 48) - 1) & !((1 << 14) - 1);
-        Some(ipa + (va.0 & ((1 << 14) - 1)))
+        Some(GuestIpaAddress(ipa + (va.0 & ((1 << 14) - 1))))
     }
 
     // Get the offset from self's ptr into the L3 table for L2 table.

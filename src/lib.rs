@@ -112,10 +112,21 @@ impl TryFrom<bindgen::hv_return_t> for HVReturnT {
     }
 }
 
-pub struct HfVm {
+#[derive(Debug)]
+pub struct GuestMemoryManager {
     memory: Arc<GuestMemoryMmap>,
+}
+
+pub struct HfVmBuilder {
     entrypoint: Option<GuestVaAddress>,
     vbar_el1: Option<GuestVaAddress>,
+    memory_manager: GuestMemoryManager,
+}
+
+pub struct HfVm {
+    entrypoint: GuestVaAddress,
+    vbar_el1: GuestVaAddress,
+    memory_manager: Arc<GuestMemoryManager>,
 }
 
 #[derive(Default)]
@@ -181,58 +192,46 @@ fn assert_hv_return_t_ok(v: bindgen::hv_return_t, name: &str) -> anyhow::Result<
     }
 }
 
-impl HfVm {
+impl GuestMemoryManager {
     pub fn new() -> anyhow::Result<Self> {
-        assert_hv_return_t_ok(unsafe { bindgen::hv_vm_create(null_obj()) }, "hv_vm_create")?;
-        debug!(
-            "allocating guest memory, IPA start: {:x?}, size: {}",
-            DRAM_IPA_START.0, MEMORY_SIZE
+        let memory = Arc::new(
+            GuestMemoryMmap::from_ranges(&[(DRAM_IPA_START.as_guest_address(), MEMORY_SIZE)])
+                .context("error allocating guest memory")?,
         );
-        let mut vm = Self {
-            memory: Arc::new(
-                GuestMemoryMmap::from_ranges(&[(DRAM_IPA_START.as_guest_address(), MEMORY_SIZE)])
-                    .context("error allocating guest memory")?,
-            ),
-            entrypoint: None,
-            vbar_el1: None,
-        };
-        vm.hf_map_memory(
-            vm.memory
-                .get_host_address(DRAM_IPA_START.as_guest_address())
-                .context("error getting host address for guest memory start")?,
-            DRAM_IPA_START,
-            MEMORY_SIZE,
-            HvMemoryFlags::ALL,
-        )
-        .context("error mapping DRAM memory into the guest VM")?;
-
         let usable_memory_size = (MEMORY_SIZE as u64 - DRAM_KERNEL_USABLE_DRAM_OFFSET.0) as usize;
 
-        vm.initial_configure_page_tables_l2()
+        let mut mm = Self { memory };
+
+        mm.initial_configure_page_tables_l2()
             .context("error in initial page table configuration")?;
 
         // Configure page tables for *Usable* DRAM.
         // This is the RAM that the kernel is free to use for whatever purpose, e.g. allocating.
-        vm.configure_page_tables(
+        mm.configure_page_tables(
             DRAM_IPA_START.add(DRAM_KERNEL_USABLE_DRAM_OFFSET),
             DRAM_VA_START.add(DRAM_KERNEL_USABLE_DRAM_OFFSET),
             usable_memory_size,
             HvMemoryFlags::ALL,
         )
         .context("error configuring page tables for DRAM")?;
-        Ok(vm)
-    }
 
-    pub fn get_memory(&self) -> Arc<GuestMemoryMmap> {
-        self.memory.clone()
+        Ok(mm)
     }
-
     fn get_ttbr_0_dram_offset(&self) -> Offset {
         DRAM_TTBR_OFFSET
     }
 
     fn get_ttbr_1_dram_offset(&self) -> Offset {
         self.get_ttbr_0_dram_offset().add(Offset(TTBR_SIZE as u64))
+    }
+
+    unsafe fn get_memory_slice(&self, va: GuestVaAddress, size: usize) -> anyhow::Result<&[u8]> {
+        let ipa = self
+            .simulate_address_lookup(va)?
+            .ok_or_else(|| anyhow!("cannot find address {:#x?} in translation tables", va.0))?;
+        let vslice = self.memory.get_slice(ipa.as_guest_address(), size)?;
+        let ptr = vslice.as_ptr();
+        Ok(core::slice::from_raw_parts(ptr, size))
     }
 
     fn initial_configure_page_tables_l2(&mut self) -> anyhow::Result<()> {
@@ -262,10 +261,10 @@ impl HfVm {
         Ok(())
     }
 
-    fn get_translation_table_for_va(
-        &mut self,
+    unsafe fn get_translation_table_for_va_ptr(
+        &self,
         va: GuestVaAddress,
-    ) -> anyhow::Result<(GuestIpaAddress, &mut page_table::TranslationTableLevel2_16k)> {
+    ) -> anyhow::Result<(GuestIpaAddress, *mut page_table::TranslationTableLevel2_16k)> {
         let top_bit_set = (va.0 >> 55) & 1 == 1;
 
         let table_start_dram_offset = if top_bit_set {
@@ -280,12 +279,33 @@ impl HfVm {
             .get_slice(table_ipa.as_guest_address(), TTBR_SIZE)
             .with_context(|| format!("error getting slice of memory at {:#x?}", table_ipa.0))?
             .as_ptr() as *mut page_table::TranslationTableLevel2_16k;
-
-        let table = unsafe { &mut *table_ptr as &mut page_table::TranslationTableLevel2_16k };
-        Ok((table_ipa, table))
+        Ok((table_ipa, table_ptr))
     }
 
-    pub fn simulate_address_lookup(&mut self, va: GuestVaAddress) -> anyhow::Result<Option<u64>> {
+    fn get_translation_table_for_va_mut(
+        &mut self,
+        va: GuestVaAddress,
+    ) -> anyhow::Result<(GuestIpaAddress, &mut page_table::TranslationTableLevel2_16k)> {
+        unsafe {
+            let (ipa, t) = self.get_translation_table_for_va_ptr(va)?;
+            Ok((ipa, &mut *t as _))
+        }
+    }
+
+    fn get_translation_table_for_va(
+        &self,
+        va: GuestVaAddress,
+    ) -> anyhow::Result<(GuestIpaAddress, &page_table::TranslationTableLevel2_16k)> {
+        unsafe {
+            let (ipa, t) = self.get_translation_table_for_va_ptr(va)?;
+            Ok((ipa, &*t as _))
+        }
+    }
+
+    pub fn simulate_address_lookup(
+        &self,
+        va: GuestVaAddress,
+    ) -> anyhow::Result<Option<GuestIpaAddress>> {
         let (ipa, table) = self.get_translation_table_for_va(va)?;
         Ok(table.simulate_lookup(ipa, va))
     }
@@ -297,12 +317,39 @@ impl HfVm {
         size: usize,
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
-        let (table_ipa, table) = self.get_translation_table_for_va(va)?;
+        let (table_ipa, table) = self.get_translation_table_for_va_mut(va)?;
 
         table
             .setup(table_ipa, va, ipa, size, flags)
             .context("error configuring the Level 2 translation table")?;
         Ok(())
+    }
+}
+
+impl HfVmBuilder {
+    pub fn new() -> anyhow::Result<Self> {
+        assert_hv_return_t_ok(unsafe { bindgen::hv_vm_create(null_obj()) }, "hv_vm_create")?;
+        debug!(
+            "allocating guest memory, IPA start: {:x?}, size: {}",
+            DRAM_IPA_START.0, MEMORY_SIZE
+        );
+        let memory_manager = GuestMemoryManager::new()?;
+        let mut vm = Self {
+            memory_manager,
+            entrypoint: None,
+            vbar_el1: None,
+        };
+        vm.hf_map_memory(
+            vm.memory_manager
+                .memory
+                .get_host_address(DRAM_IPA_START.as_guest_address())
+                .context("error getting host address for guest memory start")?,
+            DRAM_IPA_START,
+            MEMORY_SIZE,
+            HvMemoryFlags::ALL,
+        )
+        .context("error mapping DRAM memory into the guest VM")?;
+        Ok(vm)
     }
 
     fn hf_map_memory(
@@ -394,13 +441,15 @@ impl HfVm {
                         ipa.0,
                         guest_address.0,
                     );
-                    self.configure_page_tables(ipa, guest_address, size, flags)?;
+                    self.memory_manager
+                        .configure_page_tables(ipa, guest_address, size, flags)?;
 
                     let data = section.data().with_context(|| {
                         format!("error getting section data for section {}", section_name)
                     })?;
                     if !data.is_empty() {
                         let slice = self
+                            .memory_manager
                             .memory
                             .get_slice(ipa.as_guest_address(), section.size() as usize)
                             .with_context(|| {
@@ -422,43 +471,35 @@ impl HfVm {
         Ok(LoadedElf { entrypoint })
     }
 
+    pub fn build(self) -> anyhow::Result<HfVm> {
+        let entrypoint = self.entrypoint.ok_or_else(|| {
+            anyhow!("entrypoint not set, probably ELF not loaded, or loaded incorrectly")
+        })?;
+        let vbar_el1 = self.vbar_el1.ok_or_else(|| {
+            anyhow!("vbar_el1 not set, probably ELF not loaded, or loaded incorrectly")
+        })?;
+        Ok(HfVm {
+            entrypoint,
+            vbar_el1,
+            memory_manager: Arc::new(self.memory_manager),
+        })
+    }
+}
+
+impl HfVm {
     pub fn vcpu_create_and_run(
         &self,
         entrypoint: Option<GuestVaAddress>,
     ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
-        let memory = self.memory.clone();
-        let entrypoint = entrypoint
-            .or(self.entrypoint)
-            .ok_or_else(|| anyhow!("entrypoint not set"))?;
+        let memory_manager = self.memory_manager.clone();
+        let entrypoint = entrypoint.unwrap_or(self.entrypoint);
 
         let vbar_el1 = self.vbar_el1;
-        let ttbr0 = DRAM_IPA_START.add(self.get_ttbr_0_dram_offset());
-        let ttbr1 = DRAM_IPA_START.add(self.get_ttbr_1_dram_offset());
-
-        // {
-        //     info!(
-        //         "{:#x?}",
-        //         self.simulate_address_lookup(GuestAddress(0xfffffff000800200))
-        //             .unwrap()
-        //             .unwrap()
-        //     );
-
-        //     info!(
-        //         "{:#x?}",
-        //         self.simulate_address_lookup(GuestAddress(0x800200))
-        //             .unwrap()
-        //             .unwrap()
-        //     );
-
-        //     let slice = self.memory.get_slice(DRAM_VA_START, 32).unwrap();
-        //     let buf = &mut [0u8; 32];
-        //     assert_eq!(slice.copy_to(buf), 32);
-        //     hexdump::hexdump(buf);
-        //     panic!("fuck");
-        // }
+        let ttbr0 = DRAM_IPA_START.add(memory_manager.get_ttbr_0_dram_offset());
+        let ttbr1 = DRAM_IPA_START.add(memory_manager.get_ttbr_1_dram_offset());
 
         Ok(std::thread::spawn(move || {
-            let vcpu = VCpu::new(memory).unwrap();
+            let vcpu = VCpu::new(memory_manager).unwrap();
             let start_state = VcpuStartState {
                 guest_pc: entrypoint,
                 guest_vbar_el1: vbar_el1,
@@ -474,7 +515,7 @@ impl HfVm {
 #[derive(Debug)]
 pub struct VCpu {
     id: u64,
-    memory: Arc<GuestMemoryMmap>,
+    memory_manager: Arc<GuestMemoryManager>,
     exit_t: *mut bindgen::hv_vcpu_exit_t,
 }
 
@@ -525,7 +566,7 @@ impl From<&bindgen::hv_vcpu_exit_t> for HfVcpuExit {
 #[derive(Copy, Clone, Debug)]
 struct VcpuStartState {
     guest_pc: GuestVaAddress,
-    guest_vbar_el1: Option<GuestVaAddress>,
+    guest_vbar_el1: GuestVaAddress,
     ttbr0: GuestIpaAddress,
     ttbr1: GuestIpaAddress,
 }
@@ -652,10 +693,10 @@ struct StartParams {
 }
 
 impl VCpu {
-    fn new(memory: Arc<GuestMemoryMmap>) -> anyhow::Result<Self> {
+    fn new(memory_manager: Arc<GuestMemoryManager>) -> anyhow::Result<Self> {
         let mut vcpu = Self {
             id: 0,
-            memory,
+            memory_manager,
             exit_t: core::ptr::null_mut(),
         };
         assert_hv_return_t_ok(
@@ -803,16 +844,15 @@ impl VCpu {
             debug!("STACK AT {:#x} is empty", sp);
             return Ok(());
         }
-        let mut data = vec![0u8; len as usize];
         debug!("STACK AT {:#x}, length {}", sp, len);
 
-        let offset = sp - DRAM_VA_START.0;
+        let stack = unsafe {
+            self.memory_manager
+                .get_memory_slice(GuestVaAddress(sp), len as usize)
+                .with_context(|| anyhow!("error getting stack memory for stack at {:#x}", sp))?
+        };
 
-        self.memory.read_slice(
-            &mut data,
-            DRAM_IPA_START.add(Offset(offset)).as_guest_address(),
-        )?;
-        hexdump::hexdump(&data);
+        hexdump::hexdump(&stack);
         Ok(())
     }
 
@@ -942,6 +982,7 @@ impl VCpu {
             };
             let start_params_ipa = DRAM_IPA_START.add(start_params_dram_offset);
             let start_params_mem = self
+                .memory_manager
                 .memory
                 .get_slice(
                     start_params_ipa.as_guest_address(),
@@ -970,13 +1011,11 @@ impl VCpu {
         // self.enable_soft_debug()?;
         self.spawn_cancel_thread();
 
-        if let Some(vbar_el1) = start_state.guest_vbar_el1 {
-            self.set_sys_reg(
-                bindgen::hv_sys_reg_t_HV_SYS_REG_VBAR_EL1,
-                vbar_el1.0,
-                "VBAR_EL1",
-            )?;
-        }
+        self.set_sys_reg(
+            bindgen::hv_sys_reg_t_HV_SYS_REG_VBAR_EL1,
+            start_state.guest_vbar_el1.0,
+            "VBAR_EL1",
+        )?;
 
         loop {
             assert_hv_return_t_ok(unsafe { bindgen::hv_vcpu_run(self.id) }, "hv_vcpu_run")?;
@@ -1040,17 +1079,21 @@ impl VCpu {
                         PRINT_STRING => {
                             let addr = self.get_reg(bindgen::hv_reg_t_HV_REG_X0)?;
                             let len = self.get_reg(bindgen::hv_reg_t_HV_REG_X1)?;
-                            let slice = self
-                                .memory
-                                .get_slice(GuestAddress(addr), len as usize)
-                                .with_context(|| {
-                                    format!("error getting guest memory, address {:#x?}", addr)
-                                })
-                                .context("error processing PRINT_STRING hvc event")?;
+
                             let slice = unsafe {
-                                core::slice::from_raw_parts(slice.as_ptr(), len as usize)
-                            };
-                            print!("{}", core::str::from_utf8(slice)?);
+                                self.memory_manager
+                                    .get_memory_slice(GuestVaAddress(addr), len as usize)
+                            }
+                            .with_context(|| {
+                                format!("error getting guest memory, address {:#x?}", addr)
+                            })
+                            .context("error processing PRINT_STRING hvc event")?;
+                            print!(
+                                "{}",
+                                core::str::from_utf8(slice).context(
+                                    "error converting string from PRINT_STRING event to UTF-8"
+                                )?
+                            );
                         }
                         other => {
                             panic!("unsupported HVC value {:x}", other);
