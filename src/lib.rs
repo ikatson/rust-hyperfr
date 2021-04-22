@@ -104,7 +104,7 @@ pub struct LoadedElf {
 pub const VA_PAGE: u64 = 1 << 14;
 
 pub const DRAM_IPA_START: u64 = 0x80_0000;
-pub const VA_START: GuestAddress = GuestAddress(0);
+pub const VA_START: GuestAddress = GuestAddress(0xffff_fff0_0000_0000);
 pub const VA_START_OFFSET_DRAM: u64 = DRAM_IPA_START;
 pub const DRAM_VA_START: GuestAddress = GuestAddress(VA_START.0 + VA_START_OFFSET_DRAM);
 
