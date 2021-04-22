@@ -7,14 +7,11 @@ use std::{
     path::Path,
     thread::JoinHandle,
 };
-use vm_memory::{
-    Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, GuestMemoryRegion, GuestRegionMmap,
-    MemoryRegionAddress, MmapRegion,
-};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use log::{debug, error, info};
 
-mod page_table;
+pub mod page_table;
 
 pub fn get_page_size() -> u64 {
     unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) as u64 }
@@ -237,7 +234,7 @@ impl HfVm {
         Ok(())
     }
 
-    fn simulate_address_lookup(&self, va: GuestAddress) -> anyhow::Result<Option<u64>> {
+    pub fn simulate_address_lookup(&self, va: GuestAddress) -> anyhow::Result<Option<u64>> {
         let top_bit_set = (va.0 >> 55) & 1 == 1;
 
         let table_start_dram_offset = if top_bit_set {
@@ -809,11 +806,11 @@ impl VCpu {
             {
                 let mut tcr_el1 = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_TCR_EL1)?;
 
-                const EPD0: u64 = 1 << 7;
-                const NFD0: u64 = 1 << 53;
-                const SH0_OUTER_SHAREABLE: u64 = 0b10 << 12;
-                const ORGN0: u64 = 0b11 << 10;
-                const IRGN0: u64 = 0b10 << 8;
+                // const EPD0: u64 = 1 << 7;
+                // const NFD0: u64 = 1 << 53;
+                // const SH0_OUTER_SHAREABLE: u64 = 0b10 << 12;
+                // const ORGN0: u64 = 0b11 << 10;
+                // const IRGN0: u64 = 0b10 << 8;
 
                 tcr_el1 |= TCR_EL1_TG0_GRANULE
                     | TCR_EL1_TG1_GRANULE

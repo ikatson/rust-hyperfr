@@ -209,7 +209,7 @@ impl TranslationTableLevel2_16k {
             l2desc.0 |= table_start_ipa + t3offset;
 
             println!(
-                "table_start_ipa=={:#x?}, l2={}, l3addr={:#x?}",
+                "table_start_ipa={:#x?}, l2={}, l3addr={:#x?}",
                 table_start_ipa,
                 l2,
                 table_start_ipa + t3offset
@@ -278,6 +278,13 @@ impl TranslationTableLevel2_16k {
             let l2_idx = (va.0 >> (14 + 11)) & ((1 << 11) - 1);
             let l3_idx = (va.0 >> 14) & ((1 << 11) - 1);
             let l3_desc = &mut self.level_3_tables[l2_idx as usize].descriptors[l3_idx as usize];
+
+            if l3_desc.0 & 0b11 > 0 {
+                panic!(
+                    "page l2={},l3={} was already configured previously",
+                    l2_idx, l3_idx
+                );
+            }
 
             let mut v: u64 = 0b11;
             v |= 1 << 10; // AF=1
