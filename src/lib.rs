@@ -7,9 +7,9 @@ use std::{
     path::Path,
     thread::JoinHandle,
 };
-use vm_memory::{Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
+use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
 
-use log::{debug, error, info};
+use log::{debug, error, info, trace};
 
 #[derive(Copy, Clone, Debug)]
 pub struct GuestIpaAddress(u64);
@@ -198,22 +198,26 @@ impl GuestMemoryManager {
             GuestMemoryMmap::from_ranges(&[(DRAM_IPA_START.as_guest_address(), MEMORY_SIZE)])
                 .context("error allocating guest memory")?,
         );
-        let usable_memory_size = (MEMORY_SIZE as u64 - DRAM_KERNEL_USABLE_DRAM_OFFSET.0) as usize;
 
         let mut mm = Self { memory };
 
         mm.initial_configure_page_tables_l2()
             .context("error in initial page table configuration")?;
 
-        // Configure page tables for *Usable* DRAM.
-        // This is the RAM that the kernel is free to use for whatever purpose, e.g. allocating.
-        mm.configure_page_tables(
-            DRAM_IPA_START.add(DRAM_KERNEL_USABLE_DRAM_OFFSET),
-            DRAM_VA_START.add(DRAM_KERNEL_USABLE_DRAM_OFFSET),
-            usable_memory_size,
-            HvMemoryFlags::ALL,
-        )
-        .context("error configuring page tables for DRAM")?;
+        {
+            let ipa = DRAM_IPA_START.add(DRAM_KERNEL_USABLE_DRAM_OFFSET);
+            let va = DRAM_VA_START.add(DRAM_KERNEL_USABLE_DRAM_OFFSET);
+            let usable_memory_size =
+                (MEMORY_SIZE as u64 - DRAM_KERNEL_USABLE_DRAM_OFFSET.0) as usize;
+            // This is the RAM that the kernel is free to use for whatever purpose, e.g. allocating.
+            debug!(
+                "configuring translation tables for DRAM, ipa {:#x?}, va {:#x?}, usable memory size {}",
+                ipa.0, va.0, usable_memory_size,
+            );
+
+            mm.configure_page_tables(ipa, va, usable_memory_size, HvMemoryFlags::ALL)
+                .context("error configuring page tables for DRAM")?;
+        }
 
         Ok(mm)
     }
@@ -400,26 +404,6 @@ impl HfVmBuilder {
                 )
             })?;
 
-            let start = align_down_to_page_size(section.address());
-            let end = align_up_to_page_size(section.address() + section.size());
-            let size = (end - start) as usize;
-            let first_page = match first_page {
-                Some(addr) => addr,
-                None => {
-                    first_page = Some(start);
-                    start
-                }
-            };
-            // TODO: this assumes the ELF is compiled accordingly and is safe to load
-            // at the specified addresses.
-            let ipa = DRAM_IPA_START.add(Offset(start - first_page));
-            let guest_address = GuestVaAddress(start);
-
-            // TODO: assumes the exception table is the first piece.
-            if let Text = section.kind() {
-                self.vbar_el1 = Some(GuestVaAddress(section.address()));
-            }
-
             match section.kind() {
                 Text | Data | ReadOnlyData | UninitializedData => {
                     let flags = match section.kind() {
@@ -431,6 +415,25 @@ impl HfVmBuilder {
                         }
                         _ => unreachable!(),
                     };
+
+                    let start = align_down_to_page_size(section.address());
+                    let end = align_up_to_page_size(section.address() + section.size());
+                    let size = (end - start) as usize;
+                    let first_page = match first_page {
+                        Some(addr) => addr,
+                        None => {
+                            first_page = Some(start);
+                            start
+                        }
+                    };
+
+                    let ipa = DRAM_IPA_START.add(Offset(start - first_page));
+                    let guest_address = GuestVaAddress(start);
+
+                    // TODO: assumes the exception table is the first piece.
+                    if let Text = section.kind() {
+                        self.vbar_el1 = Some(GuestVaAddress(section.address()));
+                    }
 
                     debug!(
                         "configuring translation tables for section {}, section size {}, translated size {}, binary section address {:#x?}, IPA {:#x?}, guest address {:#x?}",
@@ -1003,13 +1006,13 @@ impl VCpu {
             };
             self.set_reg(
                 bindgen::hv_reg_t_HV_REG_X0,
-                DRAM_IPA_START.add(start_params_dram_offset).0,
+                DRAM_VA_START.add(start_params_dram_offset).0,
                 "X0",
             )?;
         }
 
         // self.enable_soft_debug()?;
-        self.spawn_cancel_thread();
+        // self.spawn_cancel_thread();
 
         self.set_sys_reg(
             bindgen::hv_sys_reg_t_HV_SYS_REG_VBAR_EL1,
@@ -1029,7 +1032,8 @@ impl VCpu {
             assert_eq!(exit_t.reason, HvExitReason::HV_EXIT_REASON_EXCEPTION);
             match exit_t.decoded_syndrome.exception_class {
                 // HVC
-                0b010110 => {
+                EXC_HVC => {
+                    trace!("received HVC event");
                     let iss = exit_t.decoded_syndrome.iss as u16;
                     const NOOP: u8 = 0;
                     const HALT: u8 = 1;
@@ -1061,9 +1065,26 @@ impl VCpu {
                             );
 
                             match el1_syndrome.exception_class {
-                                0b100100 | 0b100101 => {
+                                EXC_DATA_ABORT_LOWER | EXC_DATA_ABORT_SAME => {
                                     self.debug_data_abort(el1_syndrome.iss)?;
                                     name = "data abort";
+                                }
+                                EXC_SOFT_DEBUG_SAME => {
+                                    info!(
+                                        "Debug exception, address {:#x?}, continuing",
+                                        self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ELR_EL1)?
+                                    );
+                                    println!(
+                                        "X0: {:#x?}, x20: {:#x?}, SPSR_EL1.SPP: {}",
+                                        self.get_reg(bindgen::hv_reg_t_HV_REG_X0)?,
+                                        self.get_reg(bindgen::hv_reg_t_HV_REG_X20)?,
+                                        self.get_sys_reg(
+                                            bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
+                                        )? >> 21
+                                            & 1,
+                                    );
+
+                                    continue;
                                 }
                                 _ => {
                                     error!(
@@ -1074,7 +1095,7 @@ impl VCpu {
                             }
                             self.dump_all_registers()?;
                             self.print_stack()?;
-                            panic!("EL1 -> EL1 exception: {}", name);
+                            panic!("HVC EL1 -> EL1 exception: {}", name);
                         }
                         PRINT_STRING => {
                             let addr = self.get_reg(bindgen::hv_reg_t_HV_REG_X0)?;
@@ -1088,12 +1109,10 @@ impl VCpu {
                                 format!("error getting guest memory, address {:#x?}", addr)
                             })
                             .context("error processing PRINT_STRING hvc event")?;
-                            print!(
-                                "{}",
-                                core::str::from_utf8(slice).context(
-                                    "error converting string from PRINT_STRING event to UTF-8"
-                                )?
-                            );
+                            let value = core::str::from_utf8(slice).context(
+                                "error converting string from PRINT_STRING event to UTF-8",
+                            )?;
+                            print!("{}", value);
                         }
                         other => {
                             panic!("unsupported HVC value {:x}", other);
@@ -1101,14 +1120,14 @@ impl VCpu {
                     }
                 }
                 // some memory failure
-                0b100000 => {
-                    error!("memory failure");
+                EXC_MMU_LOWER | EXC_MMU_SAME => {
+                    error!("instruction abort");
                     self.dump_all_registers()?;
                     self.print_stack()?;
                     error!("{:#x?}", self.exit_t());
-                    panic!("memory failure");
+                    panic!("instruction abort");
                 }
-                0b100100 => {
+                EXC_DATA_ABORT_SAME | EXC_DATA_ABORT_LOWER => {
                     self.debug_data_abort(self.exit_t().decoded_syndrome.iss)?;
                     panic!("data abort EL1 -> EL2");
                 }
@@ -1143,7 +1162,7 @@ impl VCpu {
         });
     }
 
-    fn enable_soft_debug(mut self) -> anyhow::Result<()> {
+    fn enable_soft_debug(&mut self) -> anyhow::Result<()> {
         // Soft debug
         const KDE: u64 = 1 << 13;
         const SOFTWARE_STEP_ENABLE: u64 = 1;
@@ -1170,6 +1189,7 @@ const EXC_MMU_LOWER: u8 = 0b100000;
 const EXC_MMU_SAME: u8 = 0b100001;
 const EXC_DATA_ABORT_LOWER: u8 = 0b100100;
 const EXC_DATA_ABORT_SAME: u8 = 0b100101;
+const EXC_SOFT_DEBUG_SAME: u8 = 0b110011;
 
 struct InstructionAbortFlags(u32);
 impl core::fmt::Debug for InstructionAbortFlags {
@@ -1222,6 +1242,9 @@ impl Syndrome {
             EXC_MMU_SAME => "Instruction abort (MMU) fault from same EL",
             EXC_DATA_ABORT_LOWER => "Data abort from a lower exception level",
             EXC_DATA_ABORT_SAME => "Data abort from the same exception level",
+            EXC_SOFT_DEBUG_SAME => {
+                "Software Step exception taken without a change in Exception level"
+            }
             _ => "unknown",
         }
     }

@@ -170,9 +170,10 @@ impl TranslationTableLevel2_16k {
         table_start_ipa: crate::GuestIpaAddress,
         va: crate::GuestVaAddress,
     ) -> Option<GuestIpaAddress> {
-        debug!(
+        trace!(
             "simulate_lookup, table_start_ipa={:#x?}, va={:#x?}",
-            table_start_ipa.0, va.0
+            table_start_ipa.0,
+            va.0
         );
         let l2_idx = ((va.0 >> 25) & ((1 << 11) - 1)) as usize;
         let l2 = &self.descriptors[l2_idx];
