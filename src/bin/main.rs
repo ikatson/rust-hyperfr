@@ -14,7 +14,9 @@ fn main_result() -> anyhow::Result<()> {
     let join = vm
         .vcpu_create_and_run(None)
         .context("error creating and running vcpu")?;
-    join.join().unwrap()?;
+    join.join()
+        .unwrap()
+        .context("errror in the thread running vcpu")?;
     Ok(())
 }
 

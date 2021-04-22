@@ -366,11 +366,11 @@ impl HfVm {
             // TODO: this assumes the ELF is compiled accordingly and is safe to load
             // at the specified addresses.
             let ipa = DRAM_IPA_START.add(Offset(start - first_page));
-            let guest_address = DRAM_VA_START.add(Offset(start - first_page));
+            let guest_address = GuestVaAddress(start);
 
             // TODO: assumes the exception table is the first piece.
             if let Text = section.kind() {
-                self.vbar_el1 = Some(GuestVaAddress(section.address() - first_page))
+                self.vbar_el1 = Some(GuestVaAddress(section.address()));
             }
 
             match section.kind() {
@@ -416,9 +416,7 @@ impl HfVm {
             }
         }
 
-        let entrypoint = DRAM_VA_START.add(Offset(
-            obj.entry() - first_page.ok_or_else(|| anyhow!("no sections in the binary"))?,
-        ));
+        let entrypoint = GuestVaAddress(obj.entry());
         debug!("entrypoint is {:#x?}", entrypoint.0);
         self.entrypoint = Some(entrypoint);
         Ok(LoadedElf { entrypoint })
@@ -468,6 +466,7 @@ impl HfVm {
                 ttbr1,
             };
             vcpu.simple_run_loop(start_state)
+                .context("error calling simple_run_loop()")
         }))
     }
 }
@@ -941,12 +940,19 @@ impl VCpu {
                 dram_usable_start: DRAM_VA_START.add(start_params_end_offset),
                 dram_size: MEMORY_SIZE as u64,
             };
-            let start_params_mem = self.memory.get_slice(
-                DRAM_IPA_START
-                    .add(start_params_dram_offset)
-                    .as_guest_address(),
-                core::mem::size_of::<StartParams>(),
-            )?;
+            let start_params_ipa = DRAM_IPA_START.add(start_params_dram_offset);
+            let start_params_mem = self
+                .memory
+                .get_slice(
+                    start_params_ipa.as_guest_address(),
+                    core::mem::size_of::<StartParams>(),
+                )
+                .with_context(|| {
+                    format!(
+                        "error getting start_params memory at {:#x?}",
+                        start_params_ipa.0
+                    )
+                })?;
             unsafe {
                 core::ptr::copy(
                     &start_params,
@@ -1034,7 +1040,13 @@ impl VCpu {
                         PRINT_STRING => {
                             let addr = self.get_reg(bindgen::hv_reg_t_HV_REG_X0)?;
                             let len = self.get_reg(bindgen::hv_reg_t_HV_REG_X1)?;
-                            let slice = self.memory.get_slice(GuestAddress(addr), len as usize)?;
+                            let slice = self
+                                .memory
+                                .get_slice(GuestAddress(addr), len as usize)
+                                .with_context(|| {
+                                    format!("error getting guest memory, address {:#x?}", addr)
+                                })
+                                .context("error processing PRINT_STRING hvc event")?;
                             let slice = unsafe {
                                 core::slice::from_raw_parts(slice.as_ptr(), len as usize)
                             };
