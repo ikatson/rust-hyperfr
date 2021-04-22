@@ -166,9 +166,33 @@ impl TranslationTableLevel2_16k {
     fn is_aligned(value: u64) -> bool {
         value & ((1 << 14) - 1) == 0
     }
-    fn get_t3_offset(&self, n: usize) -> u64 {
-        let base = core::mem::size_of_val(&self.descriptors);
-        (base + (n * 2048 * 8)) as u64
+
+    pub fn simulate_lookup(&self, table_start_ipa: u64, va: GuestAddress) -> Option<u64> {
+        debug!(
+            "simulate_lookup, table_start_ipa={:#x?}, va={:#x?}",
+            table_start_ipa, va.0
+        );
+        let l2_idx = ((va.0 >> 25) & ((1 << 11) - 1)) as usize;
+        let l2 = &self.descriptors[l2_idx];
+        if l2.0 & 0b11 != 0b11 {
+            return None;
+        }
+        let l3_ipa = l2.0 & ((1 << 48) - 1) & !((1 << 14) - 1);
+        assert_eq!(l3_ipa, table_start_ipa + self.get_t3_offset(l2_idx));
+
+        let l3_idx = ((va.0 >> 14) & ((1 << 11) - 1)) as usize;
+        let l3 = &self.level_3_tables[l2_idx as usize].descriptors[l3_idx as usize];
+
+        let ipa = l3.0 & ((1 << 48) - 1) & !((1 << 14) - 1);
+        Some(ipa + (va.0 & ((1 << 14) - 1)))
+    }
+
+    // Get the offset from self's ptr into the L3 table for L2 table.
+    fn get_t3_offset(&self, l2_idx: usize) -> u64 {
+        let base = self as *const _ as u64;
+        let l3_base = &self.level_3_tables as *const TranslationTableLevel3_16k;
+        let l3 = unsafe { l3_base.add(l2_idx) };
+        l3 as u64 - base
     }
 
     pub fn setup_l2(&mut self, table_start_ipa: u64) -> anyhow::Result<()> {
@@ -183,6 +207,13 @@ impl TranslationTableLevel2_16k {
             let l2desc = &mut self.descriptors[l2 as usize];
             l2desc.0 |= 0b11;
             l2desc.0 |= table_start_ipa + t3offset;
+
+            println!(
+                "table_start_ipa=={:#x?}, l2={}, l3addr={:#x?}",
+                table_start_ipa,
+                l2,
+                table_start_ipa + t3offset
+            )
         }
 
         Ok(())

@@ -104,26 +104,26 @@ pub struct LoadedElf {
 // At that address we load the kernel itself, including exception vector table.
 // VA_START + 1GB = DRAM
 
-pub const VA_PAGE: u64 = 2 << 14;
+pub const VA_PAGE: u64 = 1 << 14;
 
 pub const DRAM_IPA_START: u64 = 0x80_0000;
 pub const VA_START: GuestAddress = GuestAddress(0xffff_fff0_0000_0000);
 pub const VA_START_OFFSET_DRAM: u64 = DRAM_IPA_START;
 pub const DRAM_VA_START: GuestAddress = GuestAddress(VA_START.0 + VA_START_OFFSET_DRAM);
 
-pub const KERNEL_BINARY_MEMORY_MAX_SIZE: u64 = 128 * 1024 * 1024; // 128 Mib
+pub const KERNEL_BINARY_MEMORY_MAX_SIZE: u64 = 8 * 1024 * 1024; // 8 Mib
 
 pub const DRAM_KERNEL_BINARY_OFFSET: u64 = 0;
 
 pub const DRAM_TTBR_OFFSET: u64 =
     DRAM_KERNEL_BINARY_OFFSET + KERNEL_BINARY_MEMORY_MAX_SIZE + VA_PAGE;
-pub const TTBR_SIZE: usize = core::mem::size_of::<page_table::TranslationTableLevel2_16k>() * 2;
+pub const TTBR_SIZE: usize = core::mem::size_of::<page_table::TranslationTableLevel2_16k>();
 
-pub const DRAM_KERNEL_USABLE_DRAM_OFFSET: u64 = DRAM_TTBR_OFFSET + TTBR_SIZE as u64 + VA_PAGE;
+pub const DRAM_KERNEL_USABLE_DRAM_OFFSET: u64 = DRAM_TTBR_OFFSET + (TTBR_SIZE * 2) as u64 + VA_PAGE;
 
 // this could be configurable, it's just that we don't care yet.
-// This is 4 GB.
-pub const MEMORY_SIZE: usize = 4 * 1024 * 1024 * 1024;
+// This is 32 MiB, we just don't need more.
+pub const MEMORY_SIZE: usize = 256 * 1024 * 1024;
 
 pub const STACK_SIZE: u64 = 1024 * 1024;
 pub const STACK_END: GuestAddress =
@@ -221,8 +221,8 @@ impl HfVm {
                     .get_slice(page_table_guest_addr, TTBR_SIZE)
                     .with_context(|| {
                         format!(
-                            "error getting slice of memory at {:#x?}",
-                            page_table_guest_addr.0
+                            "error getting slice of memory at {:#x?}, size {}",
+                            page_table_guest_addr.0, TTBR_SIZE
                         )
                     })?
                     .as_ptr() as *mut page_table::TranslationTableLevel2_16k;
@@ -237,6 +237,31 @@ impl HfVm {
         Ok(())
     }
 
+    fn simulate_address_lookup(&self, va: GuestAddress) -> anyhow::Result<Option<u64>> {
+        let top_bit_set = (va.0 >> 55) & 1 == 1;
+
+        let table_start_dram_offset = if top_bit_set {
+            self.get_ttbr_1_dram_offset()
+        } else {
+            self.get_ttbr_0_dram_offset()
+        };
+
+        let page_table_guest_addr = DRAM_VA_START.checked_add(table_start_dram_offset).unwrap();
+        let page_table_ptr = self
+            .memory
+            .get_slice(page_table_guest_addr, TTBR_SIZE)
+            .with_context(|| {
+                format!(
+                    "error getting slice of memory at {:#x?}",
+                    page_table_guest_addr.0
+                )
+            })?
+            .as_ptr() as *mut page_table::TranslationTableLevel2_16k;
+
+        let table = unsafe { &*page_table_ptr as &page_table::TranslationTableLevel2_16k };
+        Ok(table.simulate_lookup(DRAM_IPA_START + table_start_dram_offset, va))
+    }
+
     fn configure_page_tables(
         &mut self,
         ipa: u64,
@@ -244,7 +269,7 @@ impl HfVm {
         size: usize,
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
-        let top_bit_set = (va.0 >> 55) == 1;
+        let top_bit_set = (va.0 >> 55) & 1 == 1;
 
         let table_start_dram_offset = if top_bit_set {
             self.get_ttbr_1_dram_offset()
@@ -393,6 +418,14 @@ impl HfVm {
         let vbar_el1 = self.vbar_el1;
         let ttbr0 = GuestAddress(DRAM_IPA_START + self.get_ttbr_0_dram_offset());
         let ttbr1 = GuestAddress(DRAM_IPA_START + self.get_ttbr_1_dram_offset());
+
+        // panic!(
+        //     "{:#x?}",
+        //     self.simulate_address_lookup(GuestAddress(0xfffffff000800200))
+        //         .unwrap()
+        //         .unwrap()
+        // );
+
         Ok(std::thread::spawn(move || {
             let vcpu = VCpu::new(memory).unwrap();
             let start_state = VcpuStartState {
