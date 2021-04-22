@@ -338,7 +338,7 @@ impl HfVmBuilder {
             DRAM_IPA_START.0, MEMORY_SIZE
         );
         let memory_manager = GuestMemoryManager::new()?;
-        let mut vm = Self {
+        let vm = Self {
             memory_manager,
             entrypoint: None,
             vbar_el1: None,
@@ -520,6 +520,7 @@ pub struct VCpu {
     id: u64,
     memory_manager: Arc<GuestMemoryManager>,
     exit_t: *mut bindgen::hv_vcpu_exit_t,
+    next_breakpoint: u16,
 }
 
 #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
@@ -701,6 +702,7 @@ impl VCpu {
             id: 0,
             memory_manager,
             exit_t: core::ptr::null_mut(),
+            next_breakpoint: 0,
         };
         assert_hv_return_t_ok(
             unsafe { bindgen::hv_vcpu_create(&mut vcpu.id, &mut vcpu.exit_t, null_obj()) },
@@ -718,11 +720,11 @@ impl VCpu {
             "hv_vcpu_set_reg",
         )
     }
-    fn set_sys_reg(
+    fn set_sys_reg<N: core::fmt::Display>(
         &mut self,
         reg: bindgen::hv_sys_reg_t,
         value: u64,
-        name: &str,
+        name: N,
     ) -> anyhow::Result<()> {
         debug!("setting system register {} to {:#x}", name, value);
         assert_hv_return_t_ok(
@@ -734,6 +736,15 @@ impl VCpu {
         let mut value = 0u64;
         assert_hv_return_t_ok(
             unsafe { bindgen::hv_vcpu_get_reg(self.id, reg, &mut value) },
+            "hv_vcpu_get_reg",
+        )?;
+        Ok(value)
+    }
+
+    fn get_feature_reg(&mut self, reg: bindgen::hv_feature_reg_t) -> anyhow::Result<u64> {
+        let mut value = 0u64;
+        assert_hv_return_t_ok(
+            unsafe { bindgen::hv_vcpu_config_get_feature_reg(null_obj(), reg, &mut value) },
             "hv_vcpu_get_reg",
         )?;
         Ok(value)
@@ -765,6 +776,16 @@ impl VCpu {
                     "{}: {:#x}",
                     &stringify!($reg)[24..],
                     self.get_sys_reg(bindgen::$reg)?
+                );
+            };
+        }
+
+        macro_rules! dump_feature_reg {
+            ($reg:ident) => {
+                debug!(
+                    "{}: {:#x}",
+                    &stringify!($reg)[32..],
+                    self.get_feature_reg(bindgen::$reg)?
                 );
             };
         }
@@ -831,6 +852,11 @@ impl VCpu {
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_CPACR_EL1);
 
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_ESR_EL1);
+
+        dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1);
+        dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_SPSR_EL1);
+
+        dump_feature_reg!(hv_feature_reg_t_HV_FEATURE_REG_CTR_EL0);
 
         debug!(
             "ESR EL1 decoded: {:#x?}",
@@ -1011,6 +1037,11 @@ impl VCpu {
             )?;
         }
 
+        // Uncomment to be able to "step" through the code.
+        // The code for it is not implemented yet, and if just ran like this, it loops forever on LDXR/STXR pairs,
+        // so those instructions can't be debugged.
+        // However with some manual tinkering you can
+        //
         // self.enable_soft_debug()?;
         // self.spawn_cancel_thread();
 
@@ -1019,6 +1050,12 @@ impl VCpu {
             start_state.guest_vbar_el1.0,
             "VBAR_EL1",
         )?;
+
+        // These breakpoints don't work :(
+        self.add_breakpoint(GuestVaAddress(0x49e4))?;
+        self.add_breakpoint(GuestVaAddress(0x7ce8))?;
+
+        // self.dump_all_registers()?;
 
         loop {
             assert_hv_return_t_ok(unsafe { bindgen::hv_vcpu_run(self.id) }, "hv_vcpu_run")?;
@@ -1048,10 +1085,11 @@ impl VCpu {
                         }
                         HALT => {
                             info!("halt received");
+                            self.dump_all_registers()?;
                             return Ok(());
                         }
                         PANIC => {
-                            panic!("panic in the guest")
+                            bail!("guest panicked");
                         }
                         EXCEPTION | SYNCHRONOUS_EXCEPTION | IRQ => {
                             let mut name = match iss as u8 {
@@ -1070,19 +1108,17 @@ impl VCpu {
                                     name = "data abort";
                                 }
                                 EXC_SOFT_DEBUG_SAME => {
-                                    info!(
-                                        "Debug exception, address {:#x?}, continuing",
-                                        self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ELR_EL1)?
-                                    );
-                                    println!(
-                                        "X0: {:#x?}, x20: {:#x?}, SPSR_EL1.SPP: {}",
-                                        self.get_reg(bindgen::hv_reg_t_HV_REG_X0)?,
-                                        self.get_reg(bindgen::hv_reg_t_HV_REG_X20)?,
-                                        self.get_sys_reg(
-                                            bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
-                                        )? >> 21
-                                            & 1,
-                                    );
+                                    let elr_el1 =
+                                        self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ELR_EL1)?;
+                                    trace!("Debug exception, address {:#x?}, continuing", elr_el1,);
+                                    let spsr_el1 = self
+                                        .get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1)?;
+                                    // Set pstate.SS to 1, so that it actually executes the next instruction.
+                                    self.set_sys_reg(
+                                        bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
+                                        spsr_el1 | (1 << 21),
+                                        "SPSR_EL1",
+                                    )?;
 
                                     continue;
                                 }
@@ -1095,7 +1131,7 @@ impl VCpu {
                             }
                             self.dump_all_registers()?;
                             self.print_stack()?;
-                            panic!("HVC EL1 -> EL1 exception: {}", name);
+                            bail!("HVC EL1 -> EL1 exception: {}", name);
                         }
                         PRINT_STRING => {
                             let addr = self.get_reg(bindgen::hv_reg_t_HV_REG_X0)?;
@@ -1115,7 +1151,7 @@ impl VCpu {
                             print!("{}", value);
                         }
                         other => {
-                            panic!("unsupported HVC value {:x}", other);
+                            bail!("unsupported HVC value {:x}", other);
                         }
                     }
                 }
@@ -1125,14 +1161,14 @@ impl VCpu {
                     self.dump_all_registers()?;
                     self.print_stack()?;
                     error!("{:#x?}", self.exit_t());
-                    panic!("instruction abort");
+                    bail!("instruction abort");
                 }
                 EXC_DATA_ABORT_SAME | EXC_DATA_ABORT_LOWER => {
                     self.debug_data_abort(self.exit_t().decoded_syndrome.iss)?;
-                    panic!("data abort EL1 -> EL2");
+                    bail!("data abort EL1 -> EL2");
                 }
                 other => {
-                    error!("unsupported exception class {:b}", other)
+                    bail!("unsupported exception class {:b}", other)
                 }
             }
 
@@ -1150,6 +1186,7 @@ impl VCpu {
         }
     }
 
+    #[allow(dead_code)]
     fn spawn_cancel_thread(&mut self) {
         let mut id = self.id;
         std::thread::spawn(move || {
@@ -1162,6 +1199,105 @@ impl VCpu {
         });
     }
 
+    #[allow(dead_code)]
+    fn add_breakpoint(&mut self, addr: GuestVaAddress) -> anyhow::Result<()> {
+        let reg = self.next_breakpoint;
+        let (ctrl_reg, value_reg) = match reg {
+            0 => (
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR0_EL1,
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR0_EL1,
+            ),
+            1 => (
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR1_EL1,
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR1_EL1,
+            ),
+            2 => (
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR2_EL1,
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR2_EL1,
+            ),
+            3 => (
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR3_EL1,
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR3_EL1,
+            ),
+            4 => (
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR4_EL1,
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR4_EL1,
+            ),
+            5 => (
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR5_EL1,
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR5_EL1,
+            ),
+            6 => (
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR6_EL1,
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR6_EL1,
+            ),
+            7 => (
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR7_EL1,
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR7_EL1,
+            ),
+            8 => (
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR8_EL1,
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR8_EL1,
+            ),
+            9 => (
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR9_EL1,
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR9_EL1,
+            ),
+            10 => (
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR10_EL1,
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR10_EL1,
+            ),
+            11 => (
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR11_EL1,
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR11_EL1,
+            ),
+            12 => (
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR12_EL1,
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR12_EL1,
+            ),
+            13 => (
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR13_EL1,
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR13_EL1,
+            ),
+            14 => (
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR14_EL1,
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR14_EL1,
+            ),
+            15 => (
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR15_EL1,
+                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR15_EL1,
+            ),
+            _ => bail!("no more hardware breakpoints available"),
+        };
+
+        let mut ctrl_reg_value: u64 = 0b0000 << 20; // breakpoint type 0 - unlinked address match.
+
+        // ctrl_reg_value |= 0b1111 << 5; // BAS - for A64 instructions.
+
+        ctrl_reg_value |= 0b11 << 1; // PMC - to enable EL1 breakpoints.
+
+        // ctrl_reg_value |= 0b01 << 14; // SSC
+        ctrl_reg_value |= 1; // enable
+
+        self.set_sys_reg(ctrl_reg, ctrl_reg_value, format_args!("DBGBCR{}_EL1", reg))?;
+        self.set_sys_reg(value_reg, addr.0, format_args!("DBGBVR{}_EL1", reg))?;
+
+        // If this is the first breakpoint used, setup the control register.
+        if reg == 0 {
+            let mut mdscr = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1)?;
+            mdscr |= 1 << 15; // MDE bit
+            mdscr |= 1 << 13; // KDE bit
+            self.set_sys_reg(
+                bindgen::hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1,
+                mdscr,
+                "MDSCR_EL1",
+            )?;
+        }
+        self.next_breakpoint += 1;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     fn enable_soft_debug(&mut self) -> anyhow::Result<()> {
         // Soft debug
         const KDE: u64 = 1 << 13;

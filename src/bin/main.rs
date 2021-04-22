@@ -1,5 +1,7 @@
 use anyhow::Context;
 
+use log::error;
+
 fn main_result() -> anyhow::Result<()> {
     pretty_env_logger::init();
 
@@ -17,10 +19,16 @@ fn main_result() -> anyhow::Result<()> {
         .context("error creating and running vcpu")?;
     join.join()
         .unwrap()
-        .context("errror in the thread running vcpu")?;
+        .context("error in the thread running vcpu")?;
     Ok(())
 }
 
 fn main() {
-    main_result().unwrap()
+    match main_result() {
+        Ok(_) => {}
+        Err(err) => {
+            error!("Error running the hypervisor: {:?}", err);
+            std::process::exit(1);
+        }
+    };
 }
