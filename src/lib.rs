@@ -129,7 +129,16 @@ pub const STACK_SIZE: u64 = 1024 * 1024;
 pub const STACK_END: GuestAddress =
     GuestAddress(VA_START.0 + VA_START_OFFSET_DRAM + MEMORY_SIZE as u64);
 
-pub const TXSZ: u64 = 28; // 28 bits are resolved through translation. All the others should be 0 for TTBR0 and 1 for TTBR1.
+pub const TXSZ: u64 = 28;
+pub const VA_REGION_SIZE: u64 = 1 << (64 - TXSZ); // The region size for virtual addresses.
+pub const IPS_SIZE: u64 = 1 << 36; // 64 GB address size
+
+pub const TCR_EL1_TG0_GRANULE: u64 = 0b10 << 14;
+pub const TCR_EL1_TG1_GRANULE: u64 = 0b10 << 30;
+pub const TCR_EL1_IPS: u64 = 0b001 << 32; // 64 GB
+pub const TCR_EL1_T0SZ: u64 = TXSZ; // so that 36 bits remains.
+pub const TCR_EL1_T1SZ: u64 = TXSZ << 16;
+pub const TCR_EL1_HA: u64 = 1 << 39;
 
 fn assert_hv_return_t_ok(v: bindgen::hv_return_t, name: &str) -> anyhow::Result<()> {
     let ret = HVReturnT::try_from(v).map_err(|e| {
@@ -172,6 +181,9 @@ impl HfVm {
 
         let usable_memory_size = (MEMORY_SIZE as u64 - DRAM_KERNEL_USABLE_DRAM_OFFSET) as usize;
 
+        vm.initial_configure_page_tables_l2()
+            .context("error in initial page table configuration")?;
+
         // Configure page tables for *Usable* DRAM.
         // This is the RAM that the kernel is free to use for whatever purpose, e.g. allocating.
         vm.configure_page_tables(
@@ -196,6 +208,33 @@ impl HfVm {
 
     fn get_ttbr_1_dram_offset(&self) -> u64 {
         self.get_ttbr_0_dram_offset() + TTBR_SIZE as u64
+    }
+
+    fn initial_configure_page_tables_l2(&mut self) -> anyhow::Result<()> {
+        for table_start_dram_offset in
+            &[self.get_ttbr_0_dram_offset(), self.get_ttbr_1_dram_offset()]
+        {
+            let page_table_guest_addr =
+                DRAM_VA_START.checked_add(*table_start_dram_offset).unwrap();
+            let page_table_ptr =
+                self.memory
+                    .get_slice(page_table_guest_addr, TTBR_SIZE)
+                    .with_context(|| {
+                        format!(
+                            "error getting slice of memory at {:#x?}",
+                            page_table_guest_addr.0
+                        )
+                    })?
+                    .as_ptr() as *mut page_table::TranslationTableLevel2_16k;
+
+            let table =
+                unsafe { &mut *page_table_ptr as &mut page_table::TranslationTableLevel2_16k };
+            let table_start_ipa = DRAM_IPA_START + *table_start_dram_offset;
+            table
+                .setup_l2(table_start_ipa)
+                .context("error setting up L2 tables")?;
+        }
+        Ok(())
     }
 
     fn configure_page_tables(
@@ -352,8 +391,8 @@ impl HfVm {
             .ok_or_else(|| anyhow!("entrypoint not set"))?;
 
         let vbar_el1 = self.vbar_el1;
-        let ttbr0 = GuestAddress(DRAM_VA_START.0 + self.get_ttbr_0_dram_offset());
-        let ttbr1 = GuestAddress(DRAM_VA_START.0 + self.get_ttbr_1_dram_offset());
+        let ttbr0 = GuestAddress(DRAM_IPA_START + self.get_ttbr_0_dram_offset());
+        let ttbr1 = GuestAddress(DRAM_IPA_START + self.get_ttbr_1_dram_offset());
         Ok(std::thread::spawn(move || {
             let vcpu = VCpu::new(memory).unwrap();
             let start_state = VcpuStartState {
@@ -736,16 +775,19 @@ impl VCpu {
             // Set all the required registers.
             {
                 let mut tcr_el1 = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_TCR_EL1)?;
-                const TG0_GRANULE_16K: u64 = 0b10 << 14;
-                const IPS_64GB: u64 = 0b001 << 32; // 64 GB
-                const T0SZ: u64 = 28; // so that 36 bits remains.
+
                 const EPD0: u64 = 1 << 7;
                 const NFD0: u64 = 1 << 53;
                 const SH0_OUTER_SHAREABLE: u64 = 0b10 << 12;
                 const ORGN0: u64 = 0b11 << 10;
                 const IRGN0: u64 = 0b10 << 8;
-                const HA: u64 = 1 << 39;
-                tcr_el1 |= TG0_GRANULE_16K | IPS_64GB | T0SZ | HA;
+
+                tcr_el1 |= TCR_EL1_TG0_GRANULE
+                    | TCR_EL1_TG1_GRANULE
+                    | TCR_EL1_IPS
+                    | TCR_EL1_T0SZ
+                    | TCR_EL1_T1SZ
+                    | TCR_EL1_HA;
                 // | NFD0
                 // | SH0_OUTER_SHAREABLE
                 // | ORGN0
@@ -986,6 +1028,9 @@ impl core::fmt::Debug for InstructionAbortFlags {
         let ifsc = self.0 & 0b111111;
         ds.field("ifsc (status code)", &ifsc);
         let ifsc_desc = match ifsc {
+            0b000000 => {
+                "Address size fault, level 0 of translation or translation table base register"
+            }
             0b000100 => "Translation fault, level 0",
             0b000101 => "Translation fault, level 1",
             0b000110 => "Translation fault, level 2",

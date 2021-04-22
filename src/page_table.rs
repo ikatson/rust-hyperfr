@@ -171,6 +171,29 @@ impl TranslationTableLevel2_16k {
         (base + (n * 2048 * 8)) as u64
     }
 
+    pub fn setup_l2(&mut self, table_start_ipa: u64) -> anyhow::Result<()> {
+        if !Self::is_aligned(table_start_ipa) {
+            bail!(
+                "table_start_ipa {:#x} is not aligned to page size",
+                table_start_ipa
+            )
+        }
+        for l2 in 0..self.descriptors.len() {
+            let t3offset = self.get_t3_offset(l2 as usize);
+            let l2desc = &mut self.descriptors[l2 as usize];
+            l2desc.0 |= 0b11;
+            l2desc.0 |= table_start_ipa + t3offset;
+        }
+
+        Ok(())
+    }
+
+    /*
+    "va" is the beggining of the address range that is to be translated.
+    "ipa" is the beginning of the IPA address space that it will map to. IPA should fit into crate::TXSZ.
+
+
+    */
     pub fn setup(
         &mut self,
         table_start_ipa: u64,
@@ -196,93 +219,97 @@ impl TranslationTableLevel2_16k {
         if !Self::is_aligned(ipa) {
             bail!("ipa {:#x} is not aligned to page size", ipa)
         }
+        if ipa + size >= crate::IPS_SIZE {
+            bail!(
+                "ipa {:#x?} / and or ipa + size are too large, does not fit into the TXSZ
+                space which is limited by address {:#x?}",
+                ipa,
+                crate::IPS_SIZE - 1
+            )
+        }
         if !Self::is_aligned(size) {
             bail!("size {:#x} is not aligned to page size", size)
         }
         if top_bit_set {
+            // Make sure all bits up to TXSZ are ones.
             assert_eq!(va.0 >> (64 - crate::TXSZ), (1 << crate::TXSZ) - 1)
         } else {
+            // Make sure all bits up to TXSZ are zeroes.
             assert_eq!(va.0 >> (64 - crate::TXSZ), 0)
         }
 
-        let va_bottom = va.0 & ((1 << crate::TXSZ) - 1);
-        let va_top = va_bottom + size;
-        debug!("va_bottom={:#x?}, va_top={:#x?}", va_bottom, va_top);
+        let mut ipa = ipa;
+        let mut va = va;
+        let ipa_end = ipa + size;
+        let page = crate::VA_PAGE;
+        while ipa < ipa_end {
+            // to get l2 idx, get bits (35:25)
+            let l2_idx = (va.0 >> (14 + 11)) & ((1 << 11) - 1);
+            let l3_idx = (va.0 >> 14) & ((1 << 11) - 1);
+            let l3_desc = &mut self.level_3_tables[l2_idx as usize].descriptors[l3_idx as usize];
 
-        let l2_range = (va_bottom >> (14 + 11))..=(va_top >> (14 + 11));
-        for l2 in l2_range {
-            let t3offset = self.get_t3_offset(l2 as usize);
-            let l2desc = &mut self.descriptors[l2 as usize];
-            l2desc.0 |= 0b11;
-            l2desc.0 |= table_start_ipa + t3offset;
+            let mut v: u64 = 0b11;
+            v |= 1 << 10; // AF=1
+            v |= 0b10 << 8; // SH
+            v |= ipa;
 
-            let l2_va_base: u64 = va_bottom | ((l2 as u64) << (14 + 11));
-            let l2_ipa_base: u64 = ipa | ((l2 as u64) << (14 + 11));
+            l3_desc.0 = v;
 
-            for (l3, l3desc) in self.level_3_tables[l2 as usize]
-                .descriptors
-                .iter_mut()
-                .enumerate()
-                .filter(|(idx, _)| {
-                    let l3_va_base = l2_va_base | ((*idx as u64) << 14);
-                    // println!("l3_va_base={:#x?}", l3_va_base);
-                    l3_va_base >= va_bottom && l3_va_base < va_top
-                })
-            {
-                if l3desc.0 & 1 == 1 {
-                    bail!("level 3 descriptor {} already configured: l2={}, l3={}, l2val={:#x?}, l3val={:#x?}", l3, l2, l3, l2desc.0, l3desc.0);
-                }
-                let page_ipa = l2_ipa_base + ((l3 as u64) << 14);
-                l3desc.0 |= 0b11;
-                l3desc.0 |= page_ipa;
+            println!(
+                "va={:#x?}, ttbr: l2_idx={}, l3_idx={}, l3val={:#x?}",
+                va.0, l2_idx, l3_idx, v
+            );
 
-                // set access flag, otherwise it causes faults that we don't handle.
-                l3desc.0 |= 1 << 10; // AF=1;
-
-                // Not sure what this means, but shareable sounds good?
-                l3desc.0 |= 0b10 << 8; // SH
-
-                // We set up MAIR_EL1 to say that index 0 is our main memory.
-                // l3desc.0 = 0b___ << 2; // AttrIndx
-
-                println!(
-                    "ttbr: l2={}, l3={}, l2val={:#x?}, l3val={:#x?}",
-                    l2, l3, l2desc.0, l3desc.0
-                );
-            }
+            va = GuestAddress(va.0 + page);
+            ipa += page;
         }
+
+        // let va_bottom = va.0 & ((1 << crate::TXSZ) - 1);
+        // let va_top = va_bottom + size;
+        // debug!("va_bottom={:#x?}, va_top={:#x?}", va_bottom, va_top);
+
+        // let l2_range = (va_bottom >> (14 + 11))..=(va_top >> (14 + 11));
+        // for l2 in l2_range {
+        //     let t3offset = self.get_t3_offset(l2 as usize);
+        //     let l2desc = &mut self.descriptors[l2 as usize];
+        //     l2desc.0 |= 0b11;
+        //     l2desc.0 |= table_start_ipa + t3offset;
+
+        //     let l2_va_base: u64 = va_bottom | ((l2 as u64) << (14 + 11));
+        //     let l2_ipa_base: u64 = ipa | ((l2 as u64) << (14 + 11));
+
+        //     for (l3, l3desc) in self.level_3_tables[l2 as usize]
+        //         .descriptors
+        //         .iter_mut()
+        //         .enumerate()
+        //         .filter(|(idx, _)| {
+        //             let l3_va_base = l2_va_base | ((*idx as u64) << 14);
+        //             // println!("l3_va_base={:#x?}", l3_va_base);
+        //             l3_va_base >= va_bottom && l3_va_base < va_top
+        //         })
+        //     {
+        //         if l3desc.0 & 1 == 1 {
+        //             bail!("level 3 descriptor {} already configured: l2={}, l3={}, l2val={:#x?}, l3val={:#x?}", l3, l2, l3, l2desc.0, l3desc.0);
+        //         }
+        //         let page_ipa = l2_ipa_base + ((l3 as u64) << 14);
+        //         l3desc.0 |= 0b11;
+        //         l3desc.0 |= page_ipa;
+
+        //         // set access flag, otherwise it causes faults that we don't handle.
+        //         l3desc.0 |= 1 << 10; // AF=1;
+
+        //         // Not sure what this means, but shareable sounds good?
+        //         l3desc.0 |= 0b10 << 8; // SH
+
+        //         // We set up MAIR_EL1 to say that index 0 is our main memory.
+        //         // l3desc.0 = 0b___ << 2; // AttrIndx
+
+        //         println!(
+        //             "ttbr: l2={}, l3={}, l2val={:#x?}, l3val={:#x?}",
+        //             l2, l3, l2desc.0, l3desc.0
+        //         );
+        //     }
+        // }
         Ok(())
     }
-}
-
-pub unsafe fn identity_map_36_bits_of_memory(
-    ptr: *mut TranslationTableLevel2_16k,
-    ttbr: GuestAddress,
-) -> anyhow::Result<()> {
-    let offset = ttbr.0;
-    let table = &mut *ptr as &mut TranslationTableLevel2_16k;
-    for l2 in 0..2048usize {
-        let t3offset = table.get_t3_offset(l2) as u64;
-        let l2desc = &mut table.descriptors[l2];
-        l2desc.0 |= 0b11;
-        l2desc.0 |= offset + t3offset;
-
-        let va = (l2 as u64) << 25;
-        for (l3, l3desc) in table.level_3_tables[l2].descriptors.iter_mut().enumerate() {
-            l3desc.0 |= 0b11;
-            l3desc.0 |= va | ((l3 as u64) << 14);
-
-            // set access flag, otherwise it causes faults that we don't handle.
-            l3desc.0 |= 1 << 10; // AF=1;
-
-            // Not sure what this means, but shareable sounds good?
-            l3desc.0 |= 0b10 << 8; // SH
-
-            // We set up MAIR_EL1 to say that index 0 is our main memory.
-            // l3desc.0 = 0b___ << 2; // AttrIndx
-
-            // println!("{}, {}, {:x?}, {:x?}", l2, l3, l2desc.0, l3desc.0);
-        }
-    }
-    Ok(())
 }
