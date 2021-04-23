@@ -393,88 +393,147 @@ impl HfVmBuilder {
         let file = std::fs::File::open(filename)?;
         let map = unsafe { memmap::MmapOptions::default().map(&file) }
             .context("error mmmapping ELF file")?;
-        let obj = object::File::parse(&map)?;
-        use object::read::ObjectSection;
-        use object::Object;
+        let obj = object::read::File::parse(&map)?;
+        use object::{Object, ObjectSection, ObjectSegment};
 
-        let mut first_page = None;
+        struct SegmentState<'a, 'b> {
+            segment: object::Segment<'a, 'b>,
+            aligned_size: u64,
+            flags: HvMemoryFlags,
+            ipa: GuestIpaAddress,
+            va: GuestVaAddress,
+        }
+
+        let mut segments = obj
+            .segments()
+            .scan(Offset(0), |mut_offset, segment| {
+                let size = align_up_to_page_size(segment.size());
+                let offset = *mut_offset;
+                *mut_offset = mut_offset.add(Offset(size));
+                let ipa = DRAM_IPA_START.add(offset);
+                let va = GuestVaAddress(align_down_to_page_size(segment.address()));
+                Some(SegmentState {
+                    segment,
+                    aligned_size: size,
+                    ipa,
+                    va,
+                    flags: HvMemoryFlags::HV_MEMORY_READ,
+                })
+            })
+            .collect::<Vec<_>>();
 
         for section in obj.sections() {
-            use object::SectionKind::*;
+            if let Ok(segment_idx) = segments.binary_search_by(|seg| {
+                use std::cmp::Ordering as O;
+                if section.address() < seg.segment.address() {
+                    return O::Greater;
+                }
+                if section.address() > seg.segment.address() + seg.segment.size() {
+                    return O::Less;
+                }
+                O::Equal
+            }) {
+                let s = &mut segments[segment_idx];
+                use object::SectionKind::*;
+                // There's no API to get segment flags in object, at least I did not find it,
+                // so just figure it out by the sectons we care about.
+                match section.kind() {
+                    Text => s.flags |= HvMemoryFlags::HV_MEMORY_EXEC,
+                    Data | UninitializedData => s.flags |= HvMemoryFlags::HV_MEMORY_WRITE,
+                    _ => {}
+                };
+            }
+        }
+
+        for (idx, ss) in segments.iter().enumerate() {
+            macro_rules! _tt_msg {
+                () => {
+                    format_args!(
+                        "configuring translation tables for LOAD segment {}, address {:#x?}, size {}, aligned size {}, IPA {:#x?}, VA {:#x?}, flags: {:?}",
+                        idx,
+                        ss.segment.address(),
+                        ss.segment.size(),
+                        ss.aligned_size,
+                        ss.ipa.0,
+                        ss.va.0,
+                        ss.flags,
+                    );
+                }
+            }
+            debug!("{}", _tt_msg!());
+            self.memory_manager
+                .configure_page_tables(ss.ipa, ss.va, ss.aligned_size as usize, ss.flags)
+                .with_context(|| anyhow!("error {}", _tt_msg!()))?;
+        }
+
+        for section in obj.sections() {
             let section_name = section.name().with_context(|| {
                 format!(
                     "error determining section name at {:#x?}",
                     section.address()
                 )
             })?;
+            if let Ok(segment_idx) = segments.binary_search_by(|seg| {
+                use std::cmp::Ordering as O;
+                if section.address() < seg.segment.address() {
+                    return O::Greater;
+                }
+                if section.address() > seg.segment.address() + seg.segment.size() {
+                    return O::Less;
+                }
+                O::Equal
+            }) {
+                use object::SectionKind::*;
+                match section.kind() {
+                    Text | Data | UninitializedData | ReadOnlyData => {}
+                    _ => continue,
+                };
+                let data = section.data().with_context(|| {
+                    format!("error getting section data for section {}", section_name)
+                })?;
+                // let ipa = self.mem(section.address() - segment.va.0));
 
-            match section.kind() {
-                Text | Data | ReadOnlyData | UninitializedData => {
-                    let flags = match section.kind() {
-                        Text => HvMemoryFlags::HV_MEMORY_READ | HvMemoryFlags::HV_MEMORY_EXEC,
-                        Data => HvMemoryFlags::HV_MEMORY_READ | HvMemoryFlags::HV_MEMORY_WRITE,
-                        ReadOnlyData => HvMemoryFlags::HV_MEMORY_READ,
-                        UninitializedData => {
-                            HvMemoryFlags::HV_MEMORY_READ | HvMemoryFlags::HV_MEMORY_WRITE
-                        }
-                        _ => unreachable!(),
-                    };
-
-                    let start = align_down_to_page_size(section.address());
-                    let end = align_up_to_page_size(section.address() + section.size());
-                    let size = (end - start) as usize;
-                    let first_page = match first_page {
-                        Some(addr) => addr,
-                        None => {
-                            first_page = Some(start);
-                            start
-                        }
-                    };
-
-                    let ipa = DRAM_IPA_START.add(Offset(start - first_page));
-                    let guest_address = GuestVaAddress(start);
-
-                    // TODO: assumes the exception table is the first piece.
-                    if let Text = section.kind() {
-                        self.vbar_el1 = Some(GuestVaAddress(section.address()));
-                    }
-
+                let ipa = self
+                    .memory_manager
+                    .simulate_address_lookup(GuestVaAddress(section.address()))?
+                    .unwrap();
+                if !data.is_empty() {
                     debug!(
-                        "configuring translation tables for section {}, section size {}, translated size {}, binary section address {:#x?}, IPA {:#x?}, guest address {:#x?}",
+                        "loading section {} (segment {}), size {} into memory at {:#x?}, ipa {:#x?}",
                         section_name,
+                        segment_idx,
                         section.size(),
-                        size,
                         section.address(),
                         ipa.0,
-                        guest_address.0,
                     );
-                    self.memory_manager
-                        .configure_page_tables(ipa, guest_address, size, flags)?;
-
-                    let data = section.data().with_context(|| {
-                        format!("error getting section data for section {}", section_name)
-                    })?;
-                    if !data.is_empty() {
-                        let slice = self
-                            .memory_manager
-                            .memory
-                            .get_slice(ipa.as_guest_address(), section.size() as usize)
-                            .with_context(|| {
-                                format!(
-                                    "error getting the slice of memory for section {}",
-                                    section_name
-                                )
-                            })?;
-                        slice.copy_from(data);
-                    }
+                    let slice = self
+                        .memory_manager
+                        .memory
+                        .get_slice(ipa.as_guest_address(), section.size() as usize)
+                        .with_context(|| {
+                            format!(
+                                "error getting the slice of memory for section {}",
+                                section_name
+                            )
+                        })?;
+                    slice.copy_from(data);
                 }
-                _ => {}
+            } else {
+                trace!("ignoring section {}", section_name);
             }
         }
-
         let entrypoint = GuestVaAddress(obj.entry());
         debug!("entrypoint is {:#x?}", entrypoint.0);
         self.entrypoint = Some(entrypoint);
+
+        // TODO: assumes the exception table is the first piece.
+        // if let object::SectionKind::Text = section.kind() {
+        //     self.vbar_el1 = Some(GuestVaAddress(section.address()));
+        // };
+
+        // TODO: remove this hardcode
+        self.vbar_el1 = Some(GuestVaAddress(0x4000));
+
         Ok(LoadedElf { entrypoint })
     }
 

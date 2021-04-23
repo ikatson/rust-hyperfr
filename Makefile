@@ -8,10 +8,13 @@ bindgen:
 		-I./fake-include/ \
         -x objective-c > src/bindgen.rs
 
-.PHONY: run
-run:
+.PHONY: build
+build:
 	cargo build --release
 	codesign --entitlements vz.entitlements -s - target/release/main
+
+.PHONY: run
+run: build
 	RUST_BACKTRACE=1 target/release/main /Users/igor/projects/2021-04-os-hypervisor-framework/armos/target/aarch64-unknown-none/release/armos
 
 
