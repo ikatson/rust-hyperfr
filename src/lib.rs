@@ -28,6 +28,10 @@ impl GuestVaAddress {
     const fn add(&self, offset: Offset) -> GuestVaAddress {
         GuestVaAddress(self.0 + offset.0)
     }
+
+    fn checked_sub(&self, offset: Offset) -> Option<GuestVaAddress> {
+        self.0.checked_sub(offset.0).map(GuestVaAddress)
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -885,8 +889,8 @@ impl VCpu {
         Ok(())
     }
 
-    fn get_stack_end(&self) -> GuestAddress {
-        GuestAddress(STACK_END.0 - STACK_SIZE * self.id)
+    fn get_stack_end(&self) -> GuestVaAddress {
+        STACK_END.checked_sub(Offset(STACK_SIZE * self.id)).unwrap()
     }
 
     fn debug_data_abort(&mut self, iss: u32) -> anyhow::Result<()> {
@@ -915,8 +919,8 @@ impl VCpu {
         self.set_reg(bindgen::hv_reg_t_HV_REG_PC, start_state.guest_pc.0, "PC")
             .context("failed setting initial program counter")?;
 
+        // Enable floating point
         {
-            // Enable floating point
             const FPEN_NO_TRAP: u64 = 0b11 << 20; // disable trapping of FP instructions
             const CPACR_EL1: u64 = FPEN_NO_TRAP;
             self.set_sys_reg(
@@ -926,16 +930,18 @@ impl VCpu {
             )?
         }
 
-        // Copy paste, no clue yet what it does
-        const PSR_MODE_EL1H: u64 = 0x0000_0005; //
-                                                // const PSR_F_BIT: u64 = 0x0000_0040; // bit 6
-                                                // const PSR_I_BIT: u64 = 0x0000_0080; // bit 7
-                                                // const PSR_A_BIT: u64 = 0x0000_0100; // bit 8
-                                                // const PSR_D_BIT: u64 = 0x0000_0200; // bit 9
-        const PSTATE_FAULT_BITS_64: u64 =
-            // PSR_MODE_EL1H | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT;
-            PSR_MODE_EL1H;
-        self.set_reg(bindgen::hv_reg_t_HV_REG_CPSR, PSTATE_FAULT_BITS_64, "CPSR")?;
+        // Enable EL1
+        {
+            // Copy paste, no clue what the bits do.
+            const PSR_MODE_EL1H: u64 = 0x0000_0005; //
+            const PSR_F_BIT: u64 = 0x0000_0040; // bit 6
+            const PSR_I_BIT: u64 = 0x0000_0080; // bit 7
+            const PSR_A_BIT: u64 = 0x0000_0100; // bit 8
+            const PSR_D_BIT: u64 = 0x0000_0200; // bit 9
+            const PSTATE_FAULT_BITS_64: u64 =
+                PSR_MODE_EL1H | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT | PSR_MODE_EL1H;
+            self.set_reg(bindgen::hv_reg_t_HV_REG_CPSR, PSTATE_FAULT_BITS_64, "CPSR")?;
+        }
 
         {
             // Set all the required registers.
@@ -986,17 +992,6 @@ impl VCpu {
                     "TTBR1_EL1",
                 )?;
             }
-
-            // assert_hv_return_t_ok(
-            //     unsafe {
-            //         bindgen::hv_vcpu_set_pending_interrupt(
-            //             self.id,
-            //             bindgen::hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ,
-            //             true,
-            //         )
-            //     },
-            //     "hv_vcpu_set_pending_interrupt",
-            // )?;
         };
 
         {
@@ -1044,6 +1039,7 @@ impl VCpu {
         //
         // self.enable_soft_debug()?;
         // self.spawn_cancel_thread();
+        // self.set_pending_irq()?;
 
         self.set_sys_reg(
             bindgen::hv_sys_reg_t_HV_SYS_REG_VBAR_EL1,
@@ -1055,8 +1051,6 @@ impl VCpu {
         self.add_breakpoint(GuestVaAddress(0x49e4))?;
         self.add_breakpoint(GuestVaAddress(0x7ce8))?;
 
-        // self.dump_all_registers()?;
-
         loop {
             assert_hv_return_t_ok(unsafe { bindgen::hv_vcpu_run(self.id) }, "hv_vcpu_run")?;
 
@@ -1066,11 +1060,14 @@ impl VCpu {
                 panic!("unexpected exit reason {:?}", exit_t.reason);
             }
 
+            match exit_t.reason {
+                HvExitReason::HV_EXIT_REASON_EXCEPTION => {}
+                other => bail!("unsupported HvExitReason {:?}", other),
+            };
+
             assert_eq!(exit_t.reason, HvExitReason::HV_EXIT_REASON_EXCEPTION);
             match exit_t.decoded_syndrome.exception_class {
-                // HVC
                 EXC_HVC => {
-                    trace!("received HVC event");
                     let iss = exit_t.decoded_syndrome.iss as u16;
                     const NOOP: u8 = 0;
                     const HALT: u8 = 1;
@@ -1079,6 +1076,8 @@ impl VCpu {
                     const SYNCHRONOUS_EXCEPTION: u8 = 6;
                     const PRINT_STRING: u8 = 7;
                     const IRQ: u8 = 8;
+
+                    trace!("received HVC event {}", iss);
                     match iss as u8 {
                         NOOP => {
                             debug!("NOOP HVC received");
@@ -1119,7 +1118,6 @@ impl VCpu {
                                         spsr_el1 | (1 << 21),
                                         "SPSR_EL1",
                                     )?;
-
                                     continue;
                                 }
                                 _ => {
@@ -1171,19 +1169,22 @@ impl VCpu {
                     bail!("unsupported exception class {:b}", other)
                 }
             }
-
-            // Testing interrupts
-            // assert_hv_return_t_ok(
-            //     unsafe {
-            //         bindgen::hv_vcpu_set_pending_interrupt(
-            //             self.id,
-            //             bindgen::hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ,
-            //             true,
-            //         )
-            //     },
-            //     "hv_vcpu_set_pending_interrupt",
-            // )?;
         }
+    }
+
+    #[allow(dead_code)]
+    fn set_pending_irq(&mut self) -> anyhow::Result<()> {
+        assert_hv_return_t_ok(
+            unsafe {
+                bindgen::hv_vcpu_set_pending_interrupt(
+                    self.id,
+                    bindgen::hv_interrupt_type_t_HV_INTERRUPT_TYPE_IRQ,
+                    true,
+                )
+            },
+            "hv_vcpu_set_pending_interrupt",
+        )?;
+        Ok(())
     }
 
     #[allow(dead_code)]
