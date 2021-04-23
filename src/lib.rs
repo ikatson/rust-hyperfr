@@ -862,6 +862,12 @@ impl VCpu {
 
         dump_feature_reg!(hv_feature_reg_t_HV_FEATURE_REG_CTR_EL0);
 
+        dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_DBGBCR0_EL1);
+        dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_DBGBVR0_EL1);
+        dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_DBGBCR1_EL1);
+        dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_DBGBVR1_EL1);
+        dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1);
+
         let esr_el1 = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ESR_EL1)?;
         if esr_el1 != 0 {
             debug!("ESR EL1 decoded: {:#x?}", Syndrome::from(esr_el1));
@@ -931,15 +937,31 @@ impl VCpu {
 
         // Enable EL1
         {
-            // Copy paste, no clue what the bits do.
-            const PSR_MODE_EL1H: u64 = 0x0000_0005; //
-            const PSR_F_BIT: u64 = 0x0000_0040; // bit 6
-            const PSR_I_BIT: u64 = 0x0000_0080; // bit 7
-            const PSR_A_BIT: u64 = 0x0000_0100; // bit 8
-            const PSR_D_BIT: u64 = 0x0000_0200; // bit 9
-            const PSTATE_FAULT_BITS_64: u64 =
-                PSR_MODE_EL1H | PSR_A_BIT | PSR_F_BIT | PSR_I_BIT | PSR_D_BIT | PSR_MODE_EL1H;
+            // TODO: I do NOT understand why these are written to CPSR and they work
+            // like if they were written to DAIF.
+            // This piece is copied from libkrun's code.
+            const PSR_MODE_EL1H: u64 = 0x0000_0005; // EL1
+            const PSR_F_BIT: u64 = 1 << 6;
+            const PSR_I_BIT: u64 = 1 << 7;
+            const PSR_A_BIT: u64 = 1 << 8;
+
+            #[allow(dead_code)]
+            const PSR_D_BIT: u64 = 1 << 9; // bit 9
+            #[allow(dead_code)]
+            const PSR_D_BIT_DISABLE: u64 = 0;
+
+            const PSTATE_FAULT_BITS_64: u64 = PSR_MODE_EL1H
+                | PSR_A_BIT
+                | PSR_F_BIT
+                | PSR_I_BIT
+                | PSR_D_BIT_DISABLE
+                | PSR_MODE_EL1H;
             self.set_reg(bindgen::hv_reg_t_HV_REG_CPSR, PSTATE_FAULT_BITS_64, "CPSR")?;
+            // self.set_sys_reg(
+            //     bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
+            //     PSTATE_FAULT_BITS_64,
+            //     "SPSR_EL1",
+            // )?;
         }
 
         {
@@ -1036,6 +1058,7 @@ impl VCpu {
         // so those instructions can't be debugged.
         // However with some manual tinkering you can
         //
+
         // self.enable_soft_debug()?;
         // self.spawn_cancel_thread();
         // self.set_pending_irq()?;
@@ -1047,8 +1070,9 @@ impl VCpu {
         )?;
 
         // These breakpoints don't work :(
-        self.add_breakpoint(GuestVaAddress(0x49e4))?;
-        self.add_breakpoint(GuestVaAddress(0x7ce8))?;
+        self.add_breakpoint(start_state.guest_pc)?;
+
+        // self.enable_soft_debug()?;
 
         loop {
             assert_hv_return_t_ok(unsafe { bindgen::hv_vcpu_run(self.id) }, "hv_vcpu_run")?;
@@ -1087,6 +1111,7 @@ impl VCpu {
                             return Ok(());
                         }
                         PANIC => {
+                            self.dump_all_registers()?;
                             bail!("guest panicked");
                         }
                         EXCEPTION | SYNCHRONOUS_EXCEPTION | IRQ => {
@@ -1101,14 +1126,17 @@ impl VCpu {
                             );
 
                             match el1_syndrome.exception_class {
-                                EXC_DATA_ABORT_LOWER | EXC_DATA_ABORT_SAME => {
+                                EXC_DATA_ABORT_SAME => {
                                     self.debug_data_abort(el1_syndrome.iss)?;
                                     name = "data abort";
                                 }
-                                EXC_SOFT_DEBUG_SAME => {
-                                    let elr_el1 =
+                                EXC_SOFT_STEP_SAME | EXC_BREAKPOINT_SAME => {
+                                    let instruction_address =
                                         self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ELR_EL1)?;
-                                    trace!("Debug exception, address {:#x?}, continuing", elr_el1,);
+                                    trace!(
+                                        "Debug exception, address {:#x?}, continuing",
+                                        instruction_address
+                                    );
                                     let spsr_el1 = self
                                         .get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1)?;
                                     // Set pstate.SS to 1, so that it actually executes the next instruction.
@@ -1152,20 +1180,22 @@ impl VCpu {
                         }
                     }
                 }
-                // some memory failure
-                EXC_MMU_LOWER | EXC_MMU_SAME => {
+                EXC_INSTR_ABORT_LOWER => {
                     error!("instruction abort");
                     self.dump_all_registers()?;
                     self.print_stack()?;
                     error!("{:#x?}", self.exit_t());
                     bail!("instruction abort");
                 }
-                EXC_DATA_ABORT_SAME | EXC_DATA_ABORT_LOWER => {
+                EXC_DATA_ABORT_LOWER => {
                     self.debug_data_abort(self.exit_t().decoded_syndrome.iss)?;
                     bail!("data abort EL1 -> EL2");
                 }
-                other => {
-                    bail!("unsupported exception class {:b}", other)
+                _ => {
+                    bail!(
+                        "unsupported exception class {:#x?}",
+                        exit_t.decoded_syndrome
+                    )
                 }
             }
         }
@@ -1205,20 +1235,15 @@ impl VCpu {
         use bindgen::*;
         use paste::paste;
 
-        // Uses paste crate to concatenate tokens into an identifier.
-        // The bindgen values are NOT a simple addition, otherwise we could have done
-        // smth like bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR0_EL1 + reg_number
-        macro_rules! dbg_reg_pair {
-            ($reg_number:tt) => {(
-                paste!([<hv_sys_reg_t_HV_SYS_REG_DBGBCR $reg_number _EL1>]),
-                paste!([<hv_sys_reg_t_HV_SYS_REG_DBGBVR $reg_number _EL1>]),
-            )};
-        }
         // Generates a long match statement, a little shorter than pasting the whole thing here.
+        // Uses paste crate to concatenate tokens into an identifier.
         macro_rules! rmatch {
             ($($reg_number:tt),+) => {
                 match reg {
-                    $($reg_number => dbg_reg_pair!($reg_number)),+,
+                    $($reg_number => (
+                        paste!([<hv_sys_reg_t_HV_SYS_REG_DBGBCR $reg_number _EL1>]),
+                        paste!([<hv_sys_reg_t_HV_SYS_REG_DBGBVR $reg_number _EL1>]),
+                    )),+,
                     _ => bail!("no more hardware breakpoints available")
                 }
             }
@@ -1241,12 +1266,18 @@ impl VCpu {
         // If this is the first breakpoint used, setup the control register.
         if reg == 0 {
             let mut mdscr = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1)?;
-            mdscr |= 1 << 15; // MDE bit
             mdscr |= 1 << 13; // KDE bit
+            mdscr |= 1 << 15; // MDE bit
             self.set_sys_reg(
                 bindgen::hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1,
                 mdscr,
                 "MDSCR_EL1",
+            )?;
+
+            // Trap to the host.
+            assert_hv_return_t_ok(
+                unsafe { bindgen::hv_vcpu_set_trap_debug_exceptions(self.id, true) },
+                "hv_vcpu_set_trap_debug_exceptions",
             )?;
         }
         self.next_breakpoint += 1;
@@ -1259,11 +1290,23 @@ impl VCpu {
         const KDE: u64 = 1 << 13;
         const SOFTWARE_STEP_ENABLE: u64 = 1;
         let mdscr_el1 = KDE | SOFTWARE_STEP_ENABLE;
+
         self.set_sys_reg(
             bindgen::hv_sys_reg_t_HV_SYS_REG_MDSCR_EL1,
             mdscr_el1,
             "MDSCR_EL1",
         )?;
+
+        // self.set_sys_reg(
+        //     bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
+        //     1 << 21,
+        //     "SPSR_EL1",
+        // )?;
+
+        // assert_hv_return_t_ok(
+        //     unsafe { bindgen::hv_vcpu_set_trap_debug_exceptions(self.id, true) },
+        //     "hv_vcpu_set_trap_debug_exceptions",
+        // )?;
         Ok(())
     }
 }
@@ -1277,11 +1320,14 @@ pub struct Syndrome {
 }
 
 const EXC_HVC: u8 = 0b010110;
-const EXC_MMU_LOWER: u8 = 0b100000;
-const EXC_MMU_SAME: u8 = 0b100001;
+const EXC_INSTR_ABORT_LOWER: u8 = 0b100000;
+const EXC_INSTR_ABORT_SAME: u8 = 0b100001;
 const EXC_DATA_ABORT_LOWER: u8 = 0b100100;
 const EXC_DATA_ABORT_SAME: u8 = 0b100101;
-const EXC_SOFT_DEBUG_SAME: u8 = 0b110011;
+const EXC_BREAKPOINT_SAME: u8 = 0b110001;
+const EXC_BREAKPOINT_LOWER: u8 = 0b110000;
+const EXC_SOFT_STEP_SAME: u8 = 0b110011;
+const EXC_SOFT_STEP_LOWER: u8 = 0b110010;
 
 struct InstructionAbortFlags(u32);
 impl core::fmt::Debug for InstructionAbortFlags {
@@ -1328,15 +1374,17 @@ impl core::fmt::Debug for InstructionAbortFlags {
 impl Syndrome {
     fn exc_class_name(&self) -> &'static str {
         match self.exception_class {
-            // some memory failure
             EXC_HVC => "HVC",
-            EXC_MMU_LOWER => "Instruction abort (MMU) from lower EL",
-            EXC_MMU_SAME => "Instruction abort (MMU) fault from same EL",
+            EXC_INSTR_ABORT_LOWER => "Instruction abort (MMU) from lower EL",
+            EXC_INSTR_ABORT_SAME => "Instruction abort (MMU) fault from same EL",
             EXC_DATA_ABORT_LOWER => "Data abort from a lower exception level",
             EXC_DATA_ABORT_SAME => "Data abort from the same exception level",
-            EXC_SOFT_DEBUG_SAME => {
+            EXC_SOFT_STEP_SAME => {
                 "Software Step exception taken without a change in Exception level"
             }
+            EXC_SOFT_STEP_LOWER => "Software Step exception from a lower Exception level",
+            EXC_BREAKPOINT_LOWER => "Breakpoint exception from a lower Exception level",
+            EXC_BREAKPOINT_SAME => "Breakpoint exception taken without a change in Exception level",
             _ => "unknown",
         }
     }
@@ -1348,7 +1396,7 @@ impl Syndrome {
     }
     fn instruction_abort_flags(&self) -> Option<InstructionAbortFlags> {
         match self.exception_class {
-            EXC_MMU_SAME | EXC_MMU_LOWER => Some(InstructionAbortFlags(self.iss)),
+            EXC_INSTR_ABORT_SAME | EXC_INSTR_ABORT_LOWER => Some(InstructionAbortFlags(self.iss)),
             _ => None,
         }
     }
