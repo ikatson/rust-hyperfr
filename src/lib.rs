@@ -862,11 +862,10 @@ impl VCpu {
 
         dump_feature_reg!(hv_feature_reg_t_HV_FEATURE_REG_CTR_EL0);
 
-        debug!(
-            "ESR EL1 decoded: {:#x?}",
-            Syndrome::from(self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ESR_EL1)?)
-        );
-
+        let esr_el1 = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ESR_EL1)?;
+        if esr_el1 != 0 {
+            debug!("ESR EL1 decoded: {:#x?}", Syndrome::from(esr_el1));
+        };
         Ok(())
     }
 
@@ -1203,77 +1202,33 @@ impl VCpu {
     #[allow(dead_code)]
     fn add_breakpoint(&mut self, addr: GuestVaAddress) -> anyhow::Result<()> {
         let reg = self.next_breakpoint;
-        let (ctrl_reg, value_reg) = match reg {
-            0 => (
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR0_EL1,
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR0_EL1,
-            ),
-            1 => (
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR1_EL1,
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR1_EL1,
-            ),
-            2 => (
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR2_EL1,
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR2_EL1,
-            ),
-            3 => (
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR3_EL1,
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR3_EL1,
-            ),
-            4 => (
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR4_EL1,
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR4_EL1,
-            ),
-            5 => (
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR5_EL1,
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR5_EL1,
-            ),
-            6 => (
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR6_EL1,
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR6_EL1,
-            ),
-            7 => (
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR7_EL1,
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR7_EL1,
-            ),
-            8 => (
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR8_EL1,
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR8_EL1,
-            ),
-            9 => (
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR9_EL1,
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR9_EL1,
-            ),
-            10 => (
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR10_EL1,
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR10_EL1,
-            ),
-            11 => (
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR11_EL1,
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR11_EL1,
-            ),
-            12 => (
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR12_EL1,
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR12_EL1,
-            ),
-            13 => (
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR13_EL1,
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR13_EL1,
-            ),
-            14 => (
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR14_EL1,
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR14_EL1,
-            ),
-            15 => (
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR15_EL1,
-                bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBVR15_EL1,
-            ),
-            _ => bail!("no more hardware breakpoints available"),
-        };
+        use bindgen::*;
+        use paste::paste;
+
+        // Uses paste crate to concatenate tokens into an identifier.
+        // The bindgen values are NOT a simple addition, otherwise we could have done
+        // smth like bindgen::hv_sys_reg_t_HV_SYS_REG_DBGBCR0_EL1 + reg_number
+        macro_rules! dbg_reg_pair {
+            ($reg_number:tt) => {(
+                paste!([<hv_sys_reg_t_HV_SYS_REG_DBGBCR $reg_number _EL1>]),
+                paste!([<hv_sys_reg_t_HV_SYS_REG_DBGBVR $reg_number _EL1>]),
+            )};
+        }
+        // Generates a long match statement, a little shorter than pasting the whole thing here.
+        macro_rules! rmatch {
+            ($($reg_number:tt),+) => {
+                match reg {
+                    $($reg_number => dbg_reg_pair!($reg_number)),+,
+                    _ => bail!("no more hardware breakpoints available")
+                }
+            }
+        }
+        let (ctrl_reg, value_reg) = rmatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
 
         let mut ctrl_reg_value: u64 = 0b0000 << 20; // breakpoint type 0 - unlinked address match.
 
-        // ctrl_reg_value |= 0b1111 << 5; // BAS - for A64 instructions.
+        // This is unneeded actually, as for Aarch64 the bas field is reserved, but whatever.
+        ctrl_reg_value |= 0b1111 << 5; // BAS - for A64 instructions.
 
         ctrl_reg_value |= 0b11 << 1; // PMC - to enable EL1 breakpoints.
 

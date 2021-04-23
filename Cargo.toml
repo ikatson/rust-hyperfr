@@ -18,3 +18,4 @@ hexdump = "0.1"
 log = "0.4"
 pretty_env_logger = "0.4"
 vm-memory = {version = "*", features = ["backend-mmap"]}
+paste = "1"
