@@ -423,6 +423,11 @@ impl HfVmBuilder {
             .collect::<Vec<_>>();
 
         for section in obj.sections() {
+            use object::SectionKind::*;
+            match section.kind() {
+                Text | Data | UninitializedData | ReadOnlyData => {}
+                _ => continue,
+            };
             if let Ok(segment_idx) = segments.binary_search_by(|seg| {
                 use std::cmp::Ordering as O;
                 if section.address() < seg.segment.address() {
@@ -486,12 +491,19 @@ impl HfVmBuilder {
                 use object::SectionKind::*;
                 match section.kind() {
                     Text | Data | UninitializedData | ReadOnlyData => {}
-                    _ => continue,
+                    _ => {
+                        debug!(
+                            "ignoring section with name \"{}\", address {:#x?}, kind: {:?}",
+                            section_name,
+                            section.address(),
+                            section.kind()
+                        );
+                        continue;
+                    }
                 };
                 let data = section.data().with_context(|| {
                     format!("error getting section data for section {}", section_name)
                 })?;
-                // let ipa = self.mem(section.address() - segment.va.0));
 
                 let ipa = self
                     .memory_manager
@@ -499,10 +511,11 @@ impl HfVmBuilder {
                     .unwrap();
                 if !data.is_empty() {
                     debug!(
-                        "loading section {} (segment {}), size {} into memory at {:#x?}, ipa {:#x?}",
+                        "loading section \"{}\" (segment {}), size {}, kind {:?} into memory at {:#x?}, ipa {:#x?}",
                         section_name,
                         segment_idx,
                         section.size(),
+                        section.kind(),
                         section.address(),
                         ipa.0,
                     );
@@ -512,7 +525,7 @@ impl HfVmBuilder {
                         .get_slice(ipa.as_guest_address(), section.size() as usize)
                         .with_context(|| {
                             format!(
-                                "error getting the slice of memory for section {}",
+                                "error getting the slice of memory for section \"{}\"",
                                 section_name
                             )
                         })?;
@@ -526,13 +539,12 @@ impl HfVmBuilder {
         debug!("entrypoint is {:#x?}", entrypoint.0);
         self.entrypoint = Some(entrypoint);
 
-        // TODO: assumes the exception table is the first piece.
-        // if let object::SectionKind::Text = section.kind() {
-        //     self.vbar_el1 = Some(GuestVaAddress(section.address()));
-        // };
-
-        // TODO: remove this hardcode
-        self.vbar_el1 = Some(GuestVaAddress(0x4000));
+        use object::ObjectSymbol;
+        for symbol in obj.symbols() {
+            if symbol.name().unwrap_or_default() == "exception_vector_table" {
+                self.vbar_el1 = Some(GuestVaAddress(symbol.address()));
+            }
+        }
 
         Ok(LoadedElf { entrypoint })
     }
