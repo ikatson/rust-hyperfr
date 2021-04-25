@@ -285,12 +285,70 @@ impl TranslationTableLevel2_16k {
             assert_eq!(bits(va, 55, 64 - crate::TXSZ), 0)
         }
 
-        self._setup_internal(table_start_ipa, va, ipa, size, flags)
+        self._setup_internal(va, ipa, size, flags)
     }
 
     fn _setup_internal(
         &mut self,
-        table_start_ipa: u64,
+        mut va: u64,
+        mut ipa: u64,
+        mut size: u64,
+        flags: HvMemoryFlags,
+    ) -> anyhow::Result<()> {
+        if size == 0 {
+            return Ok(());
+        }
+        let block = 1 << (14 + 11);
+        while size >= block {
+            self._setup_internal_block(va, ipa, block, flags)?;
+            size -= block;
+            va += block;
+            ipa += block;
+        }
+        // For the remaining size setup l3 tables.
+        self._setup_internal_l3(va, ipa, size, flags)
+    }
+
+    fn _setup_internal_block(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        size: u64,
+        flags: HvMemoryFlags,
+    ) -> anyhow::Result<()> {
+        let l2 = (va >> (14 + 11)) & ((1 << 11) - 1);
+        let l2desc = &mut self.descriptors[l2 as usize];
+
+        // Block
+        l2desc.0 = 0b01;
+        l2desc.0 |= 1 << 10; // AF=1
+        l2desc.0 |= ipa & ((1 << 48) - 1) & !((1 << 26) - 1);
+
+        l2desc.0 |= 0b10 << 8; // SH
+        if !(flags.contains(HvMemoryFlags::HV_MEMORY_EXEC)) {
+            l2desc.0 |= 1 << 53; // Privileged execute never
+            l2desc.0 |= 1 << 54; // Unprivileged execute never
+        }
+
+        // AP bits AP[2:1], bits[7:6] Data Access Permissions bits, see Memory access control on page D5-2731.
+        if !flags.contains(HvMemoryFlags::HV_MEMORY_WRITE) {
+            l2desc.0 |= 0b10 << 6;
+        }
+
+        trace!(
+            "l2 block: l2={}, l2val={:#x?}, va: {:#x?}, ipa: {:#x?}, size: {}, flags: {:?}",
+            l2,
+            l2desc.0,
+            va,
+            ipa,
+            size,
+            flags
+        );
+        Ok(())
+    }
+
+    fn _setup_internal_l3(
+        &mut self,
         va: u64,
         ipa: u64,
         size: u64,
@@ -331,7 +389,7 @@ impl TranslationTableLevel2_16k {
             l3_desc.0 = v;
 
             trace!(
-                "va={:#x?}, ttbr: l2_idx={}, l3_idx={}, l3val={:#x?}",
+                "l3 table: va={:#x?}, ttbr: l2_idx={}, l3_idx={}, l3val={:#x?}",
                 va,
                 l2_idx,
                 l3_idx,
