@@ -333,7 +333,7 @@ impl TranslationTableLevel2_16k {
                 v
             );
 
-            va = va + page;
+            va += page;
             ipa += page;
         }
         Ok(())

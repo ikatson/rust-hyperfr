@@ -1101,7 +1101,18 @@ impl VCpu {
                 dram_start: DRAM_VA_START,
                 dram_usable_start: DRAM_VA_START.add(start_params_end_offset),
                 dram_size: MEMORY_SIZE as u64,
-                log_level: 0,
+                log_level: match std::env::var("ARMOS_LOG")
+                    .map(|s| s.to_lowercase())
+                    .as_deref()
+                    .unwrap_or_default()
+                {
+                    "trace" => 0,
+                    "debug" => 1,
+                    "info" => 2,
+                    "warn" => 3,
+                    "error" => 4,
+                    _ => 2,
+                },
             };
             let start_params_ipa = DRAM_IPA_START.add(start_params_dram_offset);
             let start_params_mem = self
@@ -1138,7 +1149,7 @@ impl VCpu {
         //
 
         // self.enable_soft_debug()?;
-        self.spawn_cancel_thread();
+        // self.spawn_cancel_thread();
         // self.set_pending_irq()?;
 
         self.set_sys_reg(
