@@ -227,12 +227,6 @@ impl TranslationTableLevel2_16k {
         Ok(())
     }
 
-    /*
-    "va" is the beggining of the address range that is to be translated.
-    "ipa" is the beginning of the IPA address space that it will map to. IPA should fit into crate::TXSZ.
-
-
-    */
     pub fn setup(
         &mut self,
         table_start_ipa: GuestIpaAddress,
@@ -291,6 +285,17 @@ impl TranslationTableLevel2_16k {
             assert_eq!(bits(va, 55, 64 - crate::TXSZ), 0)
         }
 
+        self._setup_internal(table_start_ipa, va, ipa, size, flags)
+    }
+
+    fn _setup_internal(
+        &mut self,
+        table_start_ipa: u64,
+        va: u64,
+        ipa: u64,
+        size: u64,
+        flags: HvMemoryFlags,
+    ) -> anyhow::Result<()> {
         let mut ipa = ipa;
         let mut va = va;
         let ipa_end = ipa + size;
