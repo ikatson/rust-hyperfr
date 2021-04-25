@@ -407,14 +407,19 @@ impl HfVmBuilder {
         let mut segments = obj
             .segments()
             .scan(Offset(0), |mut_offset, segment| {
-                let size = align_up_to_page_size(segment.size());
+                let start = segment.address();
+                let end = segment.address() + segment.size();
+                let aligned_start = align_down_to_page_size(start);
+                let aligned_end = align_up_to_page_size(end);
+                let aligned_size = aligned_end - aligned_start;
+
                 let offset = *mut_offset;
-                *mut_offset = mut_offset.add(Offset(size));
+                *mut_offset = mut_offset.add(Offset(aligned_size));
                 let ipa = DRAM_IPA_START.add(offset);
-                let va = GuestVaAddress(align_down_to_page_size(segment.address()));
+                let va = GuestVaAddress(aligned_start);
                 Some(SegmentState {
                     segment,
-                    aligned_size: size,
+                    aligned_size,
                     ipa,
                     va,
                     flags: HvMemoryFlags::HV_MEMORY_READ,
@@ -769,6 +774,7 @@ struct StartParams {
     dram_start: GuestVaAddress,
     dram_usable_start: GuestVaAddress,
     dram_size: u64,
+    log_level: u64,
 }
 
 impl VCpu {
@@ -1095,6 +1101,7 @@ impl VCpu {
                 dram_start: DRAM_VA_START,
                 dram_usable_start: DRAM_VA_START.add(start_params_end_offset),
                 dram_size: MEMORY_SIZE as u64,
+                log_level: 0,
             };
             let start_params_ipa = DRAM_IPA_START.add(start_params_dram_offset);
             let start_params_mem = self
@@ -1131,7 +1138,7 @@ impl VCpu {
         //
 
         // self.enable_soft_debug()?;
-        // self.spawn_cancel_thread();
+        self.spawn_cancel_thread();
         // self.set_pending_irq()?;
 
         self.set_sys_reg(
@@ -1258,6 +1265,21 @@ impl VCpu {
                     error!("{:#x?}", self.exit_t());
                     bail!("instruction abort");
                 }
+                EXC_SOFT_STEP_LOWER => {
+                    let instruction_ipa = exit_t.exception.virtual_address;
+                    trace!(
+                        "Debug exception, IPA address {:#x?}, continuing",
+                        instruction_ipa
+                    );
+                    let spsr_el1 = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1)?;
+                    // Set pstate.SS to 1, so that it actually executes the next instruction.
+                    self.set_sys_reg(
+                        bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
+                        spsr_el1 | (1 << 21),
+                        "SPSR_EL1",
+                    )?;
+                    continue;
+                }
                 EXC_DATA_ABORT_LOWER => {
                     self.debug_data_abort(self.exit_t().decoded_syndrome.iss)?;
                     bail!("data abort EL1 -> EL2");
@@ -1346,10 +1368,10 @@ impl VCpu {
             )?;
 
             // Trap to the host.
-            assert_hv_return_t_ok(
-                unsafe { bindgen::hv_vcpu_set_trap_debug_exceptions(self.id, true) },
-                "hv_vcpu_set_trap_debug_exceptions",
-            )?;
+            // assert_hv_return_t_ok(
+            //     unsafe { bindgen::hv_vcpu_set_trap_debug_exceptions(self.id, true) },
+            //     "hv_vcpu_set_trap_debug_exceptions",
+            // )?;
         }
         self.next_breakpoint += 1;
         Ok(())
