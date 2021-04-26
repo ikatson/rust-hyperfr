@@ -124,23 +124,6 @@ impl Default for TranslationTableLevel3_16k {
     }
 }
 
-// impl TranslationTable16kAllocator {
-//     pub fn allocate_recursive_identity_block(
-//         base_address: GuestAddress,
-//     ) -> TranslationTableLevel16k {
-//         let copy = TranslationTableDescriptor16k::new(base_address);
-//         let mut table = TranslationTableLevel16k {
-//             entries: [copy; 2048],
-//         };
-//         // each entry in the level 3 table should be identity.
-//         // i.e. 0x0000_0000_
-//         for descr in table.entries.iter_mut() {
-//             // descr.0
-//         }
-//         unimplemented!()
-//     }
-// }
-
 #[repr(C)]
 pub struct TranslationTableLevel2_16k {
     descriptors: [TranslationTableDescriptor16k; 2048],
@@ -162,7 +145,7 @@ const fn bits(val: u64, start_inclusive: u64, end_inclusive: u64) -> u64 {
 
 impl TranslationTableLevel2_16k {
     fn is_aligned(value: u64) -> bool {
-        value & ((1 << 14) - 1) == 0
+        crate::aligner::ALIGNER_16K.is_aligned(value)
     }
 
     pub fn simulate_lookup(
@@ -177,21 +160,28 @@ impl TranslationTableLevel2_16k {
         );
         let l2_idx = ((va.0 >> 25) & ((1 << 11) - 1)) as usize;
         let l2 = &self.descriptors[l2_idx];
-        if l2.0 & 0b11 != 0b11 {
-            return None;
+        match l2.0 & 0b11 {
+            // TABLE, points to L3 page
+            0b11 => {
+                let l3_ipa = l2.0 & ((1 << 48) - 1) & !((1 << 14) - 1);
+                assert_eq!(l3_ipa, table_start_ipa.0 + self.get_t3_offset(l2_idx));
+
+                let l3_idx = ((va.0 >> 14) & ((1 << 11) - 1)) as usize;
+                let l3 = &self.level_3_tables[l2_idx as usize].descriptors[l3_idx as usize];
+
+                if l3.0 & 0b11 != 0b11 {
+                    return None;
+                }
+
+                let ipa = l3.0 & ((1 << 48) - 1) & !((1 << 14) - 1);
+                Some(GuestIpaAddress(ipa + (va.0 & ((1 << 14) - 1))))
+            }
+            // BLOCK
+            0b01 => {
+                todo!("block l2 lookup not supported yet")
+            }
+            _ => None,
         }
-        let l3_ipa = l2.0 & ((1 << 48) - 1) & !((1 << 14) - 1);
-        assert_eq!(l3_ipa, table_start_ipa.0 + self.get_t3_offset(l2_idx));
-
-        let l3_idx = ((va.0 >> 14) & ((1 << 11) - 1)) as usize;
-        let l3 = &self.level_3_tables[l2_idx as usize].descriptors[l3_idx as usize];
-
-        if l3.0 & 0b11 != 0b11 {
-            return None;
-        }
-
-        let ipa = l3.0 & ((1 << 48) - 1) & !((1 << 14) - 1);
-        Some(GuestIpaAddress(ipa + (va.0 & ((1 << 14) - 1))))
     }
 
     // Get the offset from self's ptr into the L3 table for L2 table.
@@ -200,31 +190,6 @@ impl TranslationTableLevel2_16k {
         let l3_base = &self.level_3_tables as *const TranslationTableLevel3_16k;
         let l3 = unsafe { l3_base.add(l2_idx) };
         l3 as u64 - base
-    }
-
-    pub fn setup_l2(&mut self, table_start_ipa: crate::GuestIpaAddress) -> anyhow::Result<()> {
-        let table_start_ipa = table_start_ipa.0;
-        if !Self::is_aligned(table_start_ipa) {
-            bail!(
-                "table_start_ipa {:#x} is not aligned to page size",
-                table_start_ipa
-            )
-        }
-        for l2 in 0..self.descriptors.len() {
-            let t3offset = self.get_t3_offset(l2 as usize);
-            let l2desc = &mut self.descriptors[l2 as usize];
-            l2desc.0 |= 0b11;
-            l2desc.0 |= table_start_ipa + t3offset;
-
-            trace!(
-                "table_start_ipa={:#x?}, l2={}, l3addr={:#x?}",
-                table_start_ipa,
-                l2,
-                table_start_ipa + t3offset
-            )
-        }
-
-        Ok(())
     }
 
     pub fn setup(
@@ -285,39 +250,54 @@ impl TranslationTableLevel2_16k {
             assert_eq!(bits(va, 55, 64 - crate::TXSZ), 0)
         }
 
-        self._setup_internal(va, ipa, size, flags)
+        self._setup_internal(table_start_ipa, va, ipa, size, flags)
     }
 
     fn _setup_internal(
         &mut self,
+        table_start_ipa: u64,
         mut va: u64,
         mut ipa: u64,
         mut size: u64,
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
-        if size == 0 {
-            return Ok(());
+        use crate::aligner::Aligner;
+        const BLOCK_SIZE: u64 = 1 << 25;
+        const BLOCK_SIZE_ALIGNER: Aligner = Aligner::new_from_mask(!((1 << 25) - 1));
+
+        'outer: loop {
+            if size == 0 {
+                return Ok(());
+            }
+
+            if BLOCK_SIZE_ALIGNER.is_aligned(va) {
+                while size >= BLOCK_SIZE {
+                    self._setup_one_block(va, ipa, flags)?;
+                    size -= BLOCK_SIZE;
+                    va += BLOCK_SIZE;
+                    ipa += BLOCK_SIZE;
+                }
+                if size > 0 {
+                    return self._setup_internal_l3(table_start_ipa, va, ipa, size, flags);
+                }
+            } else {
+                let next_block_start = BLOCK_SIZE_ALIGNER.align_up(va);
+                let l3size = size.min(next_block_start - va);
+                self._setup_internal_l3(table_start_ipa, va, ipa, l3size, flags)?;
+                va += l3size;
+                ipa += l3size;
+                size -= l3size;
+            }
         }
-        let block = 1 << (14 + 11);
-        while size >= block {
-            self._setup_internal_block(va, ipa, block, flags)?;
-            size -= block;
-            va += block;
-            ipa += block;
-        }
-        // For the remaining size setup l3 tables.
-        self._setup_internal_l3(va, ipa, size, flags)
     }
 
-    fn _setup_internal_block(
-        &mut self,
-        va: u64,
-        ipa: u64,
-        size: u64,
-        flags: HvMemoryFlags,
-    ) -> anyhow::Result<()> {
+    fn _setup_one_block(&mut self, va: u64, ipa: u64, flags: HvMemoryFlags) -> anyhow::Result<()> {
         let l2 = (va >> (14 + 11)) & ((1 << 11) - 1);
         let l2desc = &mut self.descriptors[l2 as usize];
+
+        if l2desc.0 & 0b11 != 0 {
+            bail!("L2 table {} already set-up", l2);
+        }
 
         // Block
         l2desc.0 = 0b01;
@@ -336,12 +316,11 @@ impl TranslationTableLevel2_16k {
         }
 
         trace!(
-            "l2 block: l2={}, l2val={:#x?}, va: {:#x?}, ipa: {:#x?}, size: {}, flags: {:?}",
+            "l2 block: l2={}, l2val={:#x?}, va: {:#x?}, ipa: {:#x?}, flags: {:?}",
             l2,
             l2desc.0,
             va,
             ipa,
-            size,
             flags
         );
         Ok(())
@@ -349,6 +328,7 @@ impl TranslationTableLevel2_16k {
 
     fn _setup_internal_l3(
         &mut self,
+        table_start_ipa: u64,
         va: u64,
         ipa: u64,
         size: u64,
@@ -358,9 +338,44 @@ impl TranslationTableLevel2_16k {
         let mut va = va;
         let ipa_end = ipa + size;
         let page = crate::VA_PAGE;
+
+        // an impossible value
+        let mut prev_l2_idx = 2048;
+
         while ipa < ipa_end {
             // to get l2 idx, get bits (35:25)
             let l2_idx = (va >> (14 + 11)) & ((1 << 11) - 1);
+
+            if l2_idx != prev_l2_idx {
+                let offset = self.get_t3_offset(l2_idx as usize);
+                let l2_desc = &mut self.descriptors[l2_idx as usize];
+
+                let l3_offset = table_start_ipa + offset;
+                assert_eq!(bits(l3_offset, 47, 14), l3_offset);
+
+                let new_value = 0b11 | (table_start_ipa + offset);
+
+                match l2_desc.0 & 0b11 {
+                    0b01 => bail!("l2={} was previously already configured as a block", l2_idx),
+                    0b11 => {
+                        // The table was previously configured. Make sure the value is the same.
+                        if l2_desc.0 != new_value {
+                            bail!("l2={} was previously configured with value {:#x?}, wanted to write {:#x?}", l2_idx, l2_desc.0, new_value)
+                        }
+                    }
+                    _ => {
+                        l2_desc.0 = new_value;
+                        trace!(
+                            "l2 table: va={:#x?}, ttbr: l2_idx={}, l2_val={:#x?}",
+                            va,
+                            l2_idx,
+                            new_value,
+                        );
+                    }
+                }
+            }
+            prev_l2_idx = l2_idx;
+
             let l3_idx = (va >> 14) & ((1 << 11) - 1);
             let l3_desc = &mut self.level_3_tables[l2_idx as usize].descriptors[l3_idx as usize];
 

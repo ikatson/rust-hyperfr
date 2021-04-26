@@ -11,6 +11,8 @@ use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use log::{debug, error, info, trace};
 
+pub mod aligner;
+
 #[derive(Copy, Clone, Debug)]
 pub struct GuestIpaAddress(u64);
 impl GuestIpaAddress {
@@ -44,25 +46,16 @@ impl Offset {
 
 pub mod page_table;
 
-pub fn get_page_size() -> u64 {
-    unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) as u64 }
-}
-
 pub(crate) fn is_aligned_to_page_size(value: u64) -> bool {
-    align_down_to_page_size(value) == value
+    aligner::ALIGNER_16K.is_aligned(value)
 }
 
 pub(crate) fn align_down_to_page_size(value: u64) -> u64 {
-    value & !(get_page_size() - 1)
+    aligner::ALIGNER_16K.align_down(value)
 }
 
 pub fn align_up_to_page_size(value: u64) -> u64 {
-    let aligned_down = align_down_to_page_size(value);
-    if aligned_down != value {
-        aligned_down + get_page_size()
-    } else {
-        value
-    }
+    aligner::ALIGNER_16K.align_up(value)
 }
 
 #[allow(
@@ -165,7 +158,7 @@ pub const DRAM_KERNEL_USABLE_DRAM_OFFSET: Offset = DRAM_TTBR_OFFSET
 
 // this could be configurable, it's just that we don't care yet.
 // This is 32 MiB, we just don't need more.
-pub const MEMORY_SIZE: usize = 256 * 1024 * 1024;
+pub const MEMORY_SIZE: usize = 4 * 1024 * 1024 * 1024;
 
 pub const STACK_SIZE: u64 = 1024 * 1024;
 pub const STACK_END: GuestVaAddress = DRAM_VA_START.add(Offset(MEMORY_SIZE as u64));
@@ -205,9 +198,6 @@ impl GuestMemoryManager {
 
         let mut mm = Self { memory };
 
-        mm.initial_configure_page_tables_l2()
-            .context("error in initial page table configuration")?;
-
         {
             let ipa = DRAM_IPA_START.add(DRAM_KERNEL_USABLE_DRAM_OFFSET);
             let va = DRAM_VA_START.add(DRAM_KERNEL_USABLE_DRAM_OFFSET);
@@ -240,33 +230,6 @@ impl GuestMemoryManager {
         let vslice = self.memory.get_slice(ipa.as_guest_address(), size)?;
         let ptr = vslice.as_ptr();
         Ok(core::slice::from_raw_parts(ptr, size))
-    }
-
-    fn initial_configure_page_tables_l2(&mut self) -> anyhow::Result<()> {
-        for table_start_dram_offset in
-            (&[self.get_ttbr_0_dram_offset(), self.get_ttbr_1_dram_offset()])
-                .iter()
-                .copied()
-        {
-            let page_table_guest_ipa = DRAM_IPA_START.add(table_start_dram_offset);
-            let page_table_ptr =
-                self.memory
-                    .get_slice(page_table_guest_ipa.as_guest_address(), TTBR_SIZE)
-                    .with_context(|| {
-                        format!(
-                            "error getting slice of memory at {:#x?}, size {}",
-                            page_table_guest_ipa.0, TTBR_SIZE
-                        )
-                    })?
-                    .as_ptr() as *mut page_table::TranslationTableLevel2_16k;
-
-            let table =
-                unsafe { &mut *page_table_ptr as &mut page_table::TranslationTableLevel2_16k };
-            table
-                .setup_l2(page_table_guest_ipa)
-                .context("error setting up L2 tables")?;
-        }
-        Ok(())
     }
 
     unsafe fn get_translation_table_for_va_ptr(
@@ -1553,10 +1516,6 @@ bitflags! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn test_page_size_16k() {
-        assert_eq!(get_page_size(), 16384)
-    }
 
     #[test]
     fn test_align_down_to_page_size() {
