@@ -1193,144 +1193,158 @@ impl VCpu {
 
         // self.enable_soft_debug()?;
 
-        loop {
-            assert_hv_return_t_ok(unsafe { bindgen::hv_vcpu_run(self.id) }, "hv_vcpu_run")?;
+        let run = |vcpu: &mut VCpu| {
+            loop {
+                assert_hv_return_t_ok(unsafe { bindgen::hv_vcpu_run(vcpu.id) }, "hv_vcpu_run")?;
 
-            let exit_t = self.exit_t();
-            if exit_t.reason != HvExitReason::HV_EXIT_REASON_EXCEPTION {
-                self.dump_all_registers()?;
-                panic!("unexpected exit reason {:?}", exit_t.reason);
-            }
+                let exit_t = vcpu.exit_t();
+                if exit_t.reason != HvExitReason::HV_EXIT_REASON_EXCEPTION {
+                    vcpu.dump_all_registers()?;
+                    panic!("unexpected exit reason {:?}", exit_t.reason);
+                }
 
-            match exit_t.reason {
-                HvExitReason::HV_EXIT_REASON_EXCEPTION => {}
-                other => bail!("unsupported HvExitReason {:?}", other),
-            };
+                match exit_t.reason {
+                    HvExitReason::HV_EXIT_REASON_EXCEPTION => {}
+                    other => bail!("unsupported HvExitReason {:?}", other),
+                };
 
-            assert_eq!(exit_t.reason, HvExitReason::HV_EXIT_REASON_EXCEPTION);
-            match exit_t.decoded_syndrome.exception_class {
-                EXC_HVC => {
-                    let iss = exit_t.decoded_syndrome.iss as u16;
-                    const NOOP: u8 = 0;
-                    const HALT: u8 = 1;
-                    const PANIC: u8 = 4;
-                    const EXCEPTION: u8 = 5;
-                    const SYNCHRONOUS_EXCEPTION: u8 = 6;
-                    const PRINT_STRING: u8 = 7;
-                    const IRQ: u8 = 8;
+                assert_eq!(exit_t.reason, HvExitReason::HV_EXIT_REASON_EXCEPTION);
+                match exit_t.decoded_syndrome.exception_class {
+                    EXC_HVC => {
+                        let iss = exit_t.decoded_syndrome.iss as u16;
+                        const NOOP: u8 = 0;
+                        const HALT: u8 = 1;
+                        const PANIC: u8 = 4;
+                        const EXCEPTION: u8 = 5;
+                        const SYNCHRONOUS_EXCEPTION: u8 = 6;
+                        const PRINT_STRING: u8 = 7;
+                        const IRQ: u8 = 8;
 
-                    trace!("received HVC event {}", iss);
-                    match iss as u8 {
-                        NOOP => {
-                            debug!("NOOP HVC received");
-                        }
-                        HALT => {
-                            info!("halt received");
-                            self.dump_all_registers()?;
-                            return Ok(());
-                        }
-                        PANIC => {
-                            self.dump_all_registers()?;
-                            bail!("guest panicked");
-                        }
-                        EXCEPTION | SYNCHRONOUS_EXCEPTION | IRQ => {
-                            let mut name = match iss as u8 {
-                                EXCEPTION => "unknown",
-                                SYNCHRONOUS_EXCEPTION => "synchronous",
-                                IRQ => "IRQ",
-                                _ => unreachable!(),
-                            };
-                            let el1_syndrome = Syndrome::from(
-                                self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ESR_EL1)?,
-                            );
-
-                            match el1_syndrome.exception_class {
-                                EXC_DATA_ABORT_SAME => {
-                                    self.debug_data_abort(el1_syndrome.iss)?;
-                                    name = "data abort";
-                                }
-                                EXC_SOFT_STEP_SAME | EXC_BREAKPOINT_SAME => {
-                                    let instruction_address =
-                                        self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ELR_EL1)?;
-                                    trace!(
-                                        "Debug exception, address {:#x?}, continuing",
-                                        instruction_address
-                                    );
-                                    let spsr_el1 = self
-                                        .get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1)?;
-                                    // Set pstate.SS to 1, so that it actually executes the next instruction.
-                                    self.set_sys_reg(
-                                        bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
-                                        spsr_el1 | (1 << 21),
-                                        "SPSR_EL1",
-                                    )?;
-                                    continue;
-                                }
-                                _ => {
-                                    error!(
-                                        "exception class unknown. Full syndrome: {:#x?}",
-                                        el1_syndrome
-                                    );
-                                }
+                        trace!("received HVC event {}", iss);
+                        match iss as u8 {
+                            NOOP => {
+                                debug!("NOOP HVC received");
                             }
-                            self.dump_all_registers()?;
-                            self.print_stack()?;
-                            bail!("HVC EL1 -> EL1 exception: {}", name);
-                        }
-                        PRINT_STRING => {
-                            let addr = self.get_reg(bindgen::hv_reg_t_HV_REG_X0)?;
-                            let len = self.get_reg(bindgen::hv_reg_t_HV_REG_X1)?;
-
-                            let slice = unsafe {
-                                self.memory_manager
-                                    .get_memory_slice(GuestVaAddress(addr), len as usize)
+                            HALT => {
+                                info!("halt received");
+                                vcpu.dump_all_registers()?;
+                                return Ok(());
                             }
-                            .with_context(|| {
-                                format!("error getting guest memory, address {:#x?}", addr)
-                            })
-                            .context("error processing PRINT_STRING hvc event")?;
-                            let value = core::str::from_utf8(slice).context(
-                                "error converting string from PRINT_STRING event to UTF-8",
-                            )?;
-                            print!("{}", value);
-                        }
-                        other => {
-                            bail!("unsupported HVC value {:x}", other);
+                            PANIC => {
+                                vcpu.dump_all_registers()?;
+                                bail!("guest panicked");
+                            }
+                            EXCEPTION | SYNCHRONOUS_EXCEPTION | IRQ => {
+                                let mut name = match iss as u8 {
+                                    EXCEPTION => "unknown",
+                                    SYNCHRONOUS_EXCEPTION => "synchronous",
+                                    IRQ => "IRQ",
+                                    _ => unreachable!(),
+                                };
+                                let el1_syndrome = Syndrome::from(
+                                    vcpu.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ESR_EL1)?,
+                                );
+
+                                match el1_syndrome.exception_class {
+                                    EXC_DATA_ABORT_SAME => {
+                                        vcpu.debug_data_abort(el1_syndrome.iss)?;
+                                        name = "data abort";
+                                    }
+                                    EXC_SOFT_STEP_SAME | EXC_BREAKPOINT_SAME => {
+                                        let instruction_address = vcpu.get_sys_reg(
+                                            bindgen::hv_sys_reg_t_HV_SYS_REG_ELR_EL1,
+                                        )?;
+                                        trace!(
+                                            "Debug exception, address {:#x?}, continuing",
+                                            instruction_address
+                                        );
+                                        let spsr_el1 = vcpu.get_sys_reg(
+                                            bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
+                                        )?;
+                                        // Set pstate.SS to 1, so that it actually executes the next instruction.
+                                        vcpu.set_sys_reg(
+                                            bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
+                                            spsr_el1 | (1 << 21),
+                                            "SPSR_EL1",
+                                        )?;
+                                        continue;
+                                    }
+                                    _ => {
+                                        error!(
+                                            "exception class unknown. Full syndrome: {:#x?}",
+                                            el1_syndrome
+                                        );
+                                    }
+                                }
+                                vcpu.dump_all_registers()?;
+                                vcpu.print_stack()?;
+                                bail!("HVC EL1 -> EL1 exception: {}", name);
+                            }
+                            PRINT_STRING => {
+                                let addr = vcpu.get_reg(bindgen::hv_reg_t_HV_REG_X0)?;
+                                let len = vcpu.get_reg(bindgen::hv_reg_t_HV_REG_X1)?;
+
+                                let slice = unsafe {
+                                    vcpu.memory_manager
+                                        .get_memory_slice(GuestVaAddress(addr), len as usize)
+                                }
+                                .with_context(|| {
+                                    format!("error getting guest memory, address {:#x?}", addr)
+                                })
+                                .context("error processing PRINT_STRING hvc event")?;
+                                let value = core::str::from_utf8(slice).context(
+                                    "error converting string from PRINT_STRING event to UTF-8",
+                                )?;
+                                print!("{}", value);
+                            }
+                            other => {
+                                bail!("unsupported HVC value {:x}", other);
+                            }
                         }
                     }
+                    EXC_INSTR_ABORT_LOWER => {
+                        error!("instruction abort");
+                        vcpu.dump_all_registers()?;
+                        vcpu.print_stack()?;
+                        error!("{:#x?}", vcpu.exit_t());
+                        bail!("instruction abort");
+                    }
+                    EXC_SOFT_STEP_LOWER => {
+                        let instruction_ipa = exit_t.exception.virtual_address;
+                        trace!(
+                            "Debug exception, IPA address {:#x?}, continuing",
+                            instruction_ipa
+                        );
+                        let spsr_el1 =
+                            vcpu.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1)?;
+                        // Set pstate.SS to 1, so that it actually executes the next instruction.
+                        vcpu.set_sys_reg(
+                            bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
+                            spsr_el1 | (1 << 21),
+                            "SPSR_EL1",
+                        )?;
+                        continue;
+                    }
+                    EXC_DATA_ABORT_LOWER => {
+                        vcpu.debug_data_abort(vcpu.exit_t().decoded_syndrome.iss)?;
+                        bail!("data abort EL1 -> EL2");
+                    }
+                    _ => {
+                        bail!(
+                            "unsupported exception class {:#x?}",
+                            exit_t.decoded_syndrome
+                        )
+                    }
                 }
-                EXC_INSTR_ABORT_LOWER => {
-                    error!("instruction abort");
-                    self.dump_all_registers()?;
-                    self.print_stack()?;
-                    error!("{:#x?}", self.exit_t());
-                    bail!("instruction abort");
-                }
-                EXC_SOFT_STEP_LOWER => {
-                    let instruction_ipa = exit_t.exception.virtual_address;
-                    trace!(
-                        "Debug exception, IPA address {:#x?}, continuing",
-                        instruction_ipa
-                    );
-                    let spsr_el1 = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1)?;
-                    // Set pstate.SS to 1, so that it actually executes the next instruction.
-                    self.set_sys_reg(
-                        bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
-                        spsr_el1 | (1 << 21),
-                        "SPSR_EL1",
-                    )?;
-                    continue;
-                }
-                EXC_DATA_ABORT_LOWER => {
-                    self.debug_data_abort(self.exit_t().decoded_syndrome.iss)?;
-                    bail!("data abort EL1 -> EL2");
-                }
-                _ => {
-                    bail!(
-                        "unsupported exception class {:#x?}",
-                        exit_t.decoded_syndrome
-                    )
-                }
+            }
+        };
+
+        match run(&mut self) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                error!("error running vcpu: {}. Dumping all registers.", &err);
+                self.dump_all_registers()?;
+                Err(err)
             }
         }
     }
