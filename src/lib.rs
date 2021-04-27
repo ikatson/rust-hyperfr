@@ -1,50 +1,23 @@
+use aarch64_debug::{DataAbortFlags, Syndrome};
 use anyhow::{anyhow, bail, Context};
-use bindgen::{hv_exit_reason_t, NSObject};
-use bitflags::bitflags;
+use bindgen_util::null_obj;
+pub use bindgen_util::{HfVcpuExit, HvExitReason, HvMemoryFlags};
 use std::sync::Arc;
-use std::{
-    convert::{TryFrom, TryInto},
-    path::Path,
-    thread::JoinHandle,
-};
-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
+use std::{convert::TryFrom, path::Path, thread::JoinHandle};
+use vm_memory::{GuestMemory, GuestMemoryMmap};
 
 use log::{debug, error, info, trace};
 
+pub mod addresses;
 pub mod aligner;
-
-#[derive(Copy, Clone, Debug)]
-pub struct GuestIpaAddress(u64);
-impl GuestIpaAddress {
-    const fn add(&self, offset: Offset) -> GuestIpaAddress {
-        GuestIpaAddress(self.0 + offset.0)
-    }
-    const fn as_guest_address(&self) -> GuestAddress {
-        GuestAddress(self.0)
-    }
-}
-
-#[derive(Copy, Clone, Default, Debug)]
-pub struct GuestVaAddress(u64);
-impl GuestVaAddress {
-    const fn add(&self, offset: Offset) -> GuestVaAddress {
-        GuestVaAddress(self.0 + offset.0)
-    }
-
-    fn checked_sub(&self, offset: Offset) -> Option<GuestVaAddress> {
-        self.0.checked_sub(offset.0).map(GuestVaAddress)
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-pub struct Offset(u64);
-impl Offset {
-    const fn add(&self, offset: Offset) -> Offset {
-        Offset(self.0 + offset.0)
-    }
-}
-
+mod bindgen_util;
+pub mod layout;
 pub mod page_table;
+
+pub mod aarch64_debug;
+
+use addresses::{GuestIpaAddress, GuestVaAddress, Offset};
+use layout::*;
 
 pub(crate) fn is_aligned_to_page_size(value: u64) -> bool {
     aligner::ALIGNER_16K.is_aligned(value)
@@ -68,10 +41,6 @@ pub fn align_up_to_page_size(value: u64) -> u64 {
     clippy::all
 )]
 pub mod bindgen;
-
-pub const fn null_obj() -> NSObject {
-    NSObject(core::ptr::null_mut() as *mut _)
-}
 
 #[derive(Debug)]
 #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
@@ -130,50 +99,6 @@ pub struct HfVm {
 pub struct LoadedElf {
     pub entrypoint: GuestVaAddress,
 }
-
-// Memory structure:
-// VA_START - the virtual memory of the kernel so that it's in TTBR1.
-// At that address we load the kernel itself, including exception vector table.
-// VA_START + 1GB = DRAM
-
-pub const VA_PAGE: u64 = 1 << 14;
-
-pub const DRAM_IPA_START: GuestIpaAddress = GuestIpaAddress(0x80_0000);
-pub const VA_START: GuestVaAddress = GuestVaAddress(0xffff_fff0_0000_0000);
-pub const DRAM_VA_START: GuestVaAddress = VA_START.add(Offset(DRAM_IPA_START.0));
-
-pub const KERNEL_BINARY_MEMORY_MAX_SIZE: u64 = 8 * 1024 * 1024; // 8 Mib
-
-pub const DRAM_KERNEL_BINARY_OFFSET: Offset = Offset(0);
-
-pub const DRAM_TTBR_OFFSET: Offset = DRAM_KERNEL_BINARY_OFFSET
-    .add(Offset(KERNEL_BINARY_MEMORY_MAX_SIZE))
-    .add(Offset(VA_PAGE));
-
-pub const TTBR_SIZE: usize = core::mem::size_of::<page_table::TranslationTableLevel2_16k>();
-
-pub const DRAM_KERNEL_USABLE_DRAM_OFFSET: Offset = DRAM_TTBR_OFFSET
-    .add(Offset(TTBR_SIZE as u64 * 2))
-    .add(Offset(VA_PAGE));
-
-// this could be configurable, it's just that we don't care yet.
-// This is 32 MiB, we just don't need more.
-pub const MEMORY_SIZE: usize = 128 * 1024 * 1024;
-
-pub const STACK_SIZE: u64 = 1024 * 1024;
-pub const STACK_END: GuestVaAddress = DRAM_VA_START.add(Offset(MEMORY_SIZE as u64));
-
-pub const TXSZ: u64 = 28;
-pub const VA_REGION_SIZE: u64 = 1 << (64 - TXSZ); // The region size for virtual addresses.
-pub const IPS_SIZE: u64 = 1 << 36; // 64 GB address size
-
-pub const TCR_EL1_TG0_GRANULE: u64 = 0b10 << 14;
-pub const TCR_EL1_TG1_GRANULE: u64 = 0b01 << 30;
-pub const TCR_EL1_IPS: u64 = 0b001 << 32; // 64 GB
-pub const TCR_EL1_T0SZ: u64 = TXSZ; // so that 36 bits remains.
-pub const TCR_EL1_T1SZ: u64 = TXSZ << 16;
-pub const TCR_EL1_HA: u64 = 1 << 39;
-pub const TCR_EL1_HD: u64 = 1 << 40;
 
 fn assert_hv_return_t_ok(v: bindgen::hv_return_t, name: &str) -> anyhow::Result<()> {
     let ret = HVReturnT::try_from(v).map_err(|e| {
@@ -633,170 +558,12 @@ pub struct VCpu {
     next_breakpoint: u16,
 }
 
-#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
-#[derive(Debug, PartialEq, Eq)]
-pub enum HvExitReason {
-    HV_EXIT_REASON_CANCELED,
-    HV_EXIT_REASON_EXCEPTION,
-    HV_EXIT_REASON_VTIMER_ACTIVATED,
-    HV_EXIT_REASON_UNKNOWN,
-}
-
-impl TryFrom<bindgen::hv_exit_reason_t> for HvExitReason {
-    type Error = hv_exit_reason_t;
-
-    fn try_from(value: bindgen::hv_exit_reason_t) -> Result<Self, Self::Error> {
-        use HvExitReason::*;
-        let ok = match value {
-            bindgen::hv_exit_reason_t_HV_EXIT_REASON_CANCELED => HV_EXIT_REASON_CANCELED,
-            bindgen::hv_exit_reason_t_HV_EXIT_REASON_EXCEPTION => HV_EXIT_REASON_EXCEPTION,
-            bindgen::hv_exit_reason_t_HV_EXIT_REASON_VTIMER_ACTIVATED => {
-                HV_EXIT_REASON_VTIMER_ACTIVATED
-            }
-            bindgen::hv_exit_reason_t_HV_EXIT_REASON_UNKNOWN => HV_EXIT_REASON_UNKNOWN,
-            v => return Err(v),
-        };
-        Ok(ok)
-    }
-}
-
-#[derive(Debug)]
-pub struct HfVcpuExit {
-    pub reason: HvExitReason,
-    pub exception: bindgen::hv_vcpu_exit_exception_t,
-    pub decoded_syndrome: Syndrome,
-}
-
-impl From<&bindgen::hv_vcpu_exit_t> for HfVcpuExit {
-    fn from(v: &bindgen::hv_vcpu_exit_t) -> Self {
-        Self {
-            reason: v.reason.try_into().unwrap(),
-            exception: v.exception,
-            decoded_syndrome: Syndrome::from(v.exception.syndrome),
-        }
-    }
-}
-
 #[derive(Copy, Clone, Debug)]
 struct VcpuStartState {
     guest_pc: GuestVaAddress,
     guest_vbar_el1: GuestVaAddress,
     ttbr0: GuestIpaAddress,
     ttbr1: GuestIpaAddress,
-}
-
-struct DataAbortFlags(pub u32);
-
-impl DataAbortFlags {
-    fn is_valid(&self) -> bool {
-        ((self.0 >> 24) & 1) == 1
-    }
-    fn sas(&self) -> Option<u8> {
-        if self.is_valid() {
-            Some(((self.0 >> 22) & 0b11) as u8)
-        } else {
-            None
-        }
-    }
-    fn sas_len(&self) -> Option<u8> {
-        self.sas().map(|sas| 1 << sas)
-    }
-    fn sse(&self) -> Option<bool> {
-        if self.is_valid() {
-            Some(((self.0 >> 21) & 1) == 1)
-        } else {
-            None
-        }
-    }
-    fn srt(&self) -> Option<u8> {
-        if self.is_valid() {
-            Some(((self.0 >> 16) & 31) as u8)
-        } else {
-            None
-        }
-    }
-    fn sf(&self) -> Option<bool> {
-        if self.is_valid() {
-            Some(((self.0 >> 15) & 1) == 1)
-        } else {
-            None
-        }
-    }
-    fn af(&self) -> Option<bool> {
-        if self.is_valid() {
-            Some(((self.0 >> 15) & 1) == 1)
-        } else {
-            None
-        }
-    }
-
-    fn is_write(&self) -> bool {
-        ((self.0 >> 6) & 1) == 1
-    }
-
-    fn far_is_valid(&self) -> bool {
-        ((self.0 >> 10) & 1) == 0
-    }
-
-    fn dfsc(&self) -> u8 {
-        (self.0 & 0b11111) as u8
-    }
-
-    fn dfsc_desc(&self) -> &'static str {
-        match self.dfsc() {
-            0b000000 => {
-                "Address size fault, level 0 of translation or translation table base register."
-            }
-            0b000001 => "Address size fault, level 1",
-            0b000010 => "Address size fault, level 2",
-            0b000011 => "Address size fault, level 3",
-            0b000100 => "Translation fault, level 0",
-            0b000101 => "Translation fault, level 1",
-            0b000110 => "Translation fault, level 2",
-            0b000111 => "Translation fault, level 3",
-            0b001001 => "Access flag fault, level 1",
-            0b001010 => "Access flag fault, level 2",
-            0b001011 => "Access flag fault, level 3",
-            0b001000 => "Access flag fault, level 0",
-            0b001100 => "Permission fault, level 0",
-            0b001101 => "Permission fault, level 1",
-            0b001110 => "Permission fault, level 2",
-            0b001111 => "Permission fault, level 3",
-            _ => "unknown",
-        }
-    }
-}
-
-impl core::fmt::Debug for DataAbortFlags {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut ds = f.debug_struct("DataAbortFlags");
-
-        ds.field("ISV (is_valid)", &self.is_valid());
-        if let (Some(sas), Some(length), Some(sse), Some(srt), Some(sf), Some(af)) = (
-            self.sas(),
-            self.sas_len(),
-            self.sse(),
-            self.srt(),
-            self.sf(),
-            self.af(),
-        ) {
-            ds.field("sas", &sas)
-                .field("sas_length()", &length)
-                .field("sse", &sse)
-                .field("srt", &srt)
-                .field("register()", &format_args!("X{}", srt))
-                .field("sf", &sf)
-                .field("af", &af);
-        };
-        if self.dfsc() == 0b010000 {
-            ds.field("far_is_valid", &self.far_is_valid());
-        };
-
-        ds.field("is_write", &self.is_write())
-            .field("dfsc", &format_args!("{:#b}", self.dfsc()))
-            .field("dfsc_description()", &self.dfsc_desc())
-            .finish()
-    }
 }
 
 #[repr(C)]
@@ -1193,148 +960,146 @@ impl VCpu {
 
         // self.enable_soft_debug()?;
 
-        let run = |vcpu: &mut VCpu| {
-            loop {
-                assert_hv_return_t_ok(unsafe { bindgen::hv_vcpu_run(vcpu.id) }, "hv_vcpu_run")?;
+        let run = |vcpu: &mut VCpu| loop {
+            assert_hv_return_t_ok(unsafe { bindgen::hv_vcpu_run(vcpu.id) }, "hv_vcpu_run")?;
 
-                let exit_t = vcpu.exit_t();
-                if exit_t.reason != HvExitReason::HV_EXIT_REASON_EXCEPTION {
-                    vcpu.dump_all_registers()?;
-                    panic!("unexpected exit reason {:?}", exit_t.reason);
-                }
+            let exit_t = vcpu.exit_t();
+            if exit_t.reason != HvExitReason::HV_EXIT_REASON_EXCEPTION {
+                vcpu.dump_all_registers()?;
+                panic!("unexpected exit reason {:?}", exit_t.reason);
+            }
 
-                match exit_t.reason {
-                    HvExitReason::HV_EXIT_REASON_EXCEPTION => {}
-                    other => bail!("unsupported HvExitReason {:?}", other),
-                };
+            match exit_t.reason {
+                HvExitReason::HV_EXIT_REASON_EXCEPTION => {}
+                other => bail!("unsupported HvExitReason {:?}", other),
+            };
 
-                assert_eq!(exit_t.reason, HvExitReason::HV_EXIT_REASON_EXCEPTION);
-                match exit_t.decoded_syndrome.exception_class {
-                    EXC_HVC => {
-                        let iss = exit_t.decoded_syndrome.iss as u16;
-                        const NOOP: u8 = 0;
-                        const HALT: u8 = 1;
-                        const PANIC: u8 = 4;
-                        const EXCEPTION: u8 = 5;
-                        const SYNCHRONOUS_EXCEPTION: u8 = 6;
-                        const PRINT_STRING: u8 = 7;
-                        const IRQ: u8 = 8;
+            assert_eq!(exit_t.reason, HvExitReason::HV_EXIT_REASON_EXCEPTION);
 
-                        trace!("received HVC event {}", iss);
-                        match iss as u8 {
-                            NOOP => {
-                                debug!("NOOP HVC received");
-                            }
-                            HALT => {
-                                info!("halt received");
-                                vcpu.dump_all_registers()?;
-                                return Ok(());
-                            }
-                            PANIC => {
-                                vcpu.dump_all_registers()?;
-                                bail!("guest panicked");
-                            }
-                            EXCEPTION | SYNCHRONOUS_EXCEPTION | IRQ => {
-                                let mut name = match iss as u8 {
-                                    EXCEPTION => "unknown",
-                                    SYNCHRONOUS_EXCEPTION => "synchronous",
-                                    IRQ => "IRQ",
-                                    _ => unreachable!(),
-                                };
-                                let el1_syndrome = Syndrome::from(
-                                    vcpu.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ESR_EL1)?,
-                                );
+            use aarch64_debug as ad;
 
-                                match el1_syndrome.exception_class {
-                                    EXC_DATA_ABORT_SAME => {
-                                        vcpu.debug_data_abort(el1_syndrome.iss)?;
-                                        name = "data abort";
-                                    }
-                                    EXC_SOFT_STEP_SAME | EXC_BREAKPOINT_SAME => {
-                                        let instruction_address = vcpu.get_sys_reg(
-                                            bindgen::hv_sys_reg_t_HV_SYS_REG_ELR_EL1,
-                                        )?;
-                                        trace!(
-                                            "Debug exception, address {:#x?}, continuing",
-                                            instruction_address
-                                        );
-                                        let spsr_el1 = vcpu.get_sys_reg(
-                                            bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
-                                        )?;
-                                        // Set pstate.SS to 1, so that it actually executes the next instruction.
-                                        vcpu.set_sys_reg(
-                                            bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
-                                            spsr_el1 | (1 << 21),
-                                            "SPSR_EL1",
-                                        )?;
-                                        continue;
-                                    }
-                                    _ => {
-                                        error!(
-                                            "exception class unknown. Full syndrome: {:#x?}",
-                                            el1_syndrome
-                                        );
-                                    }
+            match exit_t.decoded_syndrome.exception_class {
+                ad::EXC_HVC => {
+                    let iss = exit_t.decoded_syndrome.iss as u16;
+                    const NOOP: u8 = 0;
+                    const HALT: u8 = 1;
+                    const PANIC: u8 = 4;
+                    const EXCEPTION: u8 = 5;
+                    const SYNCHRONOUS_EXCEPTION: u8 = 6;
+                    const PRINT_STRING: u8 = 7;
+                    const IRQ: u8 = 8;
+
+                    trace!("received HVC event {}", iss);
+                    match iss as u8 {
+                        NOOP => {
+                            debug!("NOOP HVC received");
+                        }
+                        HALT => {
+                            info!("halt received");
+                            vcpu.dump_all_registers()?;
+                            return Ok(());
+                        }
+                        PANIC => {
+                            vcpu.dump_all_registers()?;
+                            bail!("guest panicked");
+                        }
+                        EXCEPTION | SYNCHRONOUS_EXCEPTION | IRQ => {
+                            let mut name = match iss as u8 {
+                                EXCEPTION => "unknown",
+                                SYNCHRONOUS_EXCEPTION => "synchronous",
+                                IRQ => "IRQ",
+                                _ => unreachable!(),
+                            };
+                            let el1_syndrome = Syndrome::from(
+                                vcpu.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ESR_EL1)?,
+                            );
+
+                            match el1_syndrome.exception_class {
+                                ad::EXC_DATA_ABORT_SAME => {
+                                    vcpu.debug_data_abort(el1_syndrome.iss)?;
+                                    name = "data abort";
                                 }
-                                vcpu.dump_all_registers()?;
-                                vcpu.print_stack()?;
-                                bail!("HVC EL1 -> EL1 exception: {}", name);
-                            }
-                            PRINT_STRING => {
-                                let addr = vcpu.get_reg(bindgen::hv_reg_t_HV_REG_X0)?;
-                                let len = vcpu.get_reg(bindgen::hv_reg_t_HV_REG_X1)?;
-
-                                let slice = unsafe {
-                                    vcpu.memory_manager
-                                        .get_memory_slice(GuestVaAddress(addr), len as usize)
+                                ad::EXC_SOFT_STEP_SAME | ad::EXC_BREAKPOINT_SAME => {
+                                    let instruction_address =
+                                        vcpu.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ELR_EL1)?;
+                                    trace!(
+                                        "Debug exception, address {:#x?}, continuing",
+                                        instruction_address
+                                    );
+                                    let spsr_el1 = vcpu
+                                        .get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1)?;
+                                    // Set pstate.SS to 1, so that it actually executes the next instruction.
+                                    vcpu.set_sys_reg(
+                                        bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
+                                        spsr_el1 | (1 << 21),
+                                        "SPSR_EL1",
+                                    )?;
+                                    continue;
                                 }
-                                .with_context(|| {
-                                    format!("error getting guest memory, address {:#x?}", addr)
-                                })
-                                .context("error processing PRINT_STRING hvc event")?;
-                                let value = core::str::from_utf8(slice).context(
-                                    "error converting string from PRINT_STRING event to UTF-8",
-                                )?;
-                                print!("{}", value);
+                                _ => {
+                                    error!(
+                                        "exception class unknown. Full syndrome: {:#x?}",
+                                        el1_syndrome
+                                    );
+                                }
                             }
-                            other => {
-                                bail!("unsupported HVC value {:x}", other);
+                            vcpu.dump_all_registers()?;
+                            vcpu.print_stack()?;
+                            bail!("HVC EL1 -> EL1 exception: {}", name);
+                        }
+                        PRINT_STRING => {
+                            let addr = vcpu.get_reg(bindgen::hv_reg_t_HV_REG_X0)?;
+                            let len = vcpu.get_reg(bindgen::hv_reg_t_HV_REG_X1)?;
+
+                            let slice = unsafe {
+                                vcpu.memory_manager
+                                    .get_memory_slice(GuestVaAddress(addr), len as usize)
                             }
+                            .with_context(|| {
+                                format!("error getting guest memory, address {:#x?}", addr)
+                            })
+                            .context("error processing PRINT_STRING hvc event")?;
+                            let value = core::str::from_utf8(slice).context(
+                                "error converting string from PRINT_STRING event to UTF-8",
+                            )?;
+                            print!("{}", value);
+                        }
+                        other => {
+                            bail!("unsupported HVC value {:x}", other);
                         }
                     }
-                    EXC_INSTR_ABORT_LOWER => {
-                        error!("instruction abort");
-                        vcpu.dump_all_registers()?;
-                        vcpu.print_stack()?;
-                        error!("{:#x?}", vcpu.exit_t());
-                        bail!("instruction abort");
-                    }
-                    EXC_SOFT_STEP_LOWER => {
-                        let instruction_ipa = exit_t.exception.virtual_address;
-                        trace!(
-                            "Debug exception, IPA address {:#x?}, continuing",
-                            instruction_ipa
-                        );
-                        let spsr_el1 =
-                            vcpu.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1)?;
-                        // Set pstate.SS to 1, so that it actually executes the next instruction.
-                        vcpu.set_sys_reg(
-                            bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
-                            spsr_el1 | (1 << 21),
-                            "SPSR_EL1",
-                        )?;
-                        continue;
-                    }
-                    EXC_DATA_ABORT_LOWER => {
-                        vcpu.debug_data_abort(vcpu.exit_t().decoded_syndrome.iss)?;
-                        bail!("data abort EL1 -> EL2");
-                    }
-                    _ => {
-                        bail!(
-                            "unsupported exception class {:#x?}",
-                            exit_t.decoded_syndrome
-                        )
-                    }
+                }
+                ad::EXC_INSTR_ABORT_LOWER => {
+                    error!("instruction abort");
+                    vcpu.dump_all_registers()?;
+                    vcpu.print_stack()?;
+                    error!("{:#x?}", vcpu.exit_t());
+                    bail!("instruction abort");
+                }
+                ad::EXC_SOFT_STEP_LOWER => {
+                    let instruction_ipa = exit_t.exception.virtual_address;
+                    trace!(
+                        "Debug exception, IPA address {:#x?}, continuing",
+                        instruction_ipa
+                    );
+                    let spsr_el1 = vcpu.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1)?;
+                    // Set pstate.SS to 1, so that it actually executes the next instruction.
+                    vcpu.set_sys_reg(
+                        bindgen::hv_sys_reg_t_HV_SYS_REG_SPSR_EL1,
+                        spsr_el1 | (1 << 21),
+                        "SPSR_EL1",
+                    )?;
+                    continue;
+                }
+                ad::EXC_DATA_ABORT_LOWER => {
+                    vcpu.debug_data_abort(vcpu.exit_t().decoded_syndrome.iss)?;
+                    bail!("data abort EL1 -> EL2");
+                }
+                _ => {
+                    bail!(
+                        "unsupported exception class {:#x?}",
+                        exit_t.decoded_syndrome
+                    )
                 }
             }
         };
@@ -1456,141 +1221,6 @@ impl VCpu {
         //     "hv_vcpu_set_trap_debug_exceptions",
         // )?;
         Ok(())
-    }
-}
-
-pub struct Syndrome {
-    exception_class: u8,
-    iss: u32,
-    iss2: u8,
-    il_32_bit: bool,
-    original_value: u64,
-}
-
-const EXC_HVC: u8 = 0b010110;
-const EXC_INSTR_ABORT_LOWER: u8 = 0b100000;
-const EXC_INSTR_ABORT_SAME: u8 = 0b100001;
-const EXC_DATA_ABORT_LOWER: u8 = 0b100100;
-const EXC_DATA_ABORT_SAME: u8 = 0b100101;
-const EXC_BREAKPOINT_SAME: u8 = 0b110001;
-const EXC_BREAKPOINT_LOWER: u8 = 0b110000;
-const EXC_SOFT_STEP_SAME: u8 = 0b110011;
-const EXC_SOFT_STEP_LOWER: u8 = 0b110010;
-
-struct InstructionAbortFlags(u32);
-impl core::fmt::Debug for InstructionAbortFlags {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut ds = f.debug_struct("InstructionAbortFlags");
-
-        let ifsc = self.0 & 0b111111;
-        ds.field("ifsc (status code)", &ifsc);
-        let ifsc_desc = match ifsc {
-            0b000000 => {
-                "Address size fault, level 0 of translation or translation table base register"
-            }
-            0b000001 => "Address size fault, level 1",
-            0b000010 => "Address size fault, level 2",
-            0b000011 => "Address size fault, level 3",
-            0b000100 => "Translation fault, level 0",
-            0b000101 => "Translation fault, level 1",
-            0b000110 => "Translation fault, level 2",
-            0b000111 => "Translation fault, level 3",
-            0b001011 => "Access flag fault, level 3",
-            0b001101 => "Permission fault, level 1",
-            0b001110 => "Permission fault, level 2",
-            0b001111 => "Permission fault, level 3",
-            _ => "[OTHER, look at the docs]",
-        };
-        ds.field("IFSC description", &ifsc_desc);
-        if ifsc == 0b100000 {
-            let fnv = ((self.0 >> 10) & 1) == 1;
-            ds.field("fnv", &fnv);
-
-            let set = (self.0 >> 11) & 0b11;
-            let set = match set {
-                0b00 => "recoverable state",
-                0b10 => "uncontainable",
-                0b11 => "restartable state",
-                _ => "[RESERVED]",
-            };
-            ds.field("set", &set);
-        };
-        ds.finish()
-    }
-}
-
-impl Syndrome {
-    fn exc_class_name(&self) -> &'static str {
-        match self.exception_class {
-            EXC_HVC => "HVC",
-            EXC_INSTR_ABORT_LOWER => "Instruction abort (MMU) from lower EL",
-            EXC_INSTR_ABORT_SAME => "Instruction abort (MMU) fault from same EL",
-            EXC_DATA_ABORT_LOWER => "Data abort from a lower exception level",
-            EXC_DATA_ABORT_SAME => "Data abort from the same exception level",
-            EXC_SOFT_STEP_SAME => {
-                "Software Step exception taken without a change in Exception level"
-            }
-            EXC_SOFT_STEP_LOWER => "Software Step exception from a lower Exception level",
-            EXC_BREAKPOINT_LOWER => "Breakpoint exception from a lower Exception level",
-            EXC_BREAKPOINT_SAME => "Breakpoint exception taken without a change in Exception level",
-            _ => "unknown",
-        }
-    }
-    fn data_abort_flags(&self) -> Option<DataAbortFlags> {
-        match self.exception_class {
-            EXC_DATA_ABORT_LOWER | EXC_DATA_ABORT_SAME => Some(DataAbortFlags(self.iss)),
-            _ => None,
-        }
-    }
-    fn instruction_abort_flags(&self) -> Option<InstructionAbortFlags> {
-        match self.exception_class {
-            EXC_INSTR_ABORT_SAME | EXC_INSTR_ABORT_LOWER => Some(InstructionAbortFlags(self.iss)),
-            _ => None,
-        }
-    }
-}
-
-impl core::fmt::Debug for Syndrome {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut ds = f.debug_struct("Syndrome");
-        ds.field("exception_class", &self.exception_class)
-            .field("iss", &self.iss)
-            .field("iss2", &self.iss2)
-            .field("il32_bit", &self.il_32_bit)
-            .field("original_value", &self.original_value)
-            .field("exc_class_name()", &self.exc_class_name());
-        if let Some(flags) = self.data_abort_flags() {
-            ds.field("data_abort_flags()", &flags);
-        };
-        if let Some(flags) = self.instruction_abort_flags() {
-            ds.field("instruction_abort_flags()", &flags);
-        };
-        ds.finish()
-    }
-}
-
-impl From<u64> for Syndrome {
-    fn from(s: u64) -> Self {
-        let eclass = ((s >> 26) & 0b111111) as u8;
-        let iss = (s & ((1 << 25) - 1)) as u32;
-        let iss2 = ((s >> 32) & 31) as u8;
-        let il_32_bit = (s >> 25) & 1 > 0;
-        Self {
-            exception_class: eclass,
-            iss,
-            original_value: s,
-            il_32_bit,
-            iss2,
-        }
-    }
-}
-
-bitflags! {
-    pub struct HvMemoryFlags: u32 {
-        const HV_MEMORY_READ        = bindgen::HV_MEMORY_READ;
-        const HV_MEMORY_WRITE        = bindgen::HV_MEMORY_WRITE;
-        const HV_MEMORY_EXEC        = bindgen::HV_MEMORY_EXEC;
-        const ALL = Self::HV_MEMORY_READ.bits | Self::HV_MEMORY_WRITE.bits | Self::HV_MEMORY_EXEC.bits;
     }
 }
 

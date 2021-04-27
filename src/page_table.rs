@@ -265,7 +265,7 @@ impl TranslationTableLevel2_16k {
         const BLOCK_SIZE: u64 = 1 << 25;
         const BLOCK_SIZE_ALIGNER: Aligner = Aligner::new_from_mask(!((1 << 25) - 1));
 
-        'outer: loop {
+        loop {
             if size == 0 {
                 return Ok(());
             }

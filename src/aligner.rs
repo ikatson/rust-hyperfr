@@ -50,6 +50,7 @@ impl Aligner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn test_pow_of_2() {
         for bits in 1u64..63 {
@@ -70,17 +71,17 @@ mod tests {
 
     #[test]
     fn test_align_down_to_page_size() {
-        assert_eq!(ALIGNER_16k.align_down(16385), 16384)
+        assert_eq!(ALIGNER_16K.align_down(16385), 16384)
     }
 
     #[test]
     fn test_align_up_to_page_size() {
-        assert_eq!(ALIGNER_16k.align_up(16385), 16384 * 2)
+        assert_eq!(ALIGNER_16K.align_up(16385), 16384 * 2)
     }
 
     #[test]
     fn test_is_aligned_down_to_page_size() {
-        assert_eq!(ALIGNER_16k.is_aligned(0x0000000101408000), true);
-        assert_eq!(ALIGNER_16k.is_aligned(0x0000000103194000), true);
+        assert_eq!(ALIGNER_16K.is_aligned(0x0000000101408000), true);
+        assert_eq!(ALIGNER_16K.is_aligned(0x0000000103194000), true);
     }
 }
