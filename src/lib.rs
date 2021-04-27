@@ -1,35 +1,23 @@
 use aarch64_debug::{DataAbortFlags, Syndrome};
 use anyhow::{anyhow, bail, Context};
-use bindgen_util::null_obj;
+use bindgen_util::{assert_hv_return_t_ok, null_obj};
 pub use bindgen_util::{HfVcpuExit, HvExitReason, HvMemoryFlags};
 use std::sync::Arc;
-use std::{convert::TryFrom, path::Path, thread::JoinHandle};
+use std::thread::JoinHandle;
 use vm_memory::{GuestMemory, GuestMemoryMmap};
 
 use log::{debug, error, info, trace};
 
+pub mod aarch64_debug;
 pub mod addresses;
 pub mod aligner;
 mod bindgen_util;
+mod elf_loading;
 pub mod layout;
 pub mod page_table;
 
-pub mod aarch64_debug;
-
 use addresses::{GuestIpaAddress, GuestVaAddress, Offset};
 use layout::*;
-
-pub(crate) fn is_aligned_to_page_size(value: u64) -> bool {
-    aligner::ALIGNER_16K.is_aligned(value)
-}
-
-pub(crate) fn align_down_to_page_size(value: u64) -> u64 {
-    aligner::ALIGNER_16K.align_down(value)
-}
-
-pub fn align_up_to_page_size(value: u64) -> u64 {
-    aligner::ALIGNER_16K.align_up(value)
-}
 
 #[allow(
     dead_code,
@@ -41,42 +29,6 @@ pub fn align_up_to_page_size(value: u64) -> u64 {
     clippy::all
 )]
 pub mod bindgen;
-
-#[derive(Debug)]
-#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
-pub enum HVReturnT {
-    HV_SUCCESS,
-    HV_ERROR,
-    HV_BUSY,
-    HV_BAD_ARGUMENT,
-    HV_ILLEGAL_GUEST_STATE,
-    HV_NO_RESOURCES,
-    HV_NO_DEVICE,
-    HV_DENIED,
-    HV_UNSUPPORTED,
-}
-
-impl TryFrom<bindgen::hv_return_t> for HVReturnT {
-    type Error = bindgen::hv_return_t;
-
-    fn try_from(value: bindgen::hv_return_t) -> Result<Self, Self::Error> {
-        use bindgen as b;
-        use HVReturnT::*;
-        let ret = match value {
-            b::HV_SUCCESS => HV_SUCCESS,
-            b::HV_ERROR => HV_ERROR,
-            b::HV_BUSY => HV_BUSY,
-            b::HV_BAD_ARGUMENT => HV_BAD_ARGUMENT,
-            b::HV_ILLEGAL_GUEST_STATE => HV_ILLEGAL_GUEST_STATE,
-            b::HV_NO_RESOURCES => HV_NO_RESOURCES,
-            b::HV_NO_DEVICE => HV_NO_DEVICE,
-            b::HV_DENIED => HV_DENIED,
-            b::HV_UNSUPPORTED => HV_UNSUPPORTED,
-            ret => return Err(ret),
-        };
-        Ok(ret)
-    }
-}
 
 #[derive(Debug)]
 pub struct GuestMemoryManager {
@@ -93,25 +45,6 @@ pub struct HfVm {
     entrypoint: GuestVaAddress,
     vbar_el1: GuestVaAddress,
     memory_manager: Arc<GuestMemoryManager>,
-}
-
-#[derive(Default)]
-pub struct LoadedElf {
-    pub entrypoint: GuestVaAddress,
-}
-
-fn assert_hv_return_t_ok(v: bindgen::hv_return_t, name: &str) -> anyhow::Result<()> {
-    let ret = HVReturnT::try_from(v).map_err(|e| {
-        anyhow!(
-            "unexpected hv_return_t value {:#x} from {}",
-            e as usize,
-            name
-        )
-    })?;
-    match ret {
-        HVReturnT::HV_SUCCESS => Ok(()),
-        err => bail!("{}() returned {:?}", name, err),
-    }
 }
 
 impl GuestMemoryManager {
@@ -226,20 +159,6 @@ impl GuestMemoryManager {
     }
 }
 
-struct RelocationDebugInfo<'a> {
-    offset: u64,
-    rel: &'a object::Relocation,
-}
-
-impl<'a> core::fmt::Debug for RelocationDebugInfo<'a> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Relocation")
-            .field("offset", &format_args!("{:#x?}", self.offset))
-            .field("addend", &format_args!("{:#x?}", self.rel.addend()))
-            .finish()
-    }
-}
-
 impl HfVmBuilder {
     pub fn new() -> anyhow::Result<Self> {
         assert_hv_return_t_ok(unsafe { bindgen::hv_vm_create(null_obj()) }, "hv_vm_create")?;
@@ -274,13 +193,13 @@ impl HfVmBuilder {
         size: usize,
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
-        if !is_aligned_to_page_size(addr as u64) {
+        if !aligner::ALIGNER_16K.is_aligned(addr as u64) {
             bail!("addr {:#x} is not aligned to page size", addr as u64)
         }
-        if !is_aligned_to_page_size(ipa.0) {
+        if !aligner::ALIGNER_16K.is_aligned(ipa.0) {
             bail!("ipa {:#x} is not aligned to page size", ipa.0)
         }
-        if !is_aligned_to_page_size(size as u64) {
+        if !aligner::ALIGNER_16K.is_aligned(size as u64) {
             bail!("size {:#x} is not a multiple of page size", size)
         }
 
@@ -293,220 +212,6 @@ impl HfVmBuilder {
             unsafe { bindgen::hv_vm_map(addr as *mut _, ipa.0, size as u64, flags.bits() as u64) },
             "hv_vm_map",
         )
-    }
-
-    pub fn load_elf<P: AsRef<Path>>(&mut self, filename: P) -> anyhow::Result<LoadedElf> {
-        let file = std::fs::File::open(filename)?;
-        let map = unsafe { memmap::MmapOptions::default().map(&file) }
-            .context("error mmmapping ELF file")?;
-        let obj = object::read::File::parse(&map)?;
-        use object::{Object, ObjectSection, ObjectSegment};
-
-        struct SegmentState<'a, 'b> {
-            segment: object::Segment<'a, 'b>,
-            aligned_size: u64,
-            flags: HvMemoryFlags,
-            ipa: GuestIpaAddress,
-            va: GuestVaAddress,
-        }
-
-        let va_offset = DRAM_VA_START;
-
-        let mut segments = obj
-            .segments()
-            .scan(Offset(0), |mut_offset, segment| {
-                let start = segment.address();
-                let end = segment.address() + segment.size();
-                let aligned_start = align_down_to_page_size(start);
-                let aligned_end = align_up_to_page_size(end);
-                let aligned_size = aligned_end - aligned_start;
-
-                let offset = *mut_offset;
-                *mut_offset = mut_offset.add(Offset(aligned_size));
-                let ipa = DRAM_IPA_START.add(offset);
-                let va = va_offset.add(Offset(aligned_start));
-                Some(SegmentState {
-                    segment,
-                    aligned_size,
-                    ipa,
-                    va,
-                    flags: HvMemoryFlags::HV_MEMORY_READ,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        for section in obj.sections() {
-            use object::SectionKind::*;
-            match section.kind() {
-                Text | Data | UninitializedData | ReadOnlyData => {}
-                _ => continue,
-            };
-            if let Ok(segment_idx) = segments.binary_search_by(|seg| {
-                use std::cmp::Ordering as O;
-                if section.address() < seg.segment.address() {
-                    return O::Greater;
-                }
-                if section.address() > seg.segment.address() + seg.segment.size() {
-                    return O::Less;
-                }
-                O::Equal
-            }) {
-                let s = &mut segments[segment_idx];
-                use object::SectionKind::*;
-                // There's no API to get segment flags in object, at least I did not find it,
-                // so just figure it out by the sectons we care about.
-                match section.kind() {
-                    Text => s.flags |= HvMemoryFlags::HV_MEMORY_EXEC,
-                    Data | UninitializedData => s.flags |= HvMemoryFlags::HV_MEMORY_WRITE,
-                    _ => {}
-                };
-            }
-        }
-
-        for (idx, ss) in segments.iter().enumerate() {
-            macro_rules! _tt_msg {
-                () => {
-                    format_args!(
-                        "configuring translation tables for LOAD segment {}, address {:#x?}, size {}, aligned size {}, IPA {:#x?}, VA {:#x?}, flags: {:?}",
-                        idx,
-                        ss.segment.address(),
-                        ss.segment.size(),
-                        ss.aligned_size,
-                        ss.ipa.0,
-                        ss.va.0,
-                        ss.flags,
-                    );
-                }
-            }
-            debug!("{}", _tt_msg!());
-            self.memory_manager
-                .configure_page_tables(ss.ipa, ss.va, ss.aligned_size as usize, ss.flags)
-                .with_context(|| anyhow!("error {}", _tt_msg!()))?;
-        }
-
-        for section in obj.sections() {
-            let section_name = section.name().with_context(|| {
-                format!(
-                    "error determining section name at {:#x?}",
-                    section.address()
-                )
-            })?;
-            if let Ok(segment_idx) = segments.binary_search_by(|seg| {
-                use std::cmp::Ordering as O;
-                if section.address() < seg.segment.address() {
-                    return O::Greater;
-                }
-                if section.address() > seg.segment.address() + seg.segment.size() {
-                    return O::Less;
-                }
-                O::Equal
-            }) {
-                use object::SectionKind::*;
-                match section.kind() {
-                    Text | Data | UninitializedData | ReadOnlyData => {}
-                    _ => {
-                        debug!(
-                            "ignoring section with name \"{}\", address {:#x?}, kind: {:?}",
-                            section_name,
-                            section.address(),
-                            section.kind()
-                        );
-                        continue;
-                    }
-                };
-                let data = section.data().with_context(|| {
-                    format!("error getting section data for section {}", section_name)
-                })?;
-
-                let va = va_offset.add(Offset(section.address()));
-
-                let ipa = self.memory_manager.simulate_address_lookup(va)?.unwrap();
-                if !data.is_empty() {
-                    debug!(
-                        "loading section \"{}\" (segment {}), size {}, kind {:?} into memory at {:#x?}, ipa {:#x?}",
-                        section_name,
-                        segment_idx,
-                        section.size(),
-                        section.kind(),
-                        va.0,
-                        ipa.0,
-                    );
-                    let slice = self
-                        .memory_manager
-                        .memory
-                        .get_slice(ipa.as_guest_address(), section.size() as usize)
-                        .with_context(|| {
-                            format!(
-                                "error getting the slice of memory for section \"{}\"",
-                                section_name
-                            )
-                        })?;
-                    slice.copy_from(data);
-                }
-            } else {
-                trace!("ignoring section {}", section_name);
-            }
-        }
-        let entrypoint = va_offset.add(Offset(obj.entry()));
-        debug!("entrypoint is {:#x?}", entrypoint.0);
-        self.entrypoint = Some(entrypoint);
-
-        use object::ObjectSymbol;
-        for symbol in obj.symbols() {
-            if symbol.name().unwrap_or_default() == "exception_vector_table" {
-                self.vbar_el1 = Some(va_offset.add(Offset(symbol.address())));
-            }
-        }
-
-        if let Some(relocs) = obj.dynamic_relocations() {
-            for (offset, reloc) in relocs {
-                const R_AARCH64_RELATIVE: u32 = 1027;
-
-                match (reloc.kind(), reloc.target()) {
-                    (
-                        object::RelocationKind::Elf(R_AARCH64_RELATIVE),
-                        object::RelocationTarget::Absolute,
-                    ) => {
-                        let d = RelocationDebugInfo {
-                            offset,
-                            rel: &reloc,
-                        };
-                        let va = va_offset.add(Offset(offset));
-                        let mut relocation_mem = unsafe {
-                            self.memory_manager
-                                .get_memory_slice(va, core::mem::size_of::<u64>())
-                                .with_context(|| format!("error getting memory for {:?}", &d))?
-                        };
-                        let relocation_value = if reloc.addend() >= 0 {
-                            va_offset.add(Offset(reloc.addend() as u64))
-                        } else {
-                            bail!("relocation addend negative, not supported: {:?}", &d)
-                        };
-                        use byteorder::WriteBytesExt;
-
-                        relocation_mem
-                            .write_u64::<byteorder::LittleEndian>(relocation_value.0)
-                            .with_context(|| {
-                                format!(
-                                    "error writing value {:#x?} at VA {:#x?} for {:?}",
-                                    relocation_value.0, va.0, &d
-                                )
-                            })?;
-                        trace!(
-                            "wrote value {:#x?} at VA {:#x?} for {:?}",
-                            relocation_value.0,
-                            va.0,
-                            &d
-                        );
-                    }
-                    _ => {
-                        bail!("unsupported relocation offset {:#x?}, {:?}", offset, reloc)
-                    }
-                }
-            }
-        }
-
-        Ok(LoadedElf { entrypoint })
     }
 
     pub fn build(self) -> anyhow::Result<HfVm> {
@@ -1221,21 +926,5 @@ impl VCpu {
         //     "hv_vcpu_set_trap_debug_exceptions",
         // )?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_align_down_to_page_size() {
-        assert_eq!(align_down_to_page_size(16385), 16384)
-    }
-
-    #[test]
-    fn test_is_aligned_down_to_page_size() {
-        assert_eq!(is_aligned_to_page_size(0x0000000101408000), true);
-        assert_eq!(is_aligned_to_page_size(0x0000000103194000), true);
     }
 }

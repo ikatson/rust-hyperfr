@@ -2,6 +2,7 @@ use crate::{
     aarch64_debug::Syndrome,
     bindgen::{self, hv_exit_reason_t, NSObject},
 };
+use anyhow::{anyhow, bail};
 use bitflags::bitflags;
 use std::convert::{TryFrom, TryInto};
 
@@ -59,5 +60,55 @@ bitflags! {
         const HV_MEMORY_WRITE        = bindgen::HV_MEMORY_WRITE;
         const HV_MEMORY_EXEC        = bindgen::HV_MEMORY_EXEC;
         const ALL = Self::HV_MEMORY_READ.bits | Self::HV_MEMORY_WRITE.bits | Self::HV_MEMORY_EXEC.bits;
+    }
+}
+
+#[derive(Debug)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
+pub enum HVReturnT {
+    HV_SUCCESS,
+    HV_ERROR,
+    HV_BUSY,
+    HV_BAD_ARGUMENT,
+    HV_ILLEGAL_GUEST_STATE,
+    HV_NO_RESOURCES,
+    HV_NO_DEVICE,
+    HV_DENIED,
+    HV_UNSUPPORTED,
+}
+
+impl TryFrom<bindgen::hv_return_t> for HVReturnT {
+    type Error = bindgen::hv_return_t;
+
+    fn try_from(value: bindgen::hv_return_t) -> Result<Self, Self::Error> {
+        use bindgen as b;
+        use HVReturnT::*;
+        let ret = match value {
+            b::HV_SUCCESS => HV_SUCCESS,
+            b::HV_ERROR => HV_ERROR,
+            b::HV_BUSY => HV_BUSY,
+            b::HV_BAD_ARGUMENT => HV_BAD_ARGUMENT,
+            b::HV_ILLEGAL_GUEST_STATE => HV_ILLEGAL_GUEST_STATE,
+            b::HV_NO_RESOURCES => HV_NO_RESOURCES,
+            b::HV_NO_DEVICE => HV_NO_DEVICE,
+            b::HV_DENIED => HV_DENIED,
+            b::HV_UNSUPPORTED => HV_UNSUPPORTED,
+            ret => return Err(ret),
+        };
+        Ok(ret)
+    }
+}
+
+pub fn assert_hv_return_t_ok(v: bindgen::hv_return_t, name: &str) -> anyhow::Result<()> {
+    let ret = HVReturnT::try_from(v).map_err(|e| {
+        anyhow!(
+            "unexpected hv_return_t value {:#x} from {}",
+            e as usize,
+            name
+        )
+    })?;
+    match ret {
+        HVReturnT::HV_SUCCESS => Ok(()),
+        err => bail!("{}() returned {:?}", name, err),
     }
 }
