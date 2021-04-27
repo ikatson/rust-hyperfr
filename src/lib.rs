@@ -223,13 +223,17 @@ impl GuestMemoryManager {
         self.get_ttbr_0_dram_offset().add(Offset(TTBR_SIZE as u64))
     }
 
-    unsafe fn get_memory_slice(&self, va: GuestVaAddress, size: usize) -> anyhow::Result<&[u8]> {
+    unsafe fn get_memory_slice(
+        &self,
+        va: GuestVaAddress,
+        size: usize,
+    ) -> anyhow::Result<&mut [u8]> {
         let ipa = self
             .simulate_address_lookup(va)?
             .ok_or_else(|| anyhow!("cannot find address {:#x?} in translation tables", va.0))?;
         let vslice = self.memory.get_slice(ipa.as_guest_address(), size)?;
         let ptr = vslice.as_ptr();
-        Ok(core::slice::from_raw_parts(ptr, size))
+        Ok(core::slice::from_raw_parts_mut(ptr, size))
     }
 
     unsafe fn get_translation_table_for_va_ptr(
@@ -294,6 +298,20 @@ impl GuestMemoryManager {
             .setup(table_ipa, va, ipa, size, flags)
             .context("error configuring the Level 2 translation table")?;
         Ok(())
+    }
+}
+
+struct RelocationDebugInfo<'a> {
+    offset: u64,
+    rel: &'a object::Relocation,
+}
+
+impl<'a> core::fmt::Debug for RelocationDebugInfo<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Relocation")
+            .field("offset", &format_args!("{:#x?}", self.offset))
+            .field("addend", &format_args!("{:#x?}", self.rel.addend()))
+            .finish()
     }
 }
 
@@ -367,6 +385,8 @@ impl HfVmBuilder {
             va: GuestVaAddress,
         }
 
+        let va_offset = DRAM_VA_START;
+
         let mut segments = obj
             .segments()
             .scan(Offset(0), |mut_offset, segment| {
@@ -379,7 +399,7 @@ impl HfVmBuilder {
                 let offset = *mut_offset;
                 *mut_offset = mut_offset.add(Offset(aligned_size));
                 let ipa = DRAM_IPA_START.add(offset);
-                let va = GuestVaAddress(aligned_start);
+                let va = va_offset.add(Offset(aligned_start));
                 Some(SegmentState {
                     segment,
                     aligned_size,
@@ -473,10 +493,9 @@ impl HfVmBuilder {
                     format!("error getting section data for section {}", section_name)
                 })?;
 
-                let ipa = self
-                    .memory_manager
-                    .simulate_address_lookup(GuestVaAddress(section.address()))?
-                    .unwrap();
+                let va = va_offset.add(Offset(section.address()));
+
+                let ipa = self.memory_manager.simulate_address_lookup(va)?.unwrap();
                 if !data.is_empty() {
                     debug!(
                         "loading section \"{}\" (segment {}), size {}, kind {:?} into memory at {:#x?}, ipa {:#x?}",
@@ -484,7 +503,7 @@ impl HfVmBuilder {
                         segment_idx,
                         section.size(),
                         section.kind(),
-                        section.address(),
+                        va.0,
                         ipa.0,
                     );
                     let slice = self
@@ -503,14 +522,60 @@ impl HfVmBuilder {
                 trace!("ignoring section {}", section_name);
             }
         }
-        let entrypoint = GuestVaAddress(obj.entry());
+        let entrypoint = va_offset.add(Offset(obj.entry()));
         debug!("entrypoint is {:#x?}", entrypoint.0);
         self.entrypoint = Some(entrypoint);
 
         use object::ObjectSymbol;
         for symbol in obj.symbols() {
             if symbol.name().unwrap_or_default() == "exception_vector_table" {
-                self.vbar_el1 = Some(GuestVaAddress(symbol.address()));
+                self.vbar_el1 = Some(va_offset.add(Offset(symbol.address())));
+            }
+        }
+
+        if let Some(relocs) = obj.dynamic_relocations() {
+            for (offset, reloc) in relocs {
+                const R_AARCH64_RELATIVE: u32 = 1027;
+
+                match (reloc.kind(), reloc.target()) {
+                    (
+                        object::RelocationKind::Elf(R_AARCH64_RELATIVE),
+                        object::RelocationTarget::Absolute,
+                    ) => {
+                        let d = RelocationDebugInfo {
+                            offset,
+                            rel: &reloc,
+                        };
+                        let va = va_offset.add(Offset(offset));
+                        let mut relocation_mem = unsafe {
+                            self.memory_manager
+                                .get_memory_slice(va, core::mem::size_of::<u64>())
+                                .with_context(|| format!("error getting memory for {:?}", &d))?
+                        };
+                        assert!(reloc.addend() > 0);
+                        let relocation_value = va_offset.add(Offset(reloc.addend() as u64));
+
+                        use byteorder::WriteBytesExt;
+
+                        relocation_mem
+                            .write_u64::<byteorder::LittleEndian>(relocation_value.0)
+                            .with_context(|| {
+                                format!(
+                                    "error writing value {:#x?} at VA {:#x?} for {:?}",
+                                    relocation_value.0, va.0, &d
+                                )
+                            })?;
+                        trace!(
+                            "wrote value {:#x?} at VA {:#x?} for relocation {:?}",
+                            relocation_value.0,
+                            va.0,
+                            &d
+                        );
+                    }
+                    _ => {
+                        bail!("unsupported relocation offset {:#x?}, {:?}", offset, reloc)
+                    }
+                }
             }
         }
 
