@@ -47,13 +47,14 @@ pub struct HfVm {
 impl HfVmBuilder {
     pub fn new() -> anyhow::Result<Self> {
         assert_hv_return_t_ok(unsafe { bindgen::hv_vm_create(null_obj()) }, "hv_vm_create")?;
-        debug!(
-            "allocating guest memory, IPA start: {:x?}, size: {}",
-            DRAM_IPA_START.0, MEMORY_SIZE
-        );
+
         let ipa_start = DRAM_IPA_START;
         let va_start = DRAM_VA_START;
         let size = MEMORY_SIZE;
+        debug!(
+            "allocating guest memory, IPA start: {:x?}, size: {}",
+            ipa_start.0, size
+        );
         let memory_manager = GuestMemoryManager::new(va_start, ipa_start, size)?;
         let vm = Self {
             memory_manager,

@@ -5,7 +5,7 @@ use vm_memory::GuestMemoryMmap;
 use crate::{
     addresses::{GuestIpaAddress, GuestVaAddress, Offset, VaIpa},
     elf_loader::{self, LoadedElf, MemoryManager},
-    layout::{DRAM_IPA_START, MEMORY_SIZE, TTBR_SIZE},
+    layout::TTBR_SIZE,
     page_table, HvMemoryFlags,
 };
 use anyhow::{anyhow, Context};
@@ -55,7 +55,7 @@ impl GuestMemoryManager {
     pub fn configure_dram(&mut self) -> anyhow::Result<()> {
         let ipa = self.dram_ipa_start.add(self.usable_memory_offset);
         let va = self.dram_va_start.add(self.usable_memory_offset);
-        let usable_memory_size = (MEMORY_SIZE as u64 - self.usable_memory_offset.0) as usize;
+        let usable_memory_size = (self.memory_size as u64 - self.usable_memory_offset.0) as usize;
         // This is the RAM that the kernel is free to use for whatever purpose, e.g. allocating.
         debug!(
             "configuring translation tables for DRAM, ipa {:#x?}, va {:#x?}, usable memory size {}",
@@ -71,7 +71,6 @@ impl GuestMemoryManager {
         self.dram_va_start.add(offset)
     }
 
-    #[allow(dead_code)]
     pub fn get_ipa(&self, offset: Offset) -> GuestIpaAddress {
         self.dram_ipa_start.add(offset)
     }
@@ -129,7 +128,7 @@ impl GuestMemoryManager {
             Self::get_ttbr_0_dram_offset()
         };
 
-        let table_ipa = DRAM_IPA_START.add(table_start_dram_offset);
+        let table_ipa = self.get_ipa(table_start_dram_offset);
         let table_ptr = self
             .memory
             .get_slice(table_ipa.as_guest_address(), TTBR_SIZE)
