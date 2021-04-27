@@ -2,8 +2,8 @@ use aarch64_debug::{DataAbortFlags, Syndrome};
 use anyhow::{anyhow, bail, Context};
 use bindgen_util::{assert_hv_return_t_ok, null_obj};
 pub use bindgen_util::{HfVcpuExit, HvExitReason, HvMemoryFlags};
-use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::{path::Path, sync::Arc};
 use vm_memory::{GuestMemory, GuestMemoryMmap};
 
 use log::{debug, error, info, trace};
@@ -12,7 +12,6 @@ pub mod aarch64_debug;
 pub mod addresses;
 pub mod aligner;
 mod bindgen_util;
-mod elf_loading;
 pub mod layout;
 pub mod page_table;
 
@@ -33,6 +32,10 @@ pub mod bindgen;
 #[derive(Debug)]
 pub struct GuestMemoryManager {
     memory: Arc<GuestMemoryMmap>,
+    dram_ipa_start: GuestIpaAddress,
+    dram_va_start: GuestVaAddress,
+    memory_size: usize,
+    usable_memory_offset: Offset,
 }
 
 pub struct HfVmBuilder {
@@ -47,6 +50,26 @@ pub struct HfVm {
     memory_manager: Arc<GuestMemoryManager>,
 }
 
+#[derive(Default)]
+pub struct LoadedElf {
+    pub entrypoint: GuestVaAddress,
+    pub vbar_el1: GuestVaAddress,
+}
+
+struct RelocationDebugInfo<'a> {
+    offset: u64,
+    rel: &'a object::Relocation,
+}
+
+impl<'a> core::fmt::Debug for RelocationDebugInfo<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Relocation")
+            .field("offset", &format_args!("{:#x?}", self.offset))
+            .field("addend", &format_args!("{:#x?}", self.rel.addend()))
+            .finish()
+    }
+}
+
 impl GuestMemoryManager {
     pub fn new() -> anyhow::Result<Self> {
         let memory = Arc::new(
@@ -54,31 +77,273 @@ impl GuestMemoryManager {
                 .context("error allocating guest memory")?,
         );
 
-        let mut mm = Self { memory };
+        Ok(Self {
+            memory,
+            dram_ipa_start: DRAM_IPA_START,
+            dram_va_start: DRAM_VA_START,
+            memory_size: MEMORY_SIZE,
+            // This is temporary
+            usable_memory_offset: Self::get_binary_offset(),
+        })
+    }
+    pub fn load_elf<P: AsRef<Path>>(&mut self, filename: P) -> anyhow::Result<LoadedElf> {
+        let file = std::fs::File::open(filename)?;
+        let map = unsafe { memmap::MmapOptions::default().map(&file) }
+            .context("error mmmapping ELF file")?;
+        let obj = object::read::File::parse(&map)?;
+        use object::{Object, ObjectSection, ObjectSegment};
 
-        {
-            let ipa = DRAM_IPA_START.add(DRAM_KERNEL_USABLE_DRAM_OFFSET);
-            let va = DRAM_VA_START.add(DRAM_KERNEL_USABLE_DRAM_OFFSET);
-            let usable_memory_size =
-                (MEMORY_SIZE as u64 - DRAM_KERNEL_USABLE_DRAM_OFFSET.0) as usize;
-            // This is the RAM that the kernel is free to use for whatever purpose, e.g. allocating.
-            debug!(
-                "configuring translation tables for DRAM, ipa {:#x?}, va {:#x?}, usable memory size {}",
-                ipa.0, va.0, usable_memory_size,
-            );
-
-            mm.configure_page_tables(ipa, va, usable_memory_size, HvMemoryFlags::ALL)
-                .context("error configuring page tables for DRAM")?;
+        struct SegmentState<'a, 'b> {
+            segment: object::Segment<'a, 'b>,
+            aligned_size: u64,
+            flags: HvMemoryFlags,
+            ipa: GuestIpaAddress,
+            va: GuestVaAddress,
         }
 
-        Ok(mm)
-    }
-    fn get_ttbr_0_dram_offset(&self) -> Offset {
-        DRAM_TTBR_OFFSET
+        let va_offset = self.dram_va_start.add(self.usable_memory_offset);
+
+        let mut segments = obj
+            .segments()
+            .scan(Offset(0), |mut_offset, segment| {
+                let start = segment.address();
+                let end = segment.address() + segment.size();
+                let aligned_start = crate::aligner::ALIGNER_16K.align_down(start);
+                let aligned_end = crate::aligner::ALIGNER_16K.align_up(end);
+                let aligned_size = aligned_end - aligned_start;
+
+                let offset = *mut_offset;
+                *mut_offset = mut_offset.add(Offset(aligned_size));
+                let ipa = DRAM_IPA_START.add(offset);
+                let va = va_offset.add(Offset(aligned_start));
+                Some(SegmentState {
+                    segment,
+                    aligned_size,
+                    ipa,
+                    va,
+                    flags: HvMemoryFlags::HV_MEMORY_READ,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let used_dram_size = {
+            let last = segments
+                .last()
+                .ok_or_else(|| anyhow!("no segments in the binary"))?;
+            (last.ipa.0 - self.dram_ipa_start.0) + last.aligned_size
+        };
+
+        for section in obj.sections() {
+            use object::SectionKind::*;
+            match section.kind() {
+                Text | Data | UninitializedData | ReadOnlyData => {}
+                _ => continue,
+            };
+            if let Ok(segment_idx) = segments.binary_search_by(|seg| {
+                use std::cmp::Ordering as O;
+                if section.address() < seg.segment.address() {
+                    return O::Greater;
+                }
+                if section.address() > seg.segment.address() + seg.segment.size() {
+                    return O::Less;
+                }
+                O::Equal
+            }) {
+                let s = &mut segments[segment_idx];
+                use object::SectionKind::*;
+                // There's no API to get segment flags in object, at least I did not find it,
+                // so just figure it out by the sectons we care about.
+                match section.kind() {
+                    Text => s.flags |= HvMemoryFlags::HV_MEMORY_EXEC,
+                    Data | UninitializedData => s.flags |= HvMemoryFlags::HV_MEMORY_WRITE,
+                    _ => {}
+                };
+            }
+        }
+
+        for (idx, ss) in segments.iter().enumerate() {
+            macro_rules! _tt_msg {
+                () => {
+                    format_args!(
+                        "configuring translation tables for LOAD segment {}, address {:#x?}, size {}, aligned size {}, IPA {:#x?}, VA {:#x?}, flags: {:?}",
+                        idx,
+                        ss.segment.address(),
+                        ss.segment.size(),
+                        ss.aligned_size,
+                        ss.ipa.0,
+                        ss.va.0,
+                        ss.flags,
+                    );
+                }
+            }
+            debug!("{}", _tt_msg!());
+            self.configure_page_tables(ss.ipa, ss.va, ss.aligned_size as usize, ss.flags)
+                .with_context(|| anyhow!("error {}", _tt_msg!()))?;
+        }
+
+        for section in obj.sections() {
+            let section_name = section.name().with_context(|| {
+                format!(
+                    "error determining section name at {:#x?}",
+                    section.address()
+                )
+            })?;
+            if let Ok(segment_idx) = segments.binary_search_by(|seg| {
+                use std::cmp::Ordering as O;
+                if section.address() < seg.segment.address() {
+                    return O::Greater;
+                }
+                if section.address() > seg.segment.address() + seg.segment.size() {
+                    return O::Less;
+                }
+                O::Equal
+            }) {
+                use object::SectionKind::*;
+                match section.kind() {
+                    Text | Data | UninitializedData | ReadOnlyData => {}
+                    _ => {
+                        debug!(
+                            "ignoring section with name \"{}\", address {:#x?}, kind: {:?}",
+                            section_name,
+                            section.address(),
+                            section.kind()
+                        );
+                        continue;
+                    }
+                };
+                let data = section.data().with_context(|| {
+                    format!("error getting section data for section {}", section_name)
+                })?;
+
+                let va = va_offset.add(Offset(section.address()));
+
+                let ipa = self.simulate_address_lookup(va)?.unwrap();
+                if !data.is_empty() {
+                    debug!(
+                        "loading section \"{}\" (segment {}), size {}, kind {:?} into memory at {:#x?}, ipa {:#x?}",
+                        section_name,
+                        segment_idx,
+                        section.size(),
+                        section.kind(),
+                        va.0,
+                        ipa.0,
+                    );
+                    let slice = self
+                        .memory
+                        .get_slice(ipa.as_guest_address(), section.size() as usize)
+                        .with_context(|| {
+                            format!(
+                                "error getting the slice of memory for section \"{}\"",
+                                section_name
+                            )
+                        })?;
+                    slice.copy_from(data);
+                }
+            } else {
+                trace!("ignoring section {}", section_name);
+            }
+        }
+        let entrypoint = va_offset.add(Offset(obj.entry()));
+        debug!("entrypoint is {:#x?}", entrypoint.0);
+
+        use object::ObjectSymbol;
+        let mut vbar_el1 = None;
+        for symbol in obj.symbols() {
+            if symbol.name().unwrap_or_default() == "exception_vector_table" {
+                vbar_el1 = Some(va_offset.add(Offset(symbol.address())));
+            }
+        }
+        let vbar_el1 =
+            vbar_el1.ok_or_else(|| anyhow!("could not find symbol \"exception_vector_table\""))?;
+
+        if let Some(relocs) = obj.dynamic_relocations() {
+            for (offset, reloc) in relocs {
+                const R_AARCH64_RELATIVE: u32 = 1027;
+
+                match (reloc.kind(), reloc.target()) {
+                    (
+                        object::RelocationKind::Elf(R_AARCH64_RELATIVE),
+                        object::RelocationTarget::Absolute,
+                    ) => {
+                        let d = RelocationDebugInfo {
+                            offset,
+                            rel: &reloc,
+                        };
+                        let va = va_offset.add(Offset(offset));
+                        let mut relocation_mem = unsafe {
+                            self.get_memory_slice(va, core::mem::size_of::<u64>())
+                                .with_context(|| format!("error getting memory for {:?}", &d))?
+                        };
+                        let relocation_value = if reloc.addend() >= 0 {
+                            va_offset.add(Offset(reloc.addend() as u64))
+                        } else {
+                            bail!("relocation addend negative, not supported: {:?}", &d)
+                        };
+                        use byteorder::WriteBytesExt;
+
+                        relocation_mem
+                            .write_u64::<byteorder::LittleEndian>(relocation_value.0)
+                            .with_context(|| {
+                                format!(
+                                    "error writing value {:#x?} at VA {:#x?} for {:?}",
+                                    relocation_value.0, va.0, &d
+                                )
+                            })?;
+                        trace!(
+                            "wrote value {:#x?} at VA {:#x?} for {:?}",
+                            relocation_value.0,
+                            va.0,
+                            &d
+                        );
+                    }
+                    _ => {
+                        bail!("unsupported relocation offset {:#x?}, {:?}", offset, reloc)
+                    }
+                }
+            }
+        }
+
+        self.usable_memory_offset = self.usable_memory_offset.add(Offset(used_dram_size));
+
+        Ok(LoadedElf {
+            entrypoint,
+            vbar_el1,
+        })
     }
 
-    fn get_ttbr_1_dram_offset(&self) -> Offset {
-        self.get_ttbr_0_dram_offset().add(Offset(TTBR_SIZE as u64))
+    fn configure_dram(&mut self) -> anyhow::Result<()> {
+        let ipa = self.dram_ipa_start.add(self.usable_memory_offset);
+        let va = self.dram_va_start.add(self.usable_memory_offset);
+        let usable_memory_size = (MEMORY_SIZE as u64 - self.usable_memory_offset.0) as usize;
+        // This is the RAM that the kernel is free to use for whatever purpose, e.g. allocating.
+        debug!(
+            "configuring translation tables for DRAM, ipa {:#x?}, va {:#x?}, usable memory size {}",
+            ipa.0, va.0, usable_memory_size,
+        );
+
+        self.configure_page_tables(ipa, va, usable_memory_size, HvMemoryFlags::ALL)
+            .context("error configuring page tables for DRAM")?;
+        Ok(())
+    }
+
+    fn get_ttbr_0_dram_offset() -> Offset {
+        Offset(0)
+    }
+
+    pub fn get_ttbr_0(&self) -> GuestIpaAddress {
+        self.dram_ipa_start.add(Self::get_ttbr_0_dram_offset())
+    }
+
+    pub fn get_ttbr_1(&self) -> GuestIpaAddress {
+        self.dram_ipa_start.add(Self::get_ttbr_1_dram_offset())
+    }
+
+    fn get_ttbr_1_dram_offset() -> Offset {
+        Self::get_ttbr_0_dram_offset().add(Offset(TTBR_SIZE as u64))
+    }
+
+    fn get_binary_offset() -> Offset {
+        Self::get_ttbr_1_dram_offset().add(Offset(TTBR_SIZE as u64))
     }
 
     unsafe fn get_memory_slice(
@@ -101,9 +366,9 @@ impl GuestMemoryManager {
         let top_bit_set = (va.0 >> 55) & 1 == 1;
 
         let table_start_dram_offset = if top_bit_set {
-            self.get_ttbr_1_dram_offset()
+            Self::get_ttbr_1_dram_offset()
         } else {
-            self.get_ttbr_0_dram_offset()
+            Self::get_ttbr_0_dram_offset()
         };
 
         let table_ipa = DRAM_IPA_START.add(table_start_dram_offset);
@@ -214,13 +479,23 @@ impl HfVmBuilder {
         )
     }
 
-    pub fn build(self) -> anyhow::Result<HfVm> {
+    pub fn load_elf<P: AsRef<Path>>(&mut self, filename: P) -> anyhow::Result<LoadedElf> {
+        let elf = self.memory_manager.load_elf(filename)?;
+        self.entrypoint = Some(elf.entrypoint);
+        self.vbar_el1 = Some(elf.vbar_el1);
+        Ok(elf)
+    }
+
+    pub fn build(mut self) -> anyhow::Result<HfVm> {
         let entrypoint = self.entrypoint.ok_or_else(|| {
             anyhow!("entrypoint not set, probably ELF not loaded, or loaded incorrectly")
         })?;
         let vbar_el1 = self.vbar_el1.ok_or_else(|| {
             anyhow!("vbar_el1 not set, probably ELF not loaded, or loaded incorrectly")
         })?;
+        self.memory_manager
+            .configure_dram()
+            .context("error configuring DRAM")?;
         Ok(HfVm {
             entrypoint,
             vbar_el1,
@@ -238,8 +513,8 @@ impl HfVm {
         let entrypoint = entrypoint.unwrap_or(self.entrypoint);
 
         let vbar_el1 = self.vbar_el1;
-        let ttbr0 = DRAM_IPA_START.add(memory_manager.get_ttbr_0_dram_offset());
-        let ttbr1 = DRAM_IPA_START.add(memory_manager.get_ttbr_1_dram_offset());
+        let ttbr0 = memory_manager.get_ttbr_0();
+        let ttbr1 = memory_manager.get_ttbr_1();
 
         Ok(std::thread::spawn(move || {
             let vcpu = VCpu::new(memory_manager).unwrap();
@@ -595,7 +870,7 @@ impl VCpu {
         };
 
         {
-            let start_params_dram_offset = DRAM_KERNEL_USABLE_DRAM_OFFSET;
+            let start_params_dram_offset = self.memory_manager.usable_memory_offset;
             let start_params_end_offset =
                 start_params_dram_offset.add(Offset(core::mem::size_of::<StartParams>() as u64));
 

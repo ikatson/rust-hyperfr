@@ -14,17 +14,7 @@ pub const DRAM_VA_START: GuestVaAddress = VA_START.add(Offset(DRAM_IPA_START.0))
 
 pub const KERNEL_BINARY_MEMORY_MAX_SIZE: u64 = 8 * 1024 * 1024; // 8 Mib
 
-pub const DRAM_KERNEL_BINARY_OFFSET: Offset = Offset(0);
-
-pub const DRAM_TTBR_OFFSET: Offset = DRAM_KERNEL_BINARY_OFFSET
-    .add(Offset(KERNEL_BINARY_MEMORY_MAX_SIZE))
-    .add(Offset(VA_PAGE));
-
 pub const TTBR_SIZE: usize = core::mem::size_of::<page_table::TranslationTableLevel2_16k>();
-
-pub const DRAM_KERNEL_USABLE_DRAM_OFFSET: Offset = DRAM_TTBR_OFFSET
-    .add(Offset(TTBR_SIZE as u64 * 2))
-    .add(Offset(VA_PAGE));
 
 // this could be configurable, it's just that we don't care yet.
 // This is 32 MiB, we just don't need more.
