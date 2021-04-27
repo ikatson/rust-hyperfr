@@ -552,9 +552,11 @@ impl HfVmBuilder {
                                 .get_memory_slice(va, core::mem::size_of::<u64>())
                                 .with_context(|| format!("error getting memory for {:?}", &d))?
                         };
-                        assert!(reloc.addend() > 0);
-                        let relocation_value = va_offset.add(Offset(reloc.addend() as u64));
-
+                        let relocation_value = if reloc.addend() >= 0 {
+                            va_offset.add(Offset(reloc.addend() as u64))
+                        } else {
+                            bail!("relocation addend negative, not supported: {:?}", &d)
+                        };
                         use byteorder::WriteBytesExt;
 
                         relocation_mem
@@ -566,7 +568,7 @@ impl HfVmBuilder {
                                 )
                             })?;
                         trace!(
-                            "wrote value {:#x?} at VA {:#x?} for relocation {:?}",
+                            "wrote value {:#x?} at VA {:#x?} for {:?}",
                             relocation_value.0,
                             va.0,
                             &d
