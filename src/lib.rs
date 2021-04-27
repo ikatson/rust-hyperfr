@@ -158,7 +158,7 @@ pub const DRAM_KERNEL_USABLE_DRAM_OFFSET: Offset = DRAM_TTBR_OFFSET
 
 // this could be configurable, it's just that we don't care yet.
 // This is 32 MiB, we just don't need more.
-pub const MEMORY_SIZE: usize = 4 * 1024 * 1024 * 1024;
+pub const MEMORY_SIZE: usize = 128 * 1024 * 1024;
 
 pub const STACK_SIZE: u64 = 1024 * 1024;
 pub const STACK_END: GuestVaAddress = DRAM_VA_START.add(Offset(MEMORY_SIZE as u64));
