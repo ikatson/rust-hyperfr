@@ -2,6 +2,7 @@ use anyhow::bail;
 
 pub const ALIGNER_16K: Aligner = Aligner::new_from_mask(!((1 << 14) - 1));
 
+#[allow(dead_code)]
 pub fn is_power_of_two(x: u64) -> bool {
     (x & (x - 1)) == 0 && x > 0
 }
@@ -31,6 +32,7 @@ impl Aligner {
         }
     }
 
+    #[allow(dead_code)]
     pub fn new_from_bits(bits: u8) -> anyhow::Result<Self> {
         match bits {
             1..=63 => Ok(Self {
@@ -39,6 +41,8 @@ impl Aligner {
             _ => bail!("bits should be >= 0 and =< 64"),
         }
     }
+
+    #[allow(dead_code)]
     pub fn new_from_power_of_two(number: u64) -> anyhow::Result<Self> {
         if !(is_power_of_two(number)) {
             bail!("{} is not a power of 2", number);

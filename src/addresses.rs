@@ -30,3 +30,9 @@ impl Offset {
         Offset(self.0 + offset.0)
     }
 }
+
+#[derive(Debug)]
+pub struct VaIpa {
+    pub va: GuestVaAddress,
+    pub ipa: GuestIpaAddress,
+}
