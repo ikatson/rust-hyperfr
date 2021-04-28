@@ -5,7 +5,7 @@ use vm_memory::GuestMemoryMmap;
 use crate::{
     addresses::{GuestIpaAddress, GuestVaAddress, Offset},
     elf_loader::{self, LoadedElf, MemoryManager},
-    translation_table::{Aarch64PageSize, TranslationTableManager},
+    translation_table::{Aarch64TranslationGranule, TranslationTableManager},
     HvMemoryFlags,
 };
 use anyhow::{anyhow, Context};
@@ -35,7 +35,7 @@ impl GuestMemoryManager {
                 .context("error allocating guest memory")?,
         );
 
-        let granule = Aarch64PageSize::P16k;
+        let granule = Aarch64TranslationGranule::P16k;
         let txsz = 28;
         let tmp_ttmgr =
             TranslationTableManager::new(granule, txsz, GuestIpaAddress(0), GuestIpaAddress(0))?;

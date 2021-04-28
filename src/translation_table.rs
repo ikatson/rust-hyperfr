@@ -10,18 +10,18 @@ use anyhow::bail;
 use log::{trace, warn};
 
 #[derive(Debug, Copy, Clone)]
-pub enum Aarch64PageSize {
+pub enum Aarch64TranslationGranule {
     P4k,
     P16k,
     P64k,
 }
 
-impl Aarch64PageSize {
+impl Aarch64TranslationGranule {
     pub const fn page_size_bits(&self) -> u8 {
         match self {
-            Aarch64PageSize::P4k => 12,
-            Aarch64PageSize::P16k => 14,
-            Aarch64PageSize::P64k => 16,
+            Aarch64TranslationGranule::P4k => 12,
+            Aarch64TranslationGranule::P16k => 14,
+            Aarch64TranslationGranule::P64k => 16,
         }
     }
     pub const fn page_size(&self) -> u64 {
@@ -35,7 +35,7 @@ impl Aarch64PageSize {
 
     pub fn initial_level(&self, txsz: u8) -> i8 {
         match self {
-            Aarch64PageSize::P4k => match txsz {
+            Aarch64TranslationGranule::P4k => match txsz {
                 12..=15 => -1,
                 16..=24 => 0,
                 25..=33 => 1,
@@ -43,14 +43,14 @@ impl Aarch64PageSize {
                 43..=48 => 3,
                 _ => unimplemented!(),
             },
-            Aarch64PageSize::P16k => match txsz {
+            Aarch64TranslationGranule::P16k => match txsz {
                 12..=16 => 0,
                 17..=27 => 1,
                 28..=38 => 2,
                 39..=48 => 3,
                 _ => unimplemented!(),
             },
-            Aarch64PageSize::P64k => match txsz {
+            Aarch64TranslationGranule::P64k => match txsz {
                 12..=21 => 1,
                 22..=34 => 2,
                 35..=47 => 3,
@@ -61,21 +61,21 @@ impl Aarch64PageSize {
 
     pub fn block_size_bits(&self, table_level: i8) -> Option<u8> {
         match self {
-            Aarch64PageSize::P4k => match table_level {
+            Aarch64TranslationGranule::P4k => match table_level {
                 3 => None,
                 2 => Some(21),
                 1 => Some(30),
                 0 => None,
                 _ => unimplemented!(),
             },
-            Aarch64PageSize::P16k => match table_level {
+            Aarch64TranslationGranule::P16k => match table_level {
                 3 => None,
                 2 => Some(25),
                 1 => None,
                 0 => None,
                 _ => unimplemented!(),
             },
-            Aarch64PageSize::P64k => match table_level {
+            Aarch64TranslationGranule::P64k => match table_level {
                 3 => None,
                 2 => Some(29),
                 1 => None,
@@ -91,29 +91,29 @@ impl Aarch64PageSize {
 
     pub const fn max_bits_per_level(&self) -> u8 {
         match self {
-            Aarch64PageSize::P4k => 9,
-            Aarch64PageSize::P16k => 11,
-            Aarch64PageSize::P64k => 13,
+            Aarch64TranslationGranule::P4k => 9,
+            Aarch64TranslationGranule::P16k => 11,
+            Aarch64TranslationGranule::P64k => 13,
         }
     }
 
     pub fn bits_range(&self, table_level: i8) -> (u64, u64) {
         match self {
-            Aarch64PageSize::P4k => match table_level {
+            Aarch64TranslationGranule::P4k => match table_level {
                 3 => (20, 12),
                 2 => (29, 21),
                 1 => (38, 30),
                 0 => (47, 39),
                 _ => unimplemented!(),
             },
-            Aarch64PageSize::P16k => match table_level {
+            Aarch64TranslationGranule::P16k => match table_level {
                 3 => (24, 14),
                 2 => (35, 25),
                 1 => (46, 36),
                 0 => (47, 47),
                 _ => unimplemented!(),
             },
-            Aarch64PageSize::P64k => match table_level {
+            Aarch64TranslationGranule::P64k => match table_level {
                 3 => (28, 16),
                 2 => (41, 29),
                 1 => (47, 42),
@@ -124,7 +124,7 @@ impl Aarch64PageSize {
 }
 
 struct Descriptor(u64);
-pub struct Table {
+struct Table {
     // TODO: I guess this is not 2048 for non 16k pages.
     // Furthermore, for level 1 16k page this only could hold 2 values, not 2048.
     // Others are just wasted space.
@@ -160,13 +160,13 @@ impl TableMetadata {
 pub struct TranslationTableManager {
     ttbr0: GuestIpaAddress,
     ttbr1: GuestIpaAddress,
-    granule: Aarch64PageSize,
+    granule: Aarch64TranslationGranule,
     txsz: u8,
 }
 
 impl TranslationTableManager {
     pub fn new(
-        granule: Aarch64PageSize,
+        granule: Aarch64TranslationGranule,
         txsz: u8,
         ttbr0: GuestIpaAddress,
         ttbr1: GuestIpaAddress,
@@ -179,7 +179,7 @@ impl TranslationTableManager {
         })
     }
 
-    pub fn get_granule(&self) -> Aarch64PageSize {
+    pub fn get_granule(&self) -> Aarch64TranslationGranule {
         self.granule
     }
 
@@ -262,21 +262,10 @@ impl TranslationTableManager {
             let (bt, bb) = self.granule.bits_range(table.level);
             let index = bits(va.0, bt, bb) >> bb;
             let d = table.descriptor(index as usize);
-            trace!(
-                "simulate_address_lookup {:?}, level {}, table at {:?}, index {}, bt {}, bb {}, value: {:#x?}",
-                va,
-                table.level,
-                table.start,
-                index,
-                bt,
-                bb,
-                d.0
-            );
             match d.0 & 0b11 {
                 0b11 => {
                     let psb = self.granule.page_size_bits() as u64;
                     let ipa = GuestIpaAddress(bits(d.0, 47, psb));
-                    trace!("descriptor ipa at level {}: {:?}", table.level, ipa);
                     if table.level == 3 {
                         let offset = Offset(va.0 & ((1 << psb) - 1));
                         return Ok(Some(ipa.add(offset)));
@@ -301,7 +290,6 @@ impl TranslationTableManager {
                         }
                     };
                     let ipa = GuestIpaAddress(bits(d.0, 47, block_size_bits as u64));
-                    trace!("descriptor block ipa at level {}: {:?}", table.level, ipa);
                     let offset = Offset(va.0 & ((1 << block_size_bits) - 1));
                     return Ok(Some(ipa.add(offset)));
                 }
@@ -363,6 +351,7 @@ impl TranslationTableManager {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn setup_one(
         &self,
         mut table: TableMetadata,
@@ -373,11 +362,6 @@ impl TranslationTableManager {
         size: u64,
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
-        trace!(
-            "setup_one: table.level={}, table.ipa={:#x?}, index={}, va={:#x?}, ipa={:#x?}, size={}, flags={:?}",
-            table.level, table.start.0, index, va.0, ipa.0, size, flags
-        );
-
         debug_assert!(self.granule.aligner().is_aligned(va.0));
         debug_assert!(self.granule.aligner().is_aligned(ipa.0));
         debug_assert!(size > 0);
@@ -385,7 +369,7 @@ impl TranslationTableManager {
 
         if table.level == 3 {
             trace!(
-                "writing l3={}, va={:#x?}, ipa={:#x?}, size={}, flags={:?}",
+                "writing page l3={}, va={:#x?}, ipa={:#x?}, size={}, flags={:?}",
                 index,
                 va.0,
                 ipa.0,
@@ -437,7 +421,7 @@ impl TranslationTableManager {
                 }
 
                 trace!(
-                    "block: l{}={}, val={:#x?}, va: {:#x?}, ipa: {:#x?}, flags: {:?}",
+                    "writing block: l{}={}, val={:#x?}, va: {:#x?}, ipa: {:#x?}, flags: {:?}",
                     level,
                     index,
                     d.0,
@@ -498,35 +482,7 @@ impl TranslationTableManager {
                     start: ipa,
                 })
             }
-            _ => bail!("bullshit"),
+            _ => bail!("memory is corrupted, this shouldn't have happened"),
         }
     }
 }
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     #[test]
-//     fn test_1() {
-//         pretty_env_logger::init();
-//         let va = GuestVaAddress(0xf000_0000_0000);
-//         let ipa = GuestIpaAddress(0x0);
-//         let memory_size = 4 * 1024 * 1024 * 1024;
-
-//         let mut mgr = crate::GuestMemoryManager::new(va, ipa, memory_size).unwrap();
-//         let ttmgr = TranslationTableManager::new(Aarch64PageSize::P16k, 28).unwrap();
-
-//         // Setup identity mapping with offset.
-//         // let offset = GuestVaAddress(0x0000_ffff_0000_0000);
-//         let offset = GuestVaAddress(0);
-//         ttmgr
-//             .setup(
-//                 &mut mgr,
-//                 offset,
-//                 ipa,
-//                 32 * 1024 * 1024 + 16384,
-//                 HvMemoryFlags::ALL,
-//             )
-//             .unwrap()
-//     }
-// }
