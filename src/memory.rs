@@ -6,7 +6,9 @@ use crate::{
     addresses::{GuestIpaAddress, GuestVaAddress, Offset, VaIpa},
     elf_loader::{self, LoadedElf, MemoryManager},
     layout::TTBR_SIZE,
-    page_table, HvMemoryFlags,
+    page_table,
+    translation_table::{self, Aarch64PageSize, Table, TranslationTableManager},
+    HvMemoryFlags,
 };
 use anyhow::{anyhow, Context};
 use log::{debug, trace};
@@ -14,11 +16,28 @@ use vm_memory::GuestMemory;
 
 #[derive(Debug)]
 pub struct GuestMemoryManager {
+    translation_table_mgr: TranslationTableManager,
+    ttbr0: GuestIpaAddress,
+    ttbr1: GuestIpaAddress,
     memory: Arc<GuestMemoryMmap>,
     dram_ipa_start: GuestIpaAddress,
     dram_va_start: GuestVaAddress,
     memory_size: usize,
     usable_memory_offset: Offset,
+}
+
+struct TtbrLocation {
+    ptr: *mut Table,
+    ipa: GuestIpaAddress,
+}
+
+impl Default for TtbrLocation {
+    fn default() -> Self {
+        Self {
+            ptr: core::ptr::null_mut(),
+            ipa: GuestIpaAddress(0),
+        }
+    }
 }
 
 impl GuestMemoryManager {
@@ -32,14 +51,40 @@ impl GuestMemoryManager {
                 .context("error allocating guest memory")?,
         );
 
-        Ok(Self {
+        let granule = Aarch64PageSize::P16k;
+        let txsz = 28;
+        let tmp_ttmgr =
+            TranslationTableManager::new(granule, txsz, GuestIpaAddress(0), GuestIpaAddress(0))?;
+
+        let mut mm = Self {
+            translation_table_mgr: tmp_ttmgr,
             memory,
             dram_ipa_start: ipa_start,
             dram_va_start: va_start,
             memory_size: size,
             // This is temporary
-            usable_memory_offset: Self::get_binary_offset(),
-        })
+            usable_memory_offset: Offset(0),
+            ttbr0: GuestIpaAddress(0),
+            ttbr1: GuestIpaAddress(0),
+        };
+
+        let ttbr_layout = mm.translation_table_mgr.get_top_ttbr_layout()?;
+
+        let (_, ttbr0) = mm.allocate(ttbr_layout)?;
+        let (_, ttbr1) = mm.allocate(ttbr_layout)?;
+        mm.translation_table_mgr = TranslationTableManager::new(granule, txsz, ttbr0, ttbr1)?;
+        mm.ttbr0 = ttbr0;
+        mm.ttbr1 = ttbr1;
+
+        Ok(mm)
+    }
+
+    pub fn get_ttbr_0(&self) -> GuestIpaAddress {
+        self.ttbr0
+    }
+
+    pub fn get_ttbr_1(&self) -> GuestIpaAddress {
+        self.ttbr1
     }
 
     pub fn allocate(&mut self, layout: Layout) -> anyhow::Result<(*mut u8, GuestIpaAddress)> {
@@ -96,26 +141,6 @@ impl GuestMemoryManager {
         self.memory_size
     }
 
-    fn get_ttbr_0_dram_offset() -> Offset {
-        Offset(0)
-    }
-
-    pub fn get_ttbr_0(&self) -> GuestIpaAddress {
-        self.dram_ipa_start.add(Self::get_ttbr_0_dram_offset())
-    }
-
-    pub fn get_ttbr_1(&self) -> GuestIpaAddress {
-        self.dram_ipa_start.add(Self::get_ttbr_1_dram_offset())
-    }
-
-    fn get_ttbr_1_dram_offset() -> Offset {
-        Self::get_ttbr_0_dram_offset().add(Offset(TTBR_SIZE as u64))
-    }
-
-    fn get_binary_offset() -> Offset {
-        Self::get_ttbr_1_dram_offset().add(Offset(TTBR_SIZE as u64))
-    }
-
     pub fn get_memory_slice_by_ipa(
         &self,
         ipa: GuestIpaAddress,
@@ -133,53 +158,11 @@ impl GuestMemoryManager {
         self.get_memory_slice_by_ipa(ipa, size)
     }
 
-    unsafe fn get_translation_table_for_va_ptr(
-        &self,
-        va: GuestVaAddress,
-    ) -> anyhow::Result<(GuestIpaAddress, *mut page_table::TranslationTableLevel2_16k)> {
-        let top_bit_set = (va.0 >> 55) & 1 == 1;
-
-        let table_start_dram_offset = if top_bit_set {
-            Self::get_ttbr_1_dram_offset()
-        } else {
-            Self::get_ttbr_0_dram_offset()
-        };
-
-        let table_ipa = self.get_ipa(table_start_dram_offset);
-        let table_ptr = self
-            .memory
-            .get_slice(table_ipa.as_guest_address(), TTBR_SIZE)
-            .with_context(|| format!("error getting slice of memory at {:#x?}", table_ipa.0))?
-            .as_ptr() as *mut page_table::TranslationTableLevel2_16k;
-        Ok((table_ipa, table_ptr))
-    }
-
-    fn get_translation_table_for_va_mut(
-        &mut self,
-        va: GuestVaAddress,
-    ) -> anyhow::Result<(GuestIpaAddress, &mut page_table::TranslationTableLevel2_16k)> {
-        unsafe {
-            let (ipa, t) = self.get_translation_table_for_va_ptr(va)?;
-            Ok((ipa, &mut *t as _))
-        }
-    }
-
-    fn get_translation_table_for_va(
-        &self,
-        va: GuestVaAddress,
-    ) -> anyhow::Result<(GuestIpaAddress, &page_table::TranslationTableLevel2_16k)> {
-        unsafe {
-            let (ipa, t) = self.get_translation_table_for_va_ptr(va)?;
-            Ok((ipa, &*t as _))
-        }
-    }
-
     pub fn simulate_address_lookup(
         &self,
         va: GuestVaAddress,
     ) -> anyhow::Result<Option<GuestIpaAddress>> {
-        let (ipa, table) = self.get_translation_table_for_va(va)?;
-        Ok(table.simulate_lookup(ipa, va))
+        self.translation_table_mgr.simulate_address_lookup(self, va)
     }
 
     pub fn configure_page_tables(
@@ -189,12 +172,9 @@ impl GuestMemoryManager {
         size: usize,
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
-        let (table_ipa, table) = self.get_translation_table_for_va_mut(va)?;
-
-        table
-            .setup(table_ipa, va, ipa, size, flags)
-            .context("error configuring the Level 2 translation table")?;
-        Ok(())
+        // This is ridiculous, but a copy is needed here.
+        let mgr = self.translation_table_mgr;
+        mgr.setup(self, va, ipa, size, flags)
     }
 }
 
