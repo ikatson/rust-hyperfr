@@ -225,22 +225,20 @@ impl TranslationTableManager {
         va: GuestVaAddress,
     ) -> anyhow::Result<Option<GuestIpaAddress>> {
         let mut table = self.get_top_table(mm, va)?;
-        trace!(
-            "simulate_address_lookup {:?}, starting at level {}, table at {:?}",
-            va,
-            table.level,
-            table.start
-        );
         loop {
-            trace!(
-                "simulate_address_lookup {:?}, level {}, table at {:?}",
-                va,
-                table.level,
-                table.start
-            );
             let (bt, bb) = self.granule.bits_range(table.level);
             let index = bits(va.0, bt, bb) >> bb;
             let d = table.descriptor(index as usize);
+            trace!(
+                "simulate_address_lookup {:?}, level {}, table at {:?}, index {}, bt {}, bb {}, value: {:#x?}",
+                va,
+                table.level,
+                table.start,
+                index,
+                bt,
+                bb,
+                d.0
+            );
             match d.0 & 0b11 {
                 0b11 => {
                     let psb = self.granule.page_size_bits() as u64;

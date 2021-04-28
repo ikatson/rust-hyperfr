@@ -161,7 +161,14 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
 
             let va = va_offset.add(Offset(section.address()));
 
-            let ipa = mm.simulate_address_lookup(va)?.unwrap();
+            let ipa = mm.simulate_address_lookup(va)?.ok_or_else(|| {
+                anyhow!(
+                    "couldn't lookup address {:?} for section \"{}\", it should have been mapped together with segment {}",
+                    va,
+                    section_name,
+                    segment_idx
+                )
+            })?;
             if !data.is_empty() {
                 debug!(
                     "loading section \"{}\" (segment {}), size {}, kind {:?} into memory at {:#x?}, ipa {:#x?}",
