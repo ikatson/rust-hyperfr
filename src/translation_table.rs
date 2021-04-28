@@ -33,6 +33,21 @@ impl Aarch64TranslationGranule {
         Aligner::new_from_mask(mask)
     }
 
+    pub fn layout_for_level(&self, level: i8) -> Layout {
+        match self {
+            Aarch64TranslationGranule::P4k => match level {
+                _ => unimplemented!(),
+            },
+            Aarch64TranslationGranule::P16k => match level {
+                _ => Layout::from_size_align(core::mem::size_of::<[Descriptor; 2048]>(), 1 << 14)
+                    .unwrap(),
+            },
+            Aarch64TranslationGranule::P64k => match level {
+                _ => unimplemented!(),
+            },
+        }
+    }
+
     pub fn initial_level(&self, txsz: u8) -> i8 {
         match self {
             Aarch64TranslationGranule::P4k => match txsz {
@@ -124,35 +139,21 @@ impl Aarch64TranslationGranule {
 }
 
 struct Descriptor(u64);
-struct Table {
-    // TODO: I guess this is not 2048 for non 16k pages.
-    // Furthermore, for level 1 16k page this only could hold 2 values, not 2048.
-    // Others are just wasted space.
-    descriptors: [Descriptor; 2048],
-}
 
 #[derive(Copy, Clone)]
 struct TableMetadata {
     start: GuestIpaAddress,
     level: i8,
-    table: *mut Table,
+    descriptors: *mut Descriptor,
 }
 
 impl TableMetadata {
-    fn table(&self) -> &Table {
-        unsafe { &*self.table }
-    }
-
-    fn table_mut(&mut self) -> &mut Table {
-        unsafe { &mut *self.table }
-    }
-
     fn descriptor(&self, idx: usize) -> &Descriptor {
-        &self.table().descriptors[idx]
+        unsafe { &*(self.descriptors.add(idx)) }
     }
 
     fn descriptor_mut(&mut self, idx: usize) -> &mut Descriptor {
-        &mut self.table_mut().descriptors[idx]
+        unsafe { &mut *(self.descriptors.add(idx)) }
     }
 }
 
@@ -179,25 +180,34 @@ impl TranslationTableManager {
         })
     }
 
+    fn initial_level(&self) -> i8 {
+        self.granule.initial_level(self.txsz)
+    }
+
+    fn layout_for_level(&self, level: i8) -> Layout {
+        self.granule.layout_for_level(level)
+    }
+
     pub fn get_granule(&self) -> Aarch64TranslationGranule {
         self.granule
     }
 
     pub fn get_top_ttbr_layout(&self) -> anyhow::Result<Layout> {
-        Ok(Layout::from_size_align(
-            core::mem::size_of::<Table>(),
-            self.granule.page_size() as usize,
-        )?)
+        Ok(self.layout_for_level(self.initial_level()))
     }
 
     fn get_ttbr_at(
         &self,
         memory_mgr: &GuestMemoryManager,
         ipa: GuestIpaAddress,
-    ) -> anyhow::Result<&mut Table> {
-        let sz = core::mem::size_of::<Table>();
+    ) -> anyhow::Result<TableMetadata> {
+        let sz = self.get_top_ttbr_layout()?.size();
         let slice = memory_mgr.get_memory_slice_by_ipa(ipa, sz)?;
-        Ok(unsafe { &mut *(slice.as_mut_ptr() as *mut Table) })
+        Ok(TableMetadata {
+            level: self.initial_level(),
+            descriptors: slice.as_mut_ptr() as *mut Descriptor,
+            start: ipa,
+        })
     }
 
     fn get_top_table(
@@ -206,25 +216,9 @@ impl TranslationTableManager {
         va: GuestVaAddress,
     ) -> anyhow::Result<TableMetadata> {
         let top_bit = (va.0 >> 55) & 1 == 1;
-        let initial_level: i8 = self.granule.initial_level(self.txsz);
-        let table_meta = if top_bit {
-            let ipa = self.ttbr1;
-            let table = self.get_ttbr_at(memory_mgr, ipa)?;
-            TableMetadata {
-                start: ipa,
-                level: initial_level,
-                table,
-            }
-        } else {
-            let ipa = self.ttbr0;
-            let table = self.get_ttbr_at(memory_mgr, ipa)?;
-            TableMetadata {
-                start: ipa,
-                level: initial_level,
-                table,
-            }
-        };
-        Ok(table_meta)
+        let initial_level: i8 = self.initial_level();
+        let ipa = if top_bit { self.ttbr1 } else { self.ttbr0 };
+        return Ok(self.get_ttbr_at(memory_mgr, ipa)?);
     }
 
     pub fn setup(
@@ -271,11 +265,14 @@ impl TranslationTableManager {
                         return Ok(Some(ipa.add(offset)));
                     }
                     let table_ptr = mm
-                        .get_memory_slice_by_ipa(ipa, core::mem::size_of::<Table>())?
-                        .as_mut_ptr() as *mut Table;
+                        .get_memory_slice_by_ipa(
+                            ipa,
+                            self.layout_for_level(table.level + 1).size(),
+                        )?
+                        .as_mut_ptr() as *mut Descriptor;
                     table = TableMetadata {
                         level: table.level + 1,
-                        table: table_ptr,
+                        descriptors: table_ptr,
                         start: ipa,
                     }
                 }
@@ -454,19 +451,16 @@ impl TranslationTableManager {
                 let ipa = bits(descriptor.0, 47, self.granule.page_size_bits() as u64);
                 let ipa = GuestIpaAddress(ipa);
                 let table_ptr = memory_mgr
-                    .get_memory_slice_by_ipa(ipa, core::mem::size_of::<Table>())?
-                    .as_mut_ptr() as *mut Table;
+                    .get_memory_slice_by_ipa(ipa, self.layout_for_level(level + 1).size())?
+                    .as_mut_ptr() as *mut Descriptor;
                 Ok(TableMetadata {
                     level: level + 1,
-                    table: table_ptr,
+                    descriptors: table_ptr,
                     start: ipa,
                 })
             }
             0b00 => {
-                let layout = core::alloc::Layout::from_size_align(
-                    core::mem::size_of::<Table>(),
-                    1 << self.granule.max_bits_per_level(),
-                )?;
+                let layout = self.layout_for_level(level + 1);
                 trace!(
                     "will allocate memory for table level {}, index {}, layout {:?}",
                     level,
@@ -478,7 +472,7 @@ impl TranslationTableManager {
                 descriptor.0 |= ipa.0;
                 Ok(TableMetadata {
                     level: level + 1,
-                    table: ptr as *mut _,
+                    descriptors: ptr as *mut _,
                     start: ipa,
                 })
             }
