@@ -1,6 +1,5 @@
 use std::path::Path;
 
-
 use crate::{
     addresses::{GuestIpaAddress, VaIpa},
     GuestVaAddress, HvMemoryFlags, Offset,
@@ -177,8 +176,8 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
                     .get_memory_slice(va, section.size() as usize)
                     .with_context(|| {
                         format!(
-                            "error getting the slice of memory for section \"{}\"",
-                            section_name
+                            "error getting the slice of memory for section \"{}\" at {:?}",
+                            section_name, va
                         )
                     })?;
                 slice.copy_from_slice(data);

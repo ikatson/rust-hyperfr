@@ -35,7 +35,7 @@ impl Aarch64PageSize {
 
     pub fn initial_level(&self, txsz: u8) -> i8 {
         warn!("rewrite initial_level(), it's a stub now");
-        0
+        2
     }
 
     pub fn block_size_bits(&self, table_level: i8) -> Option<u8> {
@@ -204,6 +204,18 @@ impl TranslationTableManager {
     ) -> anyhow::Result<()> {
         // check invariants, then call into setup_internal
         let table = self.get_top_table(memory_mgr, va)?;
+
+        let aligner = self.granule.aligner();
+        if !aligner.is_aligned(va.0) {
+            bail!("{:?} is not aligned", va)
+        }
+        if !aligner.is_aligned(ipa.0) {
+            bail!("{:?} is not aligned", ipa)
+        }
+        if !aligner.is_aligned(size as u64) {
+            bail!("size {:#x?} is not aligned", size)
+        }
+
         self.setup_internal(table, memory_mgr, va, ipa, size as u64, flags)
     }
 
@@ -213,7 +225,19 @@ impl TranslationTableManager {
         va: GuestVaAddress,
     ) -> anyhow::Result<Option<GuestIpaAddress>> {
         let mut table = self.get_top_table(mm, va)?;
+        trace!(
+            "simulate_address_lookup {:?}, starting at level {}, table at {:?}",
+            va,
+            table.level,
+            table.start
+        );
         loop {
+            trace!(
+                "simulate_address_lookup {:?}, level {}, table at {:?}",
+                va,
+                table.level,
+                table.start
+            );
             let (bt, bb) = self.granule.bits_range(table.level);
             let index = bits(va.0, bt, bb) >> bb;
             let d = table.descriptor(index as usize);
@@ -221,8 +245,9 @@ impl TranslationTableManager {
                 0b11 => {
                     let psb = self.granule.page_size_bits() as u64;
                     let ipa = GuestIpaAddress(bits(d.0, 47, psb));
+                    trace!("descriptor ipa at level {}: {:?}", table.level, ipa);
                     if table.level == 3 {
-                        let offset = Offset(va.0 & !((1 << psb) - 1));
+                        let offset = Offset(va.0 & ((1 << psb) - 1));
                         return Ok(Some(ipa.add(offset)));
                     }
                     let table_ptr = mm
@@ -245,7 +270,8 @@ impl TranslationTableManager {
                         }
                     };
                     let ipa = GuestIpaAddress(bits(d.0, 47, block_size_bits as u64));
-                    let offset = Offset(va.0 & !((1 << block_size_bits) - 1));
+                    trace!("descriptor block ipa at level {}: {:?}", table.level, ipa);
+                    let offset = Offset(va.0 & ((1 << block_size_bits) - 1));
                     return Ok(Some(ipa.add(offset)));
                 }
                 _ => return Ok(None),
@@ -262,12 +288,15 @@ impl TranslationTableManager {
         size: u64,
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
-        // behave like all the invariants are all set
+        debug_assert!(self.granule.aligner().is_aligned(va.0));
+        debug_assert!(self.granule.aligner().is_aligned(ipa.0));
+        debug_assert!(size > 0);
+        debug_assert!(self.granule.aligner().is_aligned(size as u64));
 
         let (bt, bl) = self.granule.bits_range(table.level);
 
         let start_index = bits(va.0, bt, bl) >> bl;
-        let end_index = bits(va.add(Offset(size as u64)).0, bt, bl) >> bl;
+        let end_index = bits(va.add(Offset((size - 1) as u64)).0, bt, bl) >> bl;
         let block_size = 1u64 << bl;
 
         trace!(
@@ -285,7 +314,6 @@ impl TranslationTableManager {
                     let new_va = block_start_va;
                     let offset = Offset(block_start_va - va.0);
                     let ipa = ipa.add(offset);
-                    trace!("va.0 < block_start_va, {:?}", offset);
                     let size = (size - offset.0).min(block_size);
                     (new_va, ipa, size)
                 } else {
@@ -293,19 +321,9 @@ impl TranslationTableManager {
                     let va = va.0;
                     let offset = Offset(va - block_start_va);
                     let ipa = ipa;
-                    trace!("va.0 >= block_start_va, {:?}", offset);
                     let size = size.min(block_size - offset.0);
                     (va, ipa, size)
                 };
-
-                trace!(
-                    "va={:#x?}, index={}, block_start_va={:#x?}, bt={}, bl={}",
-                    va,
-                    idx,
-                    block_start_va,
-                    bt,
-                    bl
-                );
                 (GuestVaAddress(va), ipa, size)
             };
             self.setup_one(table, idx as u16, memory_mgr, va, ipa, size, flags)?;
@@ -328,6 +346,12 @@ impl TranslationTableManager {
             "setup_one: table.level={}, table.ipa={:#x?}, index={}, va={:#x?}, ipa={:#x?}, size={}, flags={:?}",
             table.level, table.start.0, index, va.0, ipa.0, size, flags
         );
+
+        debug_assert!(self.granule.aligner().is_aligned(va.0));
+        debug_assert!(self.granule.aligner().is_aligned(ipa.0));
+        debug_assert!(size > 0);
+        debug_assert!(self.granule.aligner().is_aligned(size as u64));
+
         if table.level == 3 {
             trace!(
                 "writing l3={}, va={:#x?}, ipa={:#x?}, size={}, flags={:?}",
@@ -428,10 +452,13 @@ impl TranslationTableManager {
                     core::mem::size_of::<Table>(),
                     1 << self.granule.max_bits_per_level(),
                 )?;
+                trace!(
+                    "will allocate memory for table level {}, index {}, layout {:?}",
+                    level,
+                    index,
+                    &layout
+                );
                 let (ptr, ipa) = memory_mgr.allocate(layout)?;
-
-                trace!("writing l{}={}, next ipa={:#x?}", level, index, ipa.0,);
-
                 descriptor.0 |= 0b11;
                 descriptor.0 |= ipa.0;
                 Ok(TableMetadata {

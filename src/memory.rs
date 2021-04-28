@@ -162,7 +162,11 @@ impl GuestMemoryManager {
         &self,
         va: GuestVaAddress,
     ) -> anyhow::Result<Option<GuestIpaAddress>> {
-        self.translation_table_mgr.simulate_address_lookup(self, va)
+        let maybe_ipa = self
+            .translation_table_mgr
+            .simulate_address_lookup(self, va)?;
+        trace!("simulate_address_lookup {:?} => {:?}", va, &maybe_ipa);
+        Ok(maybe_ipa)
     }
 
     pub fn configure_page_tables(

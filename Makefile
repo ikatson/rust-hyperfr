@@ -10,12 +10,12 @@ bindgen:
 
 .PHONY: build
 build:
-	@ cargo build --release
-	@ codesign --entitlements vz.entitlements -s - target/release/main
+	@ cargo build
+	@ codesign --entitlements vz.entitlements -s - target/debug/main
 
 .PHONY: run
 run: build
-	@ RUST_BACKTRACE=1 target/release/main /Users/igor/projects/2021-04-os-hypervisor-framework/armos/target/aarch64-unknown-none/release/armos
+	@ RUST_BACKTRACE=1 target/debug/main /Users/igor/projects/2021-04-os-hypervisor-framework/armos/target/aarch64-unknown-none/release/armos
 
 
 .PHONY: test
