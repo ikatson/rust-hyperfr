@@ -183,13 +183,16 @@ impl GuestMemoryManager {
 }
 
 impl MemoryManager for GuestMemoryManager {
-    fn get_binary_load_address(&self) -> VaIpa {
-        VaIpa {
-            va: self.dram_va_start.add(self.usable_memory_offset),
-            ipa: self.dram_ipa_start.add(self.usable_memory_offset),
-        }
+    fn get_va(&self, offset: Offset) -> GuestVaAddress {
+        GuestMemoryManager::get_va(self, offset)
     }
 
+    fn get_ipa(&self, offset: Offset) -> GuestIpaAddress {
+        GuestMemoryManager::get_ipa(self, offset)
+    }
+    fn aligner(&self) -> crate::aligner::Aligner {
+        self.translation_table_mgr.get_granule().aligner()
+    }
     fn simulate_address_lookup(
         &self,
         va: GuestVaAddress,
@@ -207,5 +210,9 @@ impl MemoryManager for GuestMemoryManager {
     }
     fn get_memory_slice(&mut self, va: GuestVaAddress, size: usize) -> anyhow::Result<&mut [u8]> {
         GuestMemoryManager::get_memory_slice(self, va, size)
+    }
+
+    fn allocate(&mut self, layout: Layout) -> anyhow::Result<(*mut u8, GuestIpaAddress)> {
+        GuestMemoryManager::allocate(self, layout)
     }
 }

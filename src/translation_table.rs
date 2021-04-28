@@ -150,6 +150,10 @@ impl TranslationTableManager {
         })
     }
 
+    pub fn get_granule(&self) -> Aarch64PageSize {
+        self.granule
+    }
+
     pub fn get_top_ttbr_layout(&self) -> anyhow::Result<Layout> {
         Ok(Layout::from_size_align(
             core::mem::size_of::<Table>(),

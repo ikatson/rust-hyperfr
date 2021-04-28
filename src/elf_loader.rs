@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{alloc::Layout, path::Path};
 
 use crate::{
     addresses::{GuestIpaAddress, VaIpa},
@@ -14,7 +14,10 @@ pub struct LoadedElf {
     pub used_dram_size: u64,
 }
 pub trait MemoryManager {
-    fn get_binary_load_address(&self) -> VaIpa;
+    fn aligner(&self) -> crate::aligner::Aligner;
+    fn allocate(&mut self, layout: Layout) -> anyhow::Result<(*mut u8, GuestIpaAddress)>;
+    fn get_va(&self, offset: Offset) -> GuestVaAddress;
+    fn get_ipa(&self, offset: Offset) -> GuestIpaAddress;
     fn simulate_address_lookup(
         &self,
         va: GuestVaAddress,
@@ -47,33 +50,38 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
         va: GuestVaAddress,
     }
 
-    let (va_offset, ipa_offset) = {
-        let vaipa = mm.get_binary_load_address();
-        (vaipa.va, vaipa.ipa)
-    };
+    let mut segments = Vec::new();
+    for segment in obj.segments() {
+        let start = segment.address();
+        let end = segment.address() + segment.size();
+        let aligned_start = mm.aligner().align_down(start);
+        let aligned_end = mm.aligner().align_up(end);
+        let aligned_size = aligned_end - aligned_start;
 
-    let mut segments = obj
-        .segments()
-        .scan(Offset(0), |mut_offset, segment| {
-            let start = segment.address();
-            let end = segment.address() + segment.size();
-            let aligned_start = crate::aligner::ALIGNER_16K.align_down(start);
-            let aligned_end = crate::aligner::ALIGNER_16K.align_up(end);
-            let aligned_size = aligned_end - aligned_start;
+        let (_, ipa) = mm.allocate(Layout::from_size_align(
+            aligned_size as usize,
+            segment.align() as usize,
+        )?)?;
 
-            let offset = *mut_offset;
-            *mut_offset = mut_offset.add(Offset(aligned_size));
-            let ipa = ipa_offset.add(offset);
-            let va = va_offset.add(Offset(aligned_start));
-            Some(SegmentState {
-                segment,
-                aligned_size,
-                ipa,
-                va,
-                flags: HvMemoryFlags::HV_MEMORY_READ,
-            })
-        })
-        .collect::<Vec<_>>();
+        let zero = Offset(0);
+        let ipa_start = mm.get_ipa(zero);
+        let offset = Offset(ipa.0 - ipa_start.0);
+        let va = mm.get_va(offset);
+
+        let ss = SegmentState {
+            segment,
+            aligned_size,
+            ipa,
+            va,
+            flags: HvMemoryFlags::HV_MEMORY_READ,
+        };
+        segments.push(ss)
+    }
+
+    let va_offset = segments
+        .get(0)
+        .map(|s| s.va)
+        .ok_or_else(|| anyhow!("no segments found"))?;
 
     let used_dram_size = segments.iter().map(|s| s.aligned_size).sum();
 
