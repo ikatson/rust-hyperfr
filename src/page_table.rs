@@ -139,7 +139,7 @@ impl Default for TranslationTableLevel2_16k {
     }
 }
 
-const fn bits(val: u64, start_inclusive: u64, end_inclusive: u64) -> u64 {
+pub const fn bits(val: u64, start_inclusive: u64, end_inclusive: u64) -> u64 {
     val & ((1 << (start_inclusive + 1)) - 1) & !((1 << end_inclusive) - 1)
 }
 
