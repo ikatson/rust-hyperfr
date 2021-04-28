@@ -215,25 +215,43 @@ impl TranslationTableManager {
         let end_index = bits(va.add(Offset(size as u64)).0, bt, bl) >> bl;
         let block_size = 1u64 << bl;
 
+        trace!(
+            "setup_internal: table.level={}, table.ipa={:#x?}, start_index={}, end_index={}, bt={}, bl={}, va={:#x?}, ipa={:#x?}, size={}, flags={:?}",
+            table.level, table.start.0, start_index, end_index, bt, bl, va.0, ipa.0, size, flags
+        );
+
         for idx in start_index..=end_index {
             let (va, ipa, size) = {
                 let top_bits = bits(!0, 63, bt + 1);
                 let index_bits = idx << bl;
                 let block_start_va = (va.0 & top_bits) | index_bits;
+
+                let (va, ipa, size) = if va.0 < block_start_va {
+                    let new_va = block_start_va;
+                    let offset = Offset(block_start_va - va.0);
+                    let ipa = ipa.add(offset);
+                    trace!("va.0 < block_start_va, {:?}", offset);
+                    let size = (size - offset.0).min(block_size);
+                    (new_va, ipa, size)
+                } else {
+                    // The only reason this could be happening is that va is inside the block.
+                    let va = va.0;
+                    let offset = Offset(va - block_start_va);
+                    let ipa = ipa;
+                    trace!("va.0 >= block_start_va, {:?}", offset);
+                    let size = size.min(block_size - offset.0);
+                    (va, ipa, size)
+                };
+
                 trace!(
                     "va={:#x?}, index={}, block_start_va={:#x?}, bt={}, bl={}",
-                    va.0,
+                    va,
                     idx,
                     block_start_va,
                     bt,
                     bl
                 );
-                let block_end_va = block_start_va + block_size;
-                let va_this_block = va.0.max(block_start_va);
-                let va_this_block_end = block_end_va.min(va.0 + size);
-                let size = va_this_block_end - va_this_block;
-                let ipa = ipa.add(Offset(va_this_block - va.0));
-                (GuestVaAddress(va_this_block), ipa, size)
+                (GuestVaAddress(va), ipa, size)
             };
             self.setup_one(table, idx as u16, memory_mgr, va, ipa, size, flags)?;
         }
@@ -386,9 +404,16 @@ mod tests {
         let ttmgr = TranslationTableManager::new(Aarch64PageSize::P16k, 28).unwrap();
 
         // Setup identity mapping with offset.
-        let offset = GuestVaAddress(0x0000_ffff_0000_0000);
+        // let offset = GuestVaAddress(0x0000_ffff_0000_0000);
+        let offset = GuestVaAddress(0);
         ttmgr
-            .setup(&mut mgr, offset, ipa, 48 * 1024 * 1024, HvMemoryFlags::ALL)
+            .setup(
+                &mut mgr,
+                offset,
+                ipa,
+                32 * 1024 * 1024 + 16384,
+                HvMemoryFlags::ALL,
+            )
             .unwrap()
     }
 }
