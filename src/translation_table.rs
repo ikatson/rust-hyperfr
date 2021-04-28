@@ -6,7 +6,7 @@ use crate::{
     memory::GuestMemoryManager,
 };
 use crate::{aligner::Aligner, HvMemoryFlags};
-use anyhow::{anyhow, bail, Context};
+use anyhow::bail;
 use log::{trace, warn};
 
 #[derive(Debug, Copy, Clone)]
@@ -34,13 +34,38 @@ impl Aarch64PageSize {
     }
 
     pub fn initial_level(&self, txsz: u8) -> i8 {
-        warn!("rewrite initial_level(), it's a stub now");
-        2
+        match self {
+            Aarch64PageSize::P4k => match txsz {
+                12..=15 => -1,
+                16..=24 => 0,
+                25..=33 => 1,
+                34..=42 => 2,
+                43..=48 => 3,
+                _ => unimplemented!(),
+            },
+            Aarch64PageSize::P16k => match txsz {
+                12..=16 => 0,
+                17..=27 => 1,
+                28..=38 => 2,
+                39..=48 => 3,
+                _ => unimplemented!(),
+            },
+            Aarch64PageSize::P64k => match txsz {
+                12..=21 => 1,
+                22..=34 => 2,
+                35..=47 => 3,
+                _ => unimplemented!(),
+            },
+        }
     }
 
     pub fn block_size_bits(&self, table_level: i8) -> Option<u8> {
         match self {
             Aarch64PageSize::P4k => match table_level {
+                3 => None,
+                2 => Some(21),
+                1 => Some(30),
+                0 => None,
                 _ => unimplemented!(),
             },
             Aarch64PageSize::P16k => match table_level {
@@ -51,6 +76,10 @@ impl Aarch64PageSize {
                 _ => unimplemented!(),
             },
             Aarch64PageSize::P64k => match table_level {
+                3 => None,
+                2 => Some(29),
+                1 => None,
+                0 => None,
                 _ => unimplemented!(),
             },
         }

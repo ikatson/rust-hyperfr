@@ -3,11 +3,9 @@ use std::{alloc::Layout, path::Path, sync::Arc};
 use vm_memory::GuestMemoryMmap;
 
 use crate::{
-    addresses::{GuestIpaAddress, GuestVaAddress, Offset, VaIpa},
+    addresses::{GuestIpaAddress, GuestVaAddress, Offset},
     elf_loader::{self, LoadedElf, MemoryManager},
-    layout::TTBR_SIZE,
-    page_table,
-    translation_table::{self, Aarch64PageSize, Table, TranslationTableManager},
+    translation_table::{Aarch64PageSize, TranslationTableManager},
     HvMemoryFlags,
 };
 use anyhow::{anyhow, Context};
@@ -24,20 +22,6 @@ pub struct GuestMemoryManager {
     dram_va_start: GuestVaAddress,
     memory_size: usize,
     usable_memory_offset: Offset,
-}
-
-struct TtbrLocation {
-    ptr: *mut Table,
-    ipa: GuestIpaAddress,
-}
-
-impl Default for TtbrLocation {
-    fn default() -> Self {
-        Self {
-            ptr: core::ptr::null_mut(),
-            ipa: GuestIpaAddress(0),
-        }
-    }
 }
 
 impl GuestMemoryManager {
