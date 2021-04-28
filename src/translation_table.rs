@@ -39,7 +39,9 @@ impl Aarch64TranslationGranule {
                 _ => unimplemented!(),
             },
             Aarch64TranslationGranule::P16k => match level {
-                _ => Layout::from_size_align(core::mem::size_of::<[Descriptor; 2048]>(), 1 << 14)
+                0 => Layout::from_size_align(core::mem::size_of::<[Descriptor; 2]>(), 1 << 11)
+                    .unwrap(),
+                _ => Layout::from_size_align(core::mem::size_of::<[Descriptor; 2048]>(), 1 << 11)
                     .unwrap(),
             },
             Aarch64TranslationGranule::P64k => match level {
