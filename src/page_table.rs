@@ -140,7 +140,13 @@ impl Default for TranslationTableLevel2_16k {
 }
 
 pub const fn bits(val: u64, start_inclusive: u64, end_inclusive: u64) -> u64 {
-    val & ((1 << (start_inclusive + 1)) - 1) & !((1 << end_inclusive) - 1)
+    let top_mask = match start_inclusive {
+        63 => u64::MAX,
+        0..=62 => (1u64 << (start_inclusive + 1)) - 1,
+        _ => 0,
+    };
+    let bottom_mask = !((1 << end_inclusive) - 1);
+    val & top_mask & bottom_mask
 }
 
 impl TranslationTableLevel2_16k {

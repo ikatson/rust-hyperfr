@@ -47,7 +47,9 @@ impl Aligner {
         if !(is_power_of_two(number)) {
             bail!("{} is not a power of 2", number);
         }
-        Ok(Self { mask: number - 1 })
+        Ok(Self {
+            mask: !(number - 1),
+        })
     }
 }
 

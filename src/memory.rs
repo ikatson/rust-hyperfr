@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::{alloc::Layout, path::Path, sync::Arc};
 
 use vm_memory::GuestMemoryMmap;
 
@@ -9,7 +9,7 @@ use crate::{
     page_table, HvMemoryFlags,
 };
 use anyhow::{anyhow, Context};
-use log::debug;
+use log::{debug, trace};
 use vm_memory::GuestMemory;
 
 #[derive(Debug)]
@@ -40,6 +40,23 @@ impl GuestMemoryManager {
             // This is temporary
             usable_memory_offset: Self::get_binary_offset(),
         })
+    }
+
+    pub fn allocate(&mut self, layout: Layout) -> anyhow::Result<(*mut u8, GuestIpaAddress)> {
+        let a = crate::aligner::Aligner::new_from_power_of_two(layout.align() as u64)?;
+        let offset = Offset(a.align_up(self.usable_memory_offset.0));
+        let size = layout.size();
+        let ipa = self.dram_ipa_start.add(offset);
+        let host_ptr = self
+            .get_memory_slice_by_ipa(self.dram_ipa_start.add(offset), size)?
+            .as_mut_ptr();
+        self.usable_memory_offset = offset.add(Offset(size as u64));
+        trace!(
+            "allocated {} bytes of guest memory, ipa {:#x?}",
+            size,
+            ipa.0
+        );
+        Ok((host_ptr, ipa))
     }
 
     pub fn load_elf<P: AsRef<Path>>(&mut self, filename: P) -> anyhow::Result<LoadedElf> {
