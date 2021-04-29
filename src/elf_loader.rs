@@ -12,12 +12,13 @@ pub struct LoadedElf {
 }
 pub trait MemoryManager {
     fn aligner(&self) -> crate::aligner::Aligner;
+    fn consume_va(&mut self, size: usize) -> GuestVaAddress;
     fn allocate(
         &mut self,
         layout: Layout,
         purpose: core::fmt::Arguments<'_>,
     ) -> anyhow::Result<(*mut u8, GuestIpaAddress)>;
-    fn get_binary_load_address(&self) -> GuestVaAddress;
+    fn get_binary_load_address(&mut self) -> GuestVaAddress;
     fn simulate_address_lookup(
         &self,
         va: GuestVaAddress,
@@ -64,6 +65,7 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
         let layout = Layout::from_size_align(aligned_size as usize, segment.align() as usize)?;
         let (_, ipa) = mm.allocate(layout, format_args!("LOAD segment {}", idx))?;
         let va = va_offset.add(Offset(aligned_start));
+        mm.consume_va(aligned_size as usize);
 
         let ss = SegmentState {
             segment,

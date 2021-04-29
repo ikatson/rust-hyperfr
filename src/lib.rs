@@ -371,7 +371,9 @@ impl VCpu {
     }
 
     fn get_stack_end(&self) -> GuestVaAddress {
-        STACK_END.checked_sub(Offset(STACK_SIZE * self.id)).unwrap()
+        let dram_config = self.memory_manager.get_dram_config().unwrap();
+        let size = dram_config.size - (STACK_SIZE * self.id);
+        dram_config.start_va.add(Offset(size))
     }
 
     fn debug_data_abort(&mut self, iss: u32) -> anyhow::Result<()> {
@@ -492,9 +494,8 @@ impl VCpu {
         };
 
         {
-            let start_params_va = self
-                .memory_manager
-                .get_va(self.memory_manager.get_usable_memory_offset());
+            let dram_config = self.memory_manager.get_dram_config().unwrap();
+            let start_params_va = dram_config.start_va;
             let usable_memory_start =
                 start_params_va.add(Offset(core::mem::size_of::<StartParams>() as u64));
 
@@ -541,7 +542,7 @@ impl VCpu {
         //
 
         // self.enable_soft_debug()?;
-        // self.spawn_cancel_thread();
+        self.spawn_cancel_thread();
         // self.set_pending_irq()?;
 
         self.set_sys_reg(

@@ -92,20 +92,20 @@ impl Aarch64TranslationGranule {
                 25..=33 => 1,
                 34..=42 => 2,
                 43..=48 => 3,
-                _ => unimplemented!(),
+                _ => panic!("txsz + granule configuration not supported by aarch64"),
             },
             Aarch64TranslationGranule::P16k => match txsz {
                 12..=16 => 0,
                 17..=27 => 1,
                 28..=38 => 2,
                 39..=48 => 3,
-                _ => unimplemented!(),
+                _ => panic!("txsz + granule configuration not supported by aarch64"),
             },
             Aarch64TranslationGranule::P64k => match txsz {
                 12..=21 => 1,
                 22..=34 => 2,
                 35..=47 => 3,
-                _ => unimplemented!(),
+                _ => panic!("txsz + granule configuration not supported by aarch64"),
             },
         }
     }

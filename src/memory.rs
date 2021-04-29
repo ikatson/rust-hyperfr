@@ -4,6 +4,7 @@ use vm_memory::GuestMemoryMmap;
 
 use crate::{
     addresses::{GuestIpaAddress, GuestVaAddress, Offset},
+    aligner::Aligner,
     elf_loader::{self, LoadedElf, MemoryManager},
     translation_table::{Aarch64TranslationGranule, TranslationTableManager},
     HvMemoryFlags,
@@ -11,6 +12,12 @@ use crate::{
 use anyhow::{anyhow, Context};
 use log::{debug, trace};
 use vm_memory::GuestMemory;
+
+#[derive(Debug, Clone, Copy)]
+pub struct DramConfig {
+    pub start_va: GuestVaAddress,
+    pub size: u64,
+}
 
 #[derive(Debug)]
 pub struct GuestMemoryManager {
@@ -21,7 +28,9 @@ pub struct GuestMemoryManager {
     dram_ipa_start: GuestIpaAddress,
     dram_va_start: GuestVaAddress,
     memory_size: usize,
-    usable_memory_offset: Offset,
+    used_ipa: Offset,
+    used_va: Offset,
+    dram_config: Option<DramConfig>,
 }
 
 impl GuestMemoryManager {
@@ -46,10 +55,12 @@ impl GuestMemoryManager {
             dram_ipa_start: ipa_start,
             dram_va_start: va_start,
             memory_size: size,
+            used_ipa: Offset(0),
+            used_va: Offset(0),
             // This is temporary
-            usable_memory_offset: Offset(0),
             ttbr0: GuestIpaAddress(0),
             ttbr1: GuestIpaAddress(0),
+            dram_config: None,
         };
 
         let ttbr_layout = mm.translation_table_mgr.get_top_ttbr_layout()?;
@@ -85,13 +96,13 @@ impl GuestMemoryManager {
         purpose: core::fmt::Arguments<'_>,
     ) -> anyhow::Result<(*mut u8, GuestIpaAddress)> {
         let a = crate::aligner::Aligner::new_from_power_of_two(layout.align() as u64)?;
-        let offset = Offset(a.align_up(self.usable_memory_offset.0));
+        let offset = Offset(a.align_up(self.used_ipa.0));
         let size = layout.size();
         let ipa = self.dram_ipa_start.add(offset);
         let host_ptr = self
             .get_memory_slice_by_ipa(self.dram_ipa_start.add(offset), size)?
             .as_mut_ptr();
-        self.usable_memory_offset = offset.add(Offset(size as u64));
+        self.used_ipa = offset.add(Offset(size as u64));
         trace!(
             "allocated memory for {}, ipa {:#x?}, layout size {:?}, align {:#x?}",
             purpose,
@@ -104,18 +115,37 @@ impl GuestMemoryManager {
 
     pub fn load_elf<P: AsRef<Path>>(&mut self, filename: P) -> anyhow::Result<LoadedElf> {
         let loaded = elf_loader::load_elf(self, filename)?;
-        self.usable_memory_offset = self.usable_memory_offset.add(Offset(loaded.used_dram_size));
+        self.used_ipa = self.used_ipa.add(Offset(loaded.used_dram_size));
         Ok(loaded)
     }
 
-    pub fn get_usable_memory_offset(&self) -> Offset {
-        self.usable_memory_offset
+    pub fn get_next_va(&mut self, align: usize) -> anyhow::Result<GuestVaAddress> {
+        let aligner = Aligner::new_from_power_of_two(align as u64)?;
+        let next_va = self.get_va(self.get_used_va()).0;
+        let aligned_next_va = aligner.align_up(next_va);
+        if aligned_next_va > next_va {
+            self.used_va = self.used_va.add(Offset(aligned_next_va - next_va))
+        }
+        Ok(self.dram_va_start.add(self.used_va))
+    }
+
+    pub fn get_used_va(&self) -> Offset {
+        self.used_va
+    }
+
+    #[allow(dead_code)]
+    pub fn get_used_ipa(&self) -> Offset {
+        self.used_ipa
+    }
+
+    pub fn get_dram_config(&self) -> Option<DramConfig> {
+        self.dram_config
     }
 
     pub fn configure_dram(&mut self) -> anyhow::Result<()> {
-        let ipa = self.dram_ipa_start.add(self.usable_memory_offset);
-        let va = self.dram_va_start.add(self.usable_memory_offset);
-        let usable_memory_size = (self.memory_size as u64 - self.usable_memory_offset.0) as usize;
+        let ipa = self.dram_ipa_start.add(self.used_ipa);
+        let va = self.dram_va_start.add(self.used_va);
+        let usable_memory_size = (self.memory_size as u64 - self.used_ipa.0) as usize;
         // This is the RAM that the kernel is free to use for whatever purpose, e.g. allocating.
         debug!(
             "configuring translation tables for DRAM, ipa {:#x?}, va {:#x?}, usable memory size {}",
@@ -124,6 +154,10 @@ impl GuestMemoryManager {
 
         self.configure_page_tables(ipa, va, usable_memory_size, HvMemoryFlags::ALL)
             .context("error configuring page tables for DRAM")?;
+        self.dram_config = Some(DramConfig {
+            start_va: va,
+            size: usable_memory_size as u64,
+        });
         Ok(())
     }
 
@@ -177,8 +211,9 @@ impl GuestMemoryManager {
 }
 
 impl MemoryManager for GuestMemoryManager {
-    fn get_binary_load_address(&self) -> GuestVaAddress {
-        self.get_va(self.usable_memory_offset)
+    fn get_binary_load_address(&mut self) -> GuestVaAddress {
+        self.get_next_va(self.translation_table_mgr.get_granule().page_size() as usize)
+            .unwrap()
     }
     fn aligner(&self) -> crate::aligner::Aligner {
         self.translation_table_mgr.get_granule().aligner()
@@ -200,6 +235,11 @@ impl MemoryManager for GuestMemoryManager {
     }
     fn get_memory_slice(&mut self, va: GuestVaAddress, size: usize) -> anyhow::Result<&mut [u8]> {
         GuestMemoryManager::get_memory_slice(self, va, size)
+    }
+
+    fn consume_va(&mut self, size: usize) -> GuestVaAddress {
+        self.used_va = self.used_va.add(Offset(size as u64));
+        self.get_va(self.used_ipa)
     }
 
     fn allocate(

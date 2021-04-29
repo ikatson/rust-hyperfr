@@ -14,7 +14,6 @@ pub const DRAM_VA_START: GuestVaAddress = VA_START.add(Offset(DRAM_IPA_START.0))
 pub const MEMORY_SIZE: usize = 128 * 1024 * 1024;
 
 pub const STACK_SIZE: u64 = 1024 * 1024;
-pub const STACK_END: GuestVaAddress = DRAM_VA_START.add(Offset(MEMORY_SIZE as u64));
 
 pub const TCR_EL1_IPS: u64 = 0b001 << 32; // 64 GB
 pub const TCR_EL1_HA: u64 = 1 << 39;
