@@ -12,13 +12,18 @@ pub struct LoadedElf {
 }
 pub trait MemoryManager {
     fn aligner(&self) -> crate::aligner::Aligner;
+    fn get_binary_load_address(&mut self) -> GuestVaAddress;
     fn consume_va(&mut self, size: usize) -> GuestVaAddress;
-    fn allocate(
+    fn allocate_va(
+        &mut self,
+        layout: Layout,
+        purpose: core::fmt::Arguments<'_>,
+    ) -> anyhow::Result<GuestVaAddress>;
+    fn allocate_ipa(
         &mut self,
         layout: Layout,
         purpose: core::fmt::Arguments<'_>,
     ) -> anyhow::Result<(*mut u8, GuestIpaAddress)>;
-    fn get_binary_load_address(&mut self) -> GuestVaAddress;
     fn simulate_address_lookup(
         &self,
         va: GuestVaAddress,
@@ -59,13 +64,17 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
         let start = segment.address();
         let end = segment.address() + segment.size();
         let aligned_start = mm.aligner().align_down(start);
+        if idx == 0 {
+            dbg!(mm.consume_va(aligned_start as usize));
+        }
         let aligned_end = mm.aligner().align_up(end);
         let aligned_size = aligned_end - aligned_start;
 
         let layout = Layout::from_size_align(aligned_size as usize, segment.align() as usize)?;
-        let (_, ipa) = mm.allocate(layout, format_args!("LOAD segment {}", idx))?;
-        let va = va_offset.add(Offset(aligned_start));
-        mm.consume_va(aligned_size as usize);
+        // let va = va_offset.add(Offset(aligned_start));
+        let (_, ipa) = mm.allocate_ipa(layout, format_args!("LOAD segment {}", idx))?;
+        let va = mm.allocate_va(layout, format_args!("LOAD segment {}", idx))?;
+        // dbg!(mm.consume_va(aligned_size as usize));
 
         let ss = SegmentState {
             segment,

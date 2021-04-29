@@ -443,6 +443,20 @@ impl TranslationTableManager {
         debug_assert!(self.granule.aligner().is_aligned(size as u64));
 
         if table.level == 3 {
+            let d = table.descriptor_mut(index as usize);
+
+            if d.0 & 0b11 != 0 {
+                bail!(
+                    "page already set up. Old value {:#x?}, l3={}, va={:#x?}, ipa={:#x?}, size={}, flags={:?}",
+                    d.0,
+                    index,
+                    va,
+                    ipa,
+                    size,
+                    flags
+                );
+            }
+
             trace!(
                 "writing page l3={}, va={:#x?}, ipa={:#x?}, size={}, flags={:?}",
                 index,
@@ -451,7 +465,7 @@ impl TranslationTableManager {
                 size,
                 flags
             );
-            let d = table.descriptor_mut(index as usize);
+
             let mut v: u64 = 0b11;
             v |= 1 << 10; // AF=1
             v |= 0b10 << 8; // SH
@@ -539,7 +553,7 @@ impl TranslationTableManager {
             }
             0b00 => {
                 let layout = self.layout_for_level(level + 1);
-                let (ptr, ipa) = memory_mgr.allocate(
+                let (ptr, ipa) = memory_mgr.allocate_ipa(
                     layout,
                     format_args!("translation table level {}, index {}", level, index),
                 )?;

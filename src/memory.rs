@@ -44,8 +44,8 @@ impl GuestMemoryManager {
                 .context("error allocating guest memory")?,
         );
 
-        let granule = Aarch64TranslationGranule::P16k;
-        let txsz = 17;
+        let granule = Aarch64TranslationGranule::P4k;
+        let txsz = 28;
         let tmp_ttmgr =
             TranslationTableManager::new(granule, txsz, GuestIpaAddress(0), GuestIpaAddress(0))?;
 
@@ -65,8 +65,8 @@ impl GuestMemoryManager {
 
         let ttbr_layout = mm.translation_table_mgr.get_top_ttbr_layout()?;
 
-        let (_, ttbr0) = mm.allocate(ttbr_layout, format_args!("TTBR0"))?;
-        let (_, ttbr1) = mm.allocate(ttbr_layout, format_args!("TTBR1"))?;
+        let (_, ttbr0) = mm.allocate_ipa(ttbr_layout, format_args!("TTBR0"))?;
+        let (_, ttbr1) = mm.allocate_ipa(ttbr_layout, format_args!("TTBR1"))?;
         mm.translation_table_mgr = TranslationTableManager::new(granule, txsz, ttbr0, ttbr1)?;
         mm.ttbr0 = ttbr0;
         mm.ttbr1 = ttbr1;
@@ -90,7 +90,27 @@ impl GuestMemoryManager {
         self.translation_table_mgr.get_txsz()
     }
 
-    pub fn allocate(
+    pub fn allocate_va(
+        &mut self,
+        layout: Layout,
+        purpose: core::fmt::Arguments<'_>,
+    ) -> anyhow::Result<GuestVaAddress> {
+        let a = crate::aligner::Aligner::new_from_power_of_two(layout.align() as u64)?;
+        let offset = Offset(a.align_up(self.used_va.0));
+        let size = layout.size();
+        let va = self.dram_va_start.add(offset);
+        self.used_va = offset.add(Offset(size as u64));
+        trace!(
+            "allocated VA address space for {}, {:#x?}, layout size {:?}, align {:#x?}",
+            purpose,
+            va,
+            layout.size(),
+            layout.align()
+        );
+        Ok(va)
+    }
+
+    pub fn allocate_ipa(
         &mut self,
         layout: Layout,
         purpose: core::fmt::Arguments<'_>,
@@ -104,7 +124,7 @@ impl GuestMemoryManager {
             .as_mut_ptr();
         self.used_ipa = offset.add(Offset(size as u64));
         trace!(
-            "allocated memory for {}, ipa {:#x?}, layout size {:?}, align {:#x?}",
+            "allocated IPA address space for {}, ipa {:#x?}, layout size {:?}, align {:#x?}",
             purpose,
             ipa.0,
             layout.size(),
@@ -242,11 +262,19 @@ impl MemoryManager for GuestMemoryManager {
         self.get_va(self.used_ipa)
     }
 
-    fn allocate(
+    fn allocate_ipa(
         &mut self,
         layout: Layout,
         purpose: core::fmt::Arguments<'_>,
     ) -> anyhow::Result<(*mut u8, GuestIpaAddress)> {
-        GuestMemoryManager::allocate(self, layout, purpose)
+        GuestMemoryManager::allocate_ipa(self, layout, purpose)
+    }
+
+    fn allocate_va(
+        &mut self,
+        layout: Layout,
+        purpose: core::fmt::Arguments<'_>,
+    ) -> anyhow::Result<GuestVaAddress> {
+        GuestMemoryManager::allocate_va(self, layout, purpose)
     }
 }
