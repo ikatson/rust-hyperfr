@@ -59,13 +59,23 @@ impl Aarch64TranslationGranule {
     pub fn layout_for_level(&self, level: i8) -> Layout {
         match self {
             Aarch64TranslationGranule::P4k => match level {
-                _ => unimplemented!(),
+                _ => Layout::from_size_align(
+                    core::mem::size_of::<[Descriptor; 512]>(),
+                    1 << self.page_size_bits(),
+                )
+                .unwrap(),
             },
             Aarch64TranslationGranule::P16k => match level {
-                0 => Layout::from_size_align(core::mem::size_of::<[Descriptor; 2]>(), 1 << 14)
-                    .unwrap(),
-                _ => Layout::from_size_align(core::mem::size_of::<[Descriptor; 2048]>(), 1 << 14)
-                    .unwrap(),
+                0 => Layout::from_size_align(
+                    core::mem::size_of::<[Descriptor; 2]>(),
+                    self.page_size() as usize,
+                )
+                .unwrap(),
+                _ => Layout::from_size_align(
+                    core::mem::size_of::<[Descriptor; 2048]>(),
+                    self.page_size() as usize,
+                )
+                .unwrap(),
             },
             Aarch64TranslationGranule::P64k => match level {
                 _ => unimplemented!(),
