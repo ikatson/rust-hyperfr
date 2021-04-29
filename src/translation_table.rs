@@ -6,7 +6,7 @@ use crate::{
 };
 use crate::{aligner::Aligner, HvMemoryFlags};
 use anyhow::bail;
-use log::{trace, warn};
+use log::trace;
 
 pub const fn bits(val: u64, start_inclusive: u64, end_inclusive: u64) -> u64 {
     let top_mask = match start_inclusive {
@@ -19,6 +19,7 @@ pub const fn bits(val: u64, start_inclusive: u64, end_inclusive: u64) -> u64 {
 }
 
 #[derive(Debug, Copy, Clone)]
+#[allow(dead_code)]
 pub enum Aarch64TranslationGranule {
     P4k,
     P16k,
@@ -139,6 +140,7 @@ impl Aarch64TranslationGranule {
         self.block_size_bits(table_level).map(|b| 1 << b)
     }
 
+    #[allow(dead_code)]
     pub const fn max_bits_per_level(&self) -> u8 {
         match self {
             Aarch64TranslationGranule::P4k => 9,

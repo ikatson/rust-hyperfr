@@ -5,8 +5,6 @@ use crate::addresses::*;
 // At that address we load the kernel itself, including exception vector table.
 // VA_START + 1GB = DRAM
 
-pub const VA_PAGE: u64 = 1 << 14;
-
 pub const DRAM_IPA_START: GuestIpaAddress = GuestIpaAddress(0x80_0000);
 pub const VA_START: GuestVaAddress = GuestVaAddress(0xffff_fff0_0000_0000);
 pub const DRAM_VA_START: GuestVaAddress = VA_START.add(Offset(DRAM_IPA_START.0));

@@ -48,9 +48,3 @@ impl core::fmt::Debug for Offset {
         f.write_fmt(format_args!("Offset({:#x?})", self.0))
     }
 }
-
-#[derive(Debug)]
-pub struct VaIpa {
-    pub va: GuestVaAddress,
-    pub ipa: GuestIpaAddress,
-}
