@@ -12,8 +12,6 @@ pub struct LoadedElf {
 }
 pub trait MemoryManager {
     fn aligner(&self) -> crate::aligner::Aligner;
-    fn get_binary_load_address(&mut self) -> GuestVaAddress;
-    fn consume_va(&mut self, size: usize) -> GuestVaAddress;
     fn allocate_va(
         &mut self,
         layout: Layout,
@@ -68,12 +66,6 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
         let start = segment.address();
         let end = segment.address() + segment.size();
         let aligned_start = mm.aligner().align_down(start);
-        if idx == 0 {
-            mm.allocate_va(
-                Layout::from_size_align(aligned_start as usize, segment.align() as usize)?,
-                format_args!("offset for the first segment"),
-            )?;
-        }
         let aligned_end = mm.aligner().align_up(end);
         let aligned_size = aligned_end - aligned_start;
 
@@ -99,6 +91,9 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
     }
 
     if let Some(last) = segments.last() {
+        // Consume all the virtual address space needed for this binary.
+        // Not all of it will be mapped later, just the required portions, but if the ELF is wasteful, so
+        // will be the VA space.
         mm.allocate_va(
             Layout::from_size_align(
                 (last.va.0 - va_offset.0 + last.aligned_size) as usize,

@@ -4,7 +4,6 @@ use vm_memory::GuestMemoryMmap;
 
 use crate::{
     addresses::{GuestIpaAddress, GuestVaAddress, Offset},
-    aligner::Aligner,
     elf_loader::{self, LoadedElf, MemoryManager},
     translation_table::{Aarch64TranslationGranule, TranslationTableManager},
     HvMemoryFlags,
@@ -45,7 +44,7 @@ impl GuestMemoryManager {
         );
 
         let granule = Aarch64TranslationGranule::P16k;
-        let txsz = 28;
+        let txsz = 17;
         let tmp_ttmgr =
             TranslationTableManager::new(granule, txsz, GuestIpaAddress(0), GuestIpaAddress(0))?;
 
@@ -139,25 +138,6 @@ impl GuestMemoryManager {
         Ok(loaded)
     }
 
-    pub fn get_next_va(&mut self, align: usize) -> anyhow::Result<GuestVaAddress> {
-        let aligner = Aligner::new_from_power_of_two(align as u64)?;
-        let next_va = self.get_va(self.get_used_va()).0;
-        let aligned_next_va = aligner.align_up(next_va);
-        if aligned_next_va > next_va {
-            self.used_va = self.used_va.add(Offset(aligned_next_va - next_va))
-        }
-        Ok(self.dram_va_start.add(self.used_va))
-    }
-
-    pub fn get_used_va(&self) -> Offset {
-        self.used_va
-    }
-
-    #[allow(dead_code)]
-    pub fn get_used_ipa(&self) -> Offset {
-        self.used_ipa
-    }
-
     pub fn get_dram_config(&self) -> Option<DramConfig> {
         self.dram_config
     }
@@ -231,10 +211,6 @@ impl GuestMemoryManager {
 }
 
 impl MemoryManager for GuestMemoryManager {
-    fn get_binary_load_address(&mut self) -> GuestVaAddress {
-        self.get_next_va(self.translation_table_mgr.get_granule().page_size() as usize)
-            .unwrap()
-    }
     fn aligner(&self) -> crate::aligner::Aligner {
         self.translation_table_mgr.get_granule().aligner()
     }
@@ -255,11 +231,6 @@ impl MemoryManager for GuestMemoryManager {
     }
     fn get_memory_slice(&mut self, va: GuestVaAddress, size: usize) -> anyhow::Result<&mut [u8]> {
         GuestMemoryManager::get_memory_slice(self, va, size)
-    }
-
-    fn consume_va(&mut self, size: usize) -> GuestVaAddress {
-        self.used_va = self.used_va.add(Offset(size as u64));
-        self.get_va(self.used_ipa)
     }
 
     fn allocate_ipa(
