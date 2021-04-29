@@ -1,6 +1,5 @@
 use std::alloc::Layout;
 
-use crate::page_table::bits;
 use crate::{
     addresses::{GuestIpaAddress, GuestVaAddress, Offset},
     memory::GuestMemoryManager,
@@ -8,6 +7,16 @@ use crate::{
 use crate::{aligner::Aligner, HvMemoryFlags};
 use anyhow::bail;
 use log::{trace, warn};
+
+pub const fn bits(val: u64, start_inclusive: u64, end_inclusive: u64) -> u64 {
+    let top_mask = match start_inclusive {
+        63 => u64::MAX,
+        0..=62 => (1u64 << (start_inclusive + 1)) - 1,
+        _ => 0,
+    };
+    let bottom_mask = !((1 << end_inclusive) - 1);
+    val & top_mask & bottom_mask
+}
 
 #[derive(Debug, Copy, Clone)]
 pub enum Aarch64TranslationGranule {
@@ -17,6 +26,20 @@ pub enum Aarch64TranslationGranule {
 }
 
 impl Aarch64TranslationGranule {
+    pub const fn tg0_bits(&self) -> u64 {
+        match self {
+            Aarch64TranslationGranule::P4k => 0,
+            Aarch64TranslationGranule::P16k => 0b10 << 14,
+            Aarch64TranslationGranule::P64k => 0b01 << 14,
+        }
+    }
+    pub const fn tg1_bits(&self) -> u64 {
+        match self {
+            Aarch64TranslationGranule::P4k => 0b10 << 30,
+            Aarch64TranslationGranule::P16k => 0b01 << 30,
+            Aarch64TranslationGranule::P64k => 0b11 << 30,
+        }
+    }
     pub const fn page_size_bits(&self) -> u8 {
         match self {
             Aarch64TranslationGranule::P4k => 12,
@@ -39,9 +62,9 @@ impl Aarch64TranslationGranule {
                 _ => unimplemented!(),
             },
             Aarch64TranslationGranule::P16k => match level {
-                0 => Layout::from_size_align(core::mem::size_of::<[Descriptor; 2]>(), 1 << 11)
+                0 => Layout::from_size_align(core::mem::size_of::<[Descriptor; 2]>(), 1 << 14)
                     .unwrap(),
-                _ => Layout::from_size_align(core::mem::size_of::<[Descriptor; 2048]>(), 1 << 11)
+                _ => Layout::from_size_align(core::mem::size_of::<[Descriptor; 2048]>(), 1 << 14)
                     .unwrap(),
             },
             Aarch64TranslationGranule::P64k => match level {
@@ -192,6 +215,10 @@ impl TranslationTableManager {
 
     pub fn get_granule(&self) -> Aarch64TranslationGranule {
         self.granule
+    }
+
+    pub fn get_txsz(&self) -> u8 {
+        self.txsz
     }
 
     pub fn get_top_ttbr_layout(&self) -> anyhow::Result<Layout> {

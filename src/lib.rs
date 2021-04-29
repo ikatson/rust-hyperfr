@@ -16,7 +16,6 @@ mod bindgen_util;
 mod elf_loader;
 mod layout;
 mod memory;
-mod page_table;
 mod translation_table;
 
 use addresses::{GuestIpaAddress, GuestVaAddress, Offset};
@@ -446,11 +445,11 @@ impl VCpu {
             {
                 let mut tcr_el1 = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_TCR_EL1)?;
 
-                tcr_el1 |= TCR_EL1_TG0_GRANULE
-                    | TCR_EL1_TG1_GRANULE
+                tcr_el1 |= self.memory_manager.get_granule().tg0_bits()
+                    | self.memory_manager.get_granule().tg1_bits()
                     | TCR_EL1_IPS
-                    | TCR_EL1_T0SZ
-                    | TCR_EL1_T1SZ
+                    | self.memory_manager.get_txsz() as u64
+                    | ((self.memory_manager.get_txsz() as u64) << 16)
                     | TCR_EL1_HA
                     | TCR_EL1_HD;
                 self.set_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_TCR_EL1, tcr_el1, "TCR_EL1")?;

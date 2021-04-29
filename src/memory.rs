@@ -71,6 +71,14 @@ impl GuestMemoryManager {
         self.ttbr1
     }
 
+    pub fn get_granule(&self) -> Aarch64TranslationGranule {
+        self.translation_table_mgr.get_granule()
+    }
+
+    pub fn get_txsz(&self) -> u8 {
+        self.translation_table_mgr.get_txsz()
+    }
+
     pub fn allocate(&mut self, layout: Layout) -> anyhow::Result<(*mut u8, GuestIpaAddress)> {
         let a = crate::aligner::Aligner::new_from_power_of_two(layout.align() as u64)?;
         let offset = Offset(a.align_up(self.usable_memory_offset.0));
