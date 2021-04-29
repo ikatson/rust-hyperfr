@@ -54,8 +54,8 @@ impl GuestMemoryManager {
 
         let ttbr_layout = mm.translation_table_mgr.get_top_ttbr_layout()?;
 
-        let (_, ttbr0) = mm.allocate(ttbr_layout)?;
-        let (_, ttbr1) = mm.allocate(ttbr_layout)?;
+        let (_, ttbr0) = mm.allocate(ttbr_layout, format_args!("TTBR0"))?;
+        let (_, ttbr1) = mm.allocate(ttbr_layout, format_args!("TTBR1"))?;
         mm.translation_table_mgr = TranslationTableManager::new(granule, txsz, ttbr0, ttbr1)?;
         mm.ttbr0 = ttbr0;
         mm.ttbr1 = ttbr1;
@@ -79,7 +79,11 @@ impl GuestMemoryManager {
         self.translation_table_mgr.get_txsz()
     }
 
-    pub fn allocate(&mut self, layout: Layout) -> anyhow::Result<(*mut u8, GuestIpaAddress)> {
+    pub fn allocate(
+        &mut self,
+        layout: Layout,
+        purpose: core::fmt::Arguments<'_>,
+    ) -> anyhow::Result<(*mut u8, GuestIpaAddress)> {
         let a = crate::aligner::Aligner::new_from_power_of_two(layout.align() as u64)?;
         let offset = Offset(a.align_up(self.usable_memory_offset.0));
         let size = layout.size();
@@ -89,9 +93,11 @@ impl GuestMemoryManager {
             .as_mut_ptr();
         self.usable_memory_offset = offset.add(Offset(size as u64));
         trace!(
-            "allocated {} bytes of guest memory, ipa {:#x?}",
-            size,
-            ipa.0
+            "allocated memory for {}, ipa {:#x?}, layout size {:?}, align {:#x?}",
+            purpose,
+            ipa.0,
+            layout.size(),
+            layout.align()
         );
         Ok((host_ptr, ipa))
     }
@@ -123,10 +129,6 @@ impl GuestMemoryManager {
 
     pub fn get_va(&self, offset: Offset) -> GuestVaAddress {
         self.dram_va_start.add(offset)
-    }
-
-    pub fn get_ipa(&self, offset: Offset) -> GuestIpaAddress {
-        self.dram_ipa_start.add(offset)
     }
 
     pub fn get_size(&self) -> usize {
@@ -175,12 +177,8 @@ impl GuestMemoryManager {
 }
 
 impl MemoryManager for GuestMemoryManager {
-    fn get_va(&self, offset: Offset) -> GuestVaAddress {
-        GuestMemoryManager::get_va(self, offset)
-    }
-
-    fn get_ipa(&self, offset: Offset) -> GuestIpaAddress {
-        GuestMemoryManager::get_ipa(self, offset)
+    fn get_binary_load_address(&self) -> GuestVaAddress {
+        self.get_va(self.usable_memory_offset)
     }
     fn aligner(&self) -> crate::aligner::Aligner {
         self.translation_table_mgr.get_granule().aligner()
@@ -204,7 +202,11 @@ impl MemoryManager for GuestMemoryManager {
         GuestMemoryManager::get_memory_slice(self, va, size)
     }
 
-    fn allocate(&mut self, layout: Layout) -> anyhow::Result<(*mut u8, GuestIpaAddress)> {
-        GuestMemoryManager::allocate(self, layout)
+    fn allocate(
+        &mut self,
+        layout: Layout,
+        purpose: core::fmt::Arguments<'_>,
+    ) -> anyhow::Result<(*mut u8, GuestIpaAddress)> {
+        GuestMemoryManager::allocate(self, layout, purpose)
     }
 }

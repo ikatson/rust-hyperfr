@@ -12,9 +12,12 @@ pub struct LoadedElf {
 }
 pub trait MemoryManager {
     fn aligner(&self) -> crate::aligner::Aligner;
-    fn allocate(&mut self, layout: Layout) -> anyhow::Result<(*mut u8, GuestIpaAddress)>;
-    fn get_va(&self, offset: Offset) -> GuestVaAddress;
-    fn get_ipa(&self, offset: Offset) -> GuestIpaAddress;
+    fn allocate(
+        &mut self,
+        layout: Layout,
+        purpose: core::fmt::Arguments<'_>,
+    ) -> anyhow::Result<(*mut u8, GuestIpaAddress)>;
+    fn get_binary_load_address(&self) -> GuestVaAddress;
     fn simulate_address_lookup(
         &self,
         va: GuestVaAddress,
@@ -48,22 +51,19 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
     }
 
     let mut segments = Vec::new();
-    for segment in obj.segments() {
+
+    let va_offset = mm.get_binary_load_address();
+
+    for (idx, segment) in obj.segments().enumerate() {
         let start = segment.address();
         let end = segment.address() + segment.size();
         let aligned_start = mm.aligner().align_down(start);
         let aligned_end = mm.aligner().align_up(end);
         let aligned_size = aligned_end - aligned_start;
 
-        let (_, ipa) = mm.allocate(Layout::from_size_align(
-            aligned_size as usize,
-            segment.align() as usize,
-        )?)?;
-
-        let zero = Offset(0);
-        let ipa_start = mm.get_ipa(zero);
-        let offset = Offset(ipa.0 - ipa_start.0);
-        let va = mm.get_va(offset);
+        let layout = Layout::from_size_align(aligned_size as usize, segment.align() as usize)?;
+        let (_, ipa) = mm.allocate(layout, format_args!("LOAD segment {}", idx))?;
+        let va = va_offset.add(Offset(aligned_start));
 
         let ss = SegmentState {
             segment,
@@ -74,11 +74,6 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
         };
         segments.push(ss)
     }
-
-    let va_offset = segments
-        .get(0)
-        .map(|s| s.va)
-        .ok_or_else(|| anyhow!("no segments found"))?;
 
     let used_dram_size = segments.iter().map(|s| s.aligned_size).sum();
 

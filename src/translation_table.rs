@@ -539,13 +539,10 @@ impl TranslationTableManager {
             }
             0b00 => {
                 let layout = self.layout_for_level(level + 1);
-                trace!(
-                    "will allocate memory for table level {}, index {}, layout {:?}",
-                    level,
-                    index,
-                    &layout
-                );
-                let (ptr, ipa) = memory_mgr.allocate(layout)?;
+                let (ptr, ipa) = memory_mgr.allocate(
+                    layout,
+                    format_args!("translation table level {}, index {}", level, index),
+                )?;
                 descriptor.0 |= 0b11;
                 descriptor.0 |= ipa.0;
                 Ok(TableMetadata {
