@@ -45,7 +45,7 @@ impl GuestMemoryManager {
         );
 
         let granule = Aarch64TranslationGranule::P16k;
-        let txsz = 28;
+        let txsz = 17;
         let tmp_ttmgr =
             TranslationTableManager::new(granule, txsz, GuestIpaAddress(0), GuestIpaAddress(0))?;
 
