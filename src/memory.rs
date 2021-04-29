@@ -44,7 +44,7 @@ impl GuestMemoryManager {
                 .context("error allocating guest memory")?,
         );
 
-        let granule = Aarch64TranslationGranule::P4k;
+        let granule = Aarch64TranslationGranule::P16k;
         let txsz = 28;
         let tmp_ttmgr =
             TranslationTableManager::new(granule, txsz, GuestIpaAddress(0), GuestIpaAddress(0))?;

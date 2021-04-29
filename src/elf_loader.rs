@@ -50,6 +50,7 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
 
     struct SegmentState<'a, 'b> {
         segment: object::Segment<'a, 'b>,
+        aligned_start: u64,
         aligned_size: u64,
         flags: HvMemoryFlags,
         ipa: GuestIpaAddress,
@@ -58,32 +59,53 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
 
     let mut segments = Vec::new();
 
-    let va_offset = mm.get_binary_load_address();
+    let va_offset = mm.allocate_va(
+        Layout::from_size_align(0, mm.aligner().align_up(1) as usize)?,
+        format_args!("kernel loading"),
+    )?;
 
     for (idx, segment) in obj.segments().enumerate() {
         let start = segment.address();
         let end = segment.address() + segment.size();
         let aligned_start = mm.aligner().align_down(start);
         if idx == 0 {
-            dbg!(mm.consume_va(aligned_start as usize));
+            mm.allocate_va(
+                Layout::from_size_align(aligned_start as usize, segment.align() as usize)?,
+                format_args!("offset for the first segment"),
+            )?;
         }
         let aligned_end = mm.aligner().align_up(end);
         let aligned_size = aligned_end - aligned_start;
 
+        trace!("segment {}, start={:#x?}, end={:#x?}, size={}, aligned_start={:#x?}, aligned_end={:#x?}, aligned_size={}",
+            idx, start, end, segment.size(), aligned_start, aligned_end, aligned_size
+        );
+
         let layout = Layout::from_size_align(aligned_size as usize, segment.align() as usize)?;
-        // let va = va_offset.add(Offset(aligned_start));
+        let va = va_offset.add(Offset(aligned_start));
         let (_, ipa) = mm.allocate_ipa(layout, format_args!("LOAD segment {}", idx))?;
-        let va = mm.allocate_va(layout, format_args!("LOAD segment {}", idx))?;
+        // let va = mm.allocate_va(layout, format_args!("LOAD segment {}", idx))?;
         // dbg!(mm.consume_va(aligned_size as usize));
 
         let ss = SegmentState {
             segment,
             aligned_size,
+            aligned_start,
             ipa,
             va,
             flags: HvMemoryFlags::HV_MEMORY_READ,
         };
         segments.push(ss)
+    }
+
+    if let Some(last) = segments.last() {
+        mm.allocate_va(
+            Layout::from_size_align(
+                (last.va.0 - va_offset.0 + last.aligned_size) as usize,
+                mm.aligner().align_up(1) as usize,
+            )?,
+            format_args!("virtual address space for the binary"),
+        )?;
     }
 
     let used_dram_size = segments.iter().map(|s| s.aligned_size).sum();
@@ -170,7 +192,11 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
                 format!("error getting section data for section {}", section_name)
             })?;
 
-            let va = va_offset.add(Offset(section.address()));
+            let va = {
+                let segment_state = &segments[segment_idx];
+                let offset = Offset(section.address() - segment_state.aligned_start);
+                segment_state.va.add(offset)
+            };
 
             let ipa = mm.simulate_address_lookup(va)?.ok_or_else(|| {
                 anyhow!(
