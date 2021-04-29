@@ -187,6 +187,8 @@ pub struct TranslationTableManager {
     ttbr0: GuestIpaAddress,
     ttbr1: GuestIpaAddress,
     granule: Aarch64TranslationGranule,
+    ips_size: u64,
+    ips_bits: u8,
     txsz: u8,
 }
 
@@ -197,10 +199,14 @@ impl TranslationTableManager {
         ttbr0: GuestIpaAddress,
         ttbr1: GuestIpaAddress,
     ) -> anyhow::Result<Self> {
+        let ips_bits = 36;
+        let ips_size = 1 << ips_bits;
         Ok(Self {
             ttbr0,
             ttbr1,
             granule,
+            ips_size,
+            ips_bits,
             txsz,
         })
     }
@@ -245,9 +251,26 @@ impl TranslationTableManager {
         va: GuestVaAddress,
     ) -> anyhow::Result<TableMetadata> {
         let top_bit = (va.0 >> 55) & 1 == 1;
-        let initial_level: i8 = self.initial_level();
         let ipa = if top_bit { self.ttbr1 } else { self.ttbr0 };
-        return Ok(self.get_ttbr_at(memory_mgr, ipa)?);
+
+        // Just a double-check for debugging
+        // In pseudo-code this was:
+        // if !IsZero(baseregister < 47: outputsize > ) -> throw AddressFault
+        assert_eq!(bits(ipa.0, 47, self.ips_bits as u64), 0);
+
+        if top_bit {
+            // Make sure all bits <top:inputsize> are ones.
+            // where inputsize = 64 - TxSZ and top=55
+            assert_eq!(
+                bits(va.0, 55, 64 - self.txsz as u64),
+                bits(u64::MAX, 55, 64 - self.txsz as u64)
+            )
+        } else {
+            // Make sure all bits up to TXSZ are zeroes.
+            assert_eq!(bits(va.0, 55, 64 - self.txsz as u64), 0)
+        }
+
+        self.get_ttbr_at(memory_mgr, ipa)
     }
 
     pub fn setup(
@@ -271,6 +294,20 @@ impl TranslationTableManager {
         if !aligner.is_aligned(size as u64) {
             bail!("size {:#x?} is not aligned", size)
         }
+
+        match ipa.0.checked_add(size as u64) {
+            Some(ipa_end) => {
+                if ipa_end >= self.ips_size {
+                    bail!(
+                        "ipa {:#x?} / and or ipa + size are too large, does not fit into the TXSZ
+                        space which is limited by address {:#x?}",
+                        ipa,
+                        self.ips_size - 1
+                    )
+                }
+            }
+            None => bail!("ipa + size overflow, {:?}, size {:?}", ipa, size),
+        };
 
         self.setup_internal(table, memory_mgr, va, ipa, size as u64, flags)
     }
