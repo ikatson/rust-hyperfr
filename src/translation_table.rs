@@ -59,13 +59,11 @@ impl Aarch64TranslationGranule {
 
     pub fn layout_for_level(&self, level: i8) -> Layout {
         match self {
-            Aarch64TranslationGranule::P4k => match level {
-                _ => Layout::from_size_align(
-                    core::mem::size_of::<[Descriptor; 512]>(),
-                    1 << self.page_size_bits(),
-                )
-                .unwrap(),
-            },
+            Aarch64TranslationGranule::P4k => Layout::from_size_align(
+                core::mem::size_of::<[Descriptor; 512]>(),
+                self.page_size() as usize,
+            )
+            .unwrap(),
             Aarch64TranslationGranule::P16k => match level {
                 0 => Layout::from_size_align(
                     core::mem::size_of::<[Descriptor; 2]>(),
@@ -78,9 +76,7 @@ impl Aarch64TranslationGranule {
                 )
                 .unwrap(),
             },
-            Aarch64TranslationGranule::P64k => match level {
-                _ => unimplemented!(),
-            },
+            Aarch64TranslationGranule::P64k => unimplemented!(),
         }
     }
 
@@ -177,7 +173,7 @@ impl Aarch64TranslationGranule {
 
 struct Descriptor(u64);
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 struct TableMetadata {
     start: GuestIpaAddress,
     level: i8,
@@ -334,6 +330,13 @@ impl TranslationTableManager {
             let (bt, bb) = self.granule.bits_range(table.level);
             let index = bits(va.0, bt, bb) >> bb;
             let d = table.descriptor(index as usize);
+            trace!(
+                "simulate_address_lookup: va={:?}, table={:?}, index={}, d.value={:#x?}",
+                va,
+                &table,
+                index,
+                d.0
+            );
             match d.0 & 0b11 {
                 0b11 => {
                     let psb = self.granule.page_size_bits() as u64;

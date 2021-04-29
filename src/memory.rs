@@ -8,7 +8,7 @@ use crate::{
     translation_table::{Aarch64TranslationGranule, TranslationTableManager},
     HvMemoryFlags,
 };
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use log::{debug, trace};
 use vm_memory::GuestMemory;
 
@@ -43,8 +43,17 @@ impl GuestMemoryManager {
                 .context("error allocating guest memory")?,
         );
 
-        let granule = Aarch64TranslationGranule::P16k;
-        let txsz = 17;
+        let granule = match std::env::var("GRANULE").as_deref().unwrap_or_default() {
+            "4" => Aarch64TranslationGranule::P4k,
+            "" | "16" => Aarch64TranslationGranule::P16k,
+            other => bail!("GRANULE={} is not supported, try 4,16 or 64", other),
+        };
+        let txsz: u8 = match std::env::var("TXSZ") {
+            Ok(v) => v
+                .parse()
+                .with_context(|| format!("error parsing envvar TXSZ={} as u8", &v))?,
+            Err(_) => 28,
+        };
         let tmp_ttmgr =
             TranslationTableManager::new(granule, txsz, GuestIpaAddress(0), GuestIpaAddress(0))?;
 
