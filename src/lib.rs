@@ -252,13 +252,11 @@ impl VCpu {
         }
 
         macro_rules! dump_sys_reg {
-            ($reg:ident) => {
-                debug!(
-                    "{}: {:#x}",
-                    &stringify!($reg)[24..],
-                    self.get_sys_reg(bindgen::$reg)?
-                );
-            };
+            ($reg:ident) => {{
+                let value = self.get_sys_reg(bindgen::$reg)?;
+                debug!("{}: {:#x}", &stringify!($reg)[24..], value);
+                value
+            }};
         }
 
         macro_rules! dump_feature_reg {
@@ -317,7 +315,7 @@ impl VCpu {
 
         // The PC to return to from exception.
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_ELR_EL1);
-        dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_FAR_EL1);
+        let far_el1 = GuestVaAddress(dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_FAR_EL1));
 
         // Page table registers.
         dump_sys_reg!(hv_sys_reg_t_HV_SYS_REG_TTBR0_EL1);
@@ -347,7 +345,29 @@ impl VCpu {
 
         let esr_el1 = self.get_sys_reg(bindgen::hv_sys_reg_t_HV_SYS_REG_ESR_EL1)?;
         if esr_el1 != 0 {
-            debug!("ESR EL1 decoded: {:#x?}", Syndrome::from(esr_el1));
+            let syndrome = Syndrome::from(esr_el1);
+            debug!("ESR EL1 decoded: {:#x?}", &syndrome);
+            use aarch64_debug::*;
+            match syndrome.exception_class {
+                EXC_INSTR_ABORT_LOWER
+                | EXC_INSTR_ABORT_SAME
+                | EXC_DATA_ABORT_SAME
+                | EXC_DATA_ABORT_LOWER => {
+                    match self.memory_manager.simulate_address_lookup(far_el1) {
+                        Ok(lookup) => match lookup {
+                            Some(ipa) => info!("FAR_EL1 {:?} => {:?}", far_el1, ipa),
+                            None => error!("didn't find IPA for FAR_EL1 {:?}", far_el1),
+                        },
+                        Err(e) => {
+                            error!(
+                                "error trying to simulate lookup of FAR_EL1 {:?}: {:?}",
+                                far_el1, e
+                            )
+                        }
+                    }
+                }
+                _ => {}
+            }
         };
         Ok(())
     }
