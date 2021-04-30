@@ -20,6 +20,7 @@ pretty_env_logger = "0.4"
 vm-memory = {version = "*", features = ["backend-mmap"]}
 paste = "1"
 byteorder = "1"
+rayon = "1"
 
 [profile.release]
 debug = true

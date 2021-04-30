@@ -147,6 +147,9 @@ struct TableMetadata {
     descriptors: *mut Descriptor,
 }
 
+unsafe impl Sync for TableMetadata {}
+unsafe impl Send for TableMetadata {}
+
 impl TableMetadata {
     fn descriptor(&self, idx: usize) -> &Descriptor {
         unsafe { &*(self.descriptors.add(idx)) }
@@ -259,7 +262,7 @@ impl TranslationTableManager {
 
     pub fn setup(
         &self,
-        memory_mgr: &mut GuestMemoryManager,
+        memory_mgr: &GuestMemoryManager,
         va: GuestVaAddress,
         ipa: GuestIpaAddress,
         size: usize,
@@ -355,7 +358,7 @@ impl TranslationTableManager {
     fn setup_internal(
         &self,
         table: TableMetadata,
-        memory_mgr: &mut GuestMemoryManager,
+        memory_mgr: &GuestMemoryManager,
         va: GuestVaAddress,
         ipa: GuestIpaAddress,
         size: u64,
@@ -377,30 +380,34 @@ impl TranslationTableManager {
             table.level, table.start.0, start_index, end_index, bt, bl, va.0, ipa.0, size, flags
         );
 
-        for idx in start_index..=end_index {
-            let (va, ipa, size) = {
-                let top_bits = bits(!0, 63, bt + 1);
-                let index_bits = idx << bl;
-                let block_start_va = (va.0 & top_bits) | index_bits;
+        use rayon::prelude::*;
 
-                let (va, ipa, size) = if va.0 < block_start_va {
-                    let new_va = block_start_va;
-                    let offset = Offset(block_start_va - va.0);
-                    let ipa = ipa.add(offset);
-                    let size = (size - offset.0).min(block_size);
-                    (new_va, ipa, size)
-                } else {
-                    // The only reason this could be happening is that va is inside the block.
-                    let va = va.0;
-                    let offset = Offset(va - block_start_va);
-                    let ipa = ipa;
-                    let size = size.min(block_size - offset.0);
-                    (va, ipa, size)
+        (start_index..=end_index)
+            .into_par_iter()
+            .try_for_each(|idx| {
+                let (va, ipa, size) = {
+                    let top_bits = bits(!0, 63, bt + 1);
+                    let index_bits = idx << bl;
+                    let block_start_va = (va.0 & top_bits) | index_bits;
+
+                    let (va, ipa, size) = if va.0 < block_start_va {
+                        let new_va = block_start_va;
+                        let offset = Offset(block_start_va - va.0);
+                        let ipa = ipa.add(offset);
+                        let size = (size - offset.0).min(block_size);
+                        (new_va, ipa, size)
+                    } else {
+                        // The only reason this could be happening is that va is inside the block.
+                        let va = va.0;
+                        let offset = Offset(va - block_start_va);
+                        let ipa = ipa;
+                        let size = size.min(block_size - offset.0);
+                        (va, ipa, size)
+                    };
+                    (GuestVaAddress(va), ipa, size)
                 };
-                (GuestVaAddress(va), ipa, size)
-            };
-            self.setup_one(table, idx as u16, memory_mgr, va, ipa, size, flags)?;
-        }
+                self.setup_one(table, idx as u16, memory_mgr, va, ipa, size, flags)
+            })?;
 
         Ok(())
     }
@@ -410,7 +417,7 @@ impl TranslationTableManager {
         &self,
         mut table: TableMetadata,
         index: u16,
-        memory_mgr: &mut GuestMemoryManager,
+        memory_mgr: &GuestMemoryManager,
         va: GuestVaAddress,
         ipa: GuestIpaAddress,
         size: u64,
@@ -515,7 +522,7 @@ impl TranslationTableManager {
         &self,
         mut table: TableMetadata,
         index: u16,
-        memory_mgr: &mut GuestMemoryManager,
+        memory_mgr: &GuestMemoryManager,
     ) -> anyhow::Result<TableMetadata> {
         let level = table.level;
         let descriptor = table.descriptor_mut(index as usize);
