@@ -57,15 +57,15 @@ impl Aarch64TranslationGranule {
         Aligner::new_from_mask(mask)
     }
 
-    pub fn layout_for_level(&self, level: i8, txsz: u8) -> Layout {
+    pub const fn layout_for_level(&self, level: i8, txsz: u8) -> Layout {
         let (bt, bl) = self.bits_range(level, txsz);
         let stride = bt - bl + 1;
         let size = core::mem::size_of::<Descriptor>() * (1 << stride);
         let align = 1 << self.page_size_bits();
-        Layout::from_size_align(size, align).unwrap()
+        unsafe { Layout::from_size_align_unchecked(size, align) }
     }
 
-    pub fn initial_level(&self, txsz: u8) -> i8 {
+    pub const fn initial_level(&self, txsz: u8) -> i8 {
         match self {
             Aarch64TranslationGranule::P4k => match txsz {
                 12..=15 => -1,
@@ -73,69 +73,60 @@ impl Aarch64TranslationGranule {
                 25..=33 => 1,
                 34..=42 => 2,
                 43..=48 => 3,
-                _ => panic!("txsz + granule configuration not supported by aarch64"),
+                _ => i8::MIN,
             },
             Aarch64TranslationGranule::P16k => match txsz {
                 12..=16 => 0,
                 17..=27 => 1,
                 28..=38 => 2,
                 39..=48 => 3,
-                _ => panic!("txsz + granule configuration not supported by aarch64"),
+                _ => i8::MIN,
             },
             Aarch64TranslationGranule::P64k => match txsz {
                 12..=21 => 1,
                 22..=34 => 2,
                 35..=47 => 3,
-                _ => panic!("txsz + granule configuration not supported by aarch64"),
+                _ => i8::MIN,
             },
         }
     }
 
-    pub fn block_size_bits(&self, table_level: i8) -> Option<u8> {
+    pub const fn block_size_bits(&self, table_level: i8) -> Option<u8> {
         match self {
             Aarch64TranslationGranule::P4k => match table_level {
-                3 => None,
                 2 => Some(21),
                 1 => Some(30),
-                0 => None,
-                _ => unimplemented!(),
+                _ => None,
             },
             Aarch64TranslationGranule::P16k => match table_level {
-                3 => None,
                 2 => Some(25),
-                1 => None,
-                0 => None,
-                _ => unimplemented!(),
+                _ => None,
             },
             Aarch64TranslationGranule::P64k => match table_level {
-                3 => None,
                 2 => Some(29),
-                1 => None,
-                0 => None,
-                _ => unimplemented!(),
+                _ => None,
             },
         }
     }
 
-    pub fn block_size(&self, table_level: i8) -> Option<u64> {
-        self.block_size_bits(table_level).map(|b| 1 << b)
-    }
-
-    #[allow(dead_code)]
-    pub const fn max_bits_per_level(&self) -> u8 {
-        match self {
-            Aarch64TranslationGranule::P4k => 9,
-            Aarch64TranslationGranule::P16k => 11,
-            Aarch64TranslationGranule::P64k => 13,
+    pub const fn block_size(&self, table_level: i8) -> Option<u64> {
+        // Can't use map in const fn.
+        match self.block_size_bits(table_level) {
+            Some(b) => Some(1 << b),
+            None => None,
         }
     }
 
-    pub fn bits_range(&self, table_level: i8, txsz: u8) -> (u8, u8) {
+    pub const fn max_stride(&self) -> u8 {
+        self.page_size_bits() - 3
+    }
+
+    pub const fn bits_range(&self, table_level: i8, txsz: u8) -> (u8, u8) {
         // Copied this code from TTBRWALK.txt
         let initial_level = self.initial_level(txsz);
 
         let grainsize = self.page_size_bits();
-        let stride = grainsize - 3;
+        let stride = self.max_stride();
 
         let addrselectbottom = (3 - table_level) as u8 * stride + grainsize;
         let addrselecttop = if table_level == initial_level {
