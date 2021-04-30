@@ -57,27 +57,12 @@ impl Aarch64TranslationGranule {
         Aligner::new_from_mask(mask)
     }
 
-    pub fn layout_for_level(&self, level: i8) -> Layout {
-        match self {
-            Aarch64TranslationGranule::P4k => Layout::from_size_align(
-                core::mem::size_of::<[Descriptor; 512]>(),
-                self.page_size() as usize,
-            )
-            .unwrap(),
-            Aarch64TranslationGranule::P16k => match level {
-                0 => Layout::from_size_align(
-                    core::mem::size_of::<[Descriptor; 2]>(),
-                    self.page_size() as usize,
-                )
-                .unwrap(),
-                _ => Layout::from_size_align(
-                    core::mem::size_of::<[Descriptor; 2048]>(),
-                    self.page_size() as usize,
-                )
-                .unwrap(),
-            },
-            Aarch64TranslationGranule::P64k => unimplemented!(),
-        }
+    pub fn layout_for_level(&self, level: i8, txsz: u8) -> Layout {
+        let (bt, bl) = self.bits_range(level, txsz);
+        let stride = bt - bl + 1;
+        let size = core::mem::size_of::<Descriptor>() * (1 << stride);
+        let align = 1 << self.page_size_bits();
+        Layout::from_size_align(size, align).unwrap()
     }
 
     pub fn initial_level(&self, txsz: u8) -> i8 {
@@ -215,7 +200,7 @@ impl TranslationTableManager {
     }
 
     fn layout_for_level(&self, level: i8) -> Layout {
-        self.granule.layout_for_level(level)
+        self.granule.layout_for_level(level, self.txsz)
     }
 
     pub fn get_granule(&self) -> Aarch64TranslationGranule {
