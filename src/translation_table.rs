@@ -41,10 +41,7 @@ pub trait Granule: core::fmt::Debug + Send + Sync {
     fn block_size_bits(&self, table_level: i8) -> Option<u8>;
     fn block_size(&self, table_level: i8) -> Option<u64> {
         // Can't use map in const fn.
-        match self.block_size_bits(table_level) {
-            Some(b) => Some(1 << b),
-            None => None,
-        }
+        self.block_size_bits(table_level).map(|b| 1 << b)
     }
     fn max_stride(&self) -> u8 {
         self.page_size_bits() - 3
@@ -66,8 +63,8 @@ pub trait Granule: core::fmt::Debug + Send + Sync {
     }
 }
 
-static GRANULE_4k: &'static dyn Granule = &Granule4k {};
-static GRANULE_16k: &'static dyn Granule = &Granule16k {};
+static GRANULE_4K: &'static dyn Granule = &Granule4k {};
+static GRANULE_16K: &'static dyn Granule = &Granule16k {};
 
 #[derive(Debug)]
 struct Granule4k {}
@@ -76,7 +73,7 @@ struct Granule16k {}
 
 impl Granule for Granule4k {
     fn get_dyn_self(&self) -> &'static dyn Granule {
-        GRANULE_4k
+        GRANULE_4K
     }
     fn tg0_bits(&self) -> u64 {
         0
@@ -110,7 +107,7 @@ impl Granule for Granule4k {
 
 impl Granule for Granule16k {
     fn get_dyn_self(&self) -> &'static dyn Granule {
-        GRANULE_16k
+        GRANULE_16K
     }
     fn tg0_bits(&self) -> u64 {
         0b10 << 14
@@ -144,6 +141,7 @@ impl Granule for Granule16k {
 pub enum Aarch64TranslationGranule {
     P4k,
     P16k,
+    #[allow(dead_code)]
     P64k,
 }
 struct Descriptor(u64);

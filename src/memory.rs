@@ -12,9 +12,7 @@ use vm_memory::GuestMemoryMmap;
 use crate::{
     addresses::{GuestIpaAddress, GuestVaAddress, Offset},
     elf_loader::{self, LoadedElf, MemoryManager},
-    translation_table::{
-        new_tt_mgr, Aarch64TranslationGranule, Granule, TranslationTableManager, TtMgr,
-    },
+    translation_table::{new_tt_mgr, Aarch64TranslationGranule, Granule, TtMgr},
     HvMemoryFlags,
 };
 use anyhow::{anyhow, bail, Context};
