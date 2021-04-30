@@ -18,7 +18,7 @@ pub const fn bits(val: u64, start_inclusive: u8, end_inclusive: u8) -> u64 {
     val & top_mask & bottom_mask
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum Aarch64TranslationGranule {
     P4k,
@@ -157,49 +157,112 @@ impl TableMetadata {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct TranslationTableManager {
-    ttbr0: GuestIpaAddress,
-    ttbr1: GuestIpaAddress,
-    granule: Aarch64TranslationGranule,
-    ips_size: u64,
-    ips_bits: u8,
-    txsz: u8,
+pub trait TTMgr: core::fmt::Debug + Send + Sync {
+    fn get_granule(&self) -> Aarch64TranslationGranule;
+    fn get_txsz(&self) -> u8;
+    fn setup(
+        &self,
+        memory_mgr: &mut GuestMemoryManager,
+        va: GuestVaAddress,
+        ipa: GuestIpaAddress,
+        size: usize,
+        flags: HvMemoryFlags,
+    ) -> anyhow::Result<()>;
+    fn simulate_address_lookup(
+        &self,
+        mm: &GuestMemoryManager,
+        va: GuestVaAddress,
+    ) -> anyhow::Result<Option<GuestIpaAddress>>;
+    fn get_top_ttbr_layout(&self) -> anyhow::Result<Layout>;
 }
 
-impl TranslationTableManager {
-    pub fn new(
-        granule: Aarch64TranslationGranule,
-        txsz: u8,
-        ttbr0: GuestIpaAddress,
-        ttbr1: GuestIpaAddress,
-    ) -> anyhow::Result<Self> {
+impl<const G: Aarch64TranslationGranule, const TXSZ: u8> TTMgr
+    for TranslationTableManager<G, TXSZ>
+{
+    fn get_granule(&self) -> Aarch64TranslationGranule {
+        Self::get_granule(&self)
+    }
+
+    fn get_txsz(&self) -> u8 {
+        Self::get_txsz(&self)
+    }
+
+    fn setup(
+        &self,
+        memory_mgr: &mut GuestMemoryManager,
+        va: GuestVaAddress,
+        ipa: GuestIpaAddress,
+        size: usize,
+        flags: HvMemoryFlags,
+    ) -> anyhow::Result<()> {
+        Self::setup(&self, memory_mgr, va, ipa, size, flags)
+    }
+
+    fn simulate_address_lookup(
+        &self,
+        mm: &GuestMemoryManager,
+        va: GuestVaAddress,
+    ) -> anyhow::Result<Option<GuestIpaAddress>> {
+        Self::simulate_address_lookup(&self, mm, va)
+    }
+    fn get_top_ttbr_layout(&self) -> anyhow::Result<Layout> {
+        Self::get_top_ttbr_layout(&self)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TranslationTableManager<const G: Aarch64TranslationGranule, const TXSZ: u8> {
+    ttbr0: GuestIpaAddress,
+    ttbr1: GuestIpaAddress,
+    ips_size: u64,
+    ips_bits: u8,
+}
+
+pub fn new_ttbr_mgr(
+    granule: Aarch64TranslationGranule,
+    txsz: u8,
+    ttbr0: GuestIpaAddress,
+    ttbr1: GuestIpaAddress,
+) -> anyhow::Result<Box<dyn TTMgr>> {
+    use Aarch64TranslationGranule::*;
+    match (granule, txsz) {
+        (P16k, 28) => Ok(Box::new(TranslationTableManager::<{ P16k }, 28>::new(
+            ttbr0, ttbr1,
+        )?)),
+        _ => bail!(
+            "unsupported granule/txsz combination: {:?}/{}",
+            granule,
+            txsz
+        ),
+    }
+}
+
+impl<const G: Aarch64TranslationGranule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
+    fn new(ttbr0: GuestIpaAddress, ttbr1: GuestIpaAddress) -> anyhow::Result<Self> {
         let ips_bits = 36;
         let ips_size = 1 << ips_bits;
         Ok(Self {
             ttbr0,
             ttbr1,
-            granule,
             ips_size,
             ips_bits,
-            txsz,
         })
     }
 
     fn initial_level(&self) -> i8 {
-        self.granule.initial_level(self.txsz)
+        G.initial_level(TXSZ)
     }
 
     fn layout_for_level(&self, level: i8) -> Layout {
-        self.granule.layout_for_level(level, self.txsz)
+        G.layout_for_level(level, TXSZ)
     }
 
     pub fn get_granule(&self) -> Aarch64TranslationGranule {
-        self.granule
+        G
     }
 
     pub fn get_txsz(&self) -> u8 {
-        self.txsz
+        TXSZ
     }
 
     pub fn get_top_ttbr_layout(&self) -> anyhow::Result<Layout> {
@@ -237,19 +300,19 @@ impl TranslationTableManager {
             // Make sure all bits <top:inputsize> are ones.
             // where inputsize = 64 - TxSZ and top=55
             assert_eq!(
-                bits(va.0, 55, 64 - self.txsz),
-                bits(u64::MAX, 55, 64 - self.txsz),
+                bits(va.0, 55, 64 - TXSZ),
+                bits(u64::MAX, 55, 64 - TXSZ),
                 "bits [64:{}] should be 1, but they are not in {:?}",
-                (64 - self.txsz),
+                (64 - TXSZ),
                 va
             )
         } else {
             // Make sure all bits up to TXSZ are zeroes.
             assert_eq!(
-                bits(va.0, 55, 64 - self.txsz),
+                bits(va.0, 55, 64 - TXSZ),
                 0,
                 "bits [64:{}] should be zeroes, but they are not in {:?}",
-                (64 - self.txsz),
+                (64 - TXSZ),
                 va
             )
         }
@@ -268,7 +331,7 @@ impl TranslationTableManager {
         // check invariants, then call into setup_internal
         let table = self.get_top_table(memory_mgr, va)?;
 
-        let aligner = self.granule.aligner();
+        let aligner = G.aligner();
         if !aligner.is_aligned(va.0) {
             bail!("{:?} is not aligned", va)
         }
@@ -303,7 +366,7 @@ impl TranslationTableManager {
     ) -> anyhow::Result<Option<GuestIpaAddress>> {
         let mut table = self.get_top_table(mm, va)?;
         loop {
-            let (bt, bb) = self.granule.bits_range(table.level, self.txsz);
+            let (bt, bb) = G.bits_range(table.level, TXSZ);
             let index = bits(va.0, bt, bb) >> bb;
             let d = table.descriptor(index as usize);
             trace!(
@@ -315,7 +378,7 @@ impl TranslationTableManager {
             );
             match d.0 & 0b11 {
                 0b11 => {
-                    let psb = self.granule.page_size_bits();
+                    let psb = G.page_size_bits();
                     let ipa = GuestIpaAddress(bits(d.0, 47, psb));
                     if table.level == 3 {
                         let offset = Offset(va.0 & ((1 << psb) - 1));
@@ -334,7 +397,7 @@ impl TranslationTableManager {
                     }
                 }
                 0b01 => {
-                    let block_size_bits = match self.granule.block_size_bits(table.level) {
+                    let block_size_bits = match G.block_size_bits(table.level) {
                         Some(bs) => bs,
                         None => {
                             bail!(
@@ -361,12 +424,12 @@ impl TranslationTableManager {
         size: u64,
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
-        debug_assert!(self.granule.aligner().is_aligned(va.0));
-        debug_assert!(self.granule.aligner().is_aligned(ipa.0));
+        debug_assert!(G.aligner().is_aligned(va.0));
+        debug_assert!(G.aligner().is_aligned(ipa.0));
         debug_assert!(size > 0);
-        debug_assert!(self.granule.aligner().is_aligned(size as u64));
+        debug_assert!(G.aligner().is_aligned(size as u64));
 
-        let (bt, bl) = self.granule.bits_range(table.level, self.txsz);
+        let (bt, bl) = G.bits_range(table.level, TXSZ);
 
         let start_index = bits(va.0, bt, bl) >> bl;
         let end_index = bits(va.add(Offset((size - 1) as u64)).0, bt, bl) >> bl;
@@ -416,10 +479,10 @@ impl TranslationTableManager {
         size: u64,
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
-        debug_assert!(self.granule.aligner().is_aligned(va.0));
-        debug_assert!(self.granule.aligner().is_aligned(ipa.0));
+        debug_assert!(G.aligner().is_aligned(va.0));
+        debug_assert!(G.aligner().is_aligned(ipa.0));
         debug_assert!(size > 0);
-        debug_assert!(self.granule.aligner().is_aligned(size as u64));
+        debug_assert!(G.aligner().is_aligned(size as u64));
 
         if table.level == 3 {
             let d = table.descriptor_mut(index as usize);
@@ -463,7 +526,7 @@ impl TranslationTableManager {
             return Ok(());
         }
 
-        if let Some(block_size) = self.granule.block_size(table.level) {
+        if let Some(block_size) = G.block_size(table.level) {
             if size as u64 == block_size {
                 let level = table.level;
                 let d = table.descriptor_mut(index as usize);
@@ -519,7 +582,7 @@ impl TranslationTableManager {
                 bail!("already a block")
             }
             0b11 => {
-                let ipa = bits(descriptor.0, 47, self.granule.page_size_bits());
+                let ipa = bits(descriptor.0, 47, G.page_size_bits());
                 let ipa = GuestIpaAddress(ipa);
                 let table_ptr = memory_mgr
                     .get_memory_slice_by_ipa(ipa, self.layout_for_level(level + 1).size())?

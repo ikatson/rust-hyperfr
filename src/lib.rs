@@ -1,3 +1,5 @@
+#![feature(const_generics)]
+
 use aarch64_debug::{DataAbortFlags, Syndrome};
 use anyhow::{anyhow, bail, Context};
 use bindgen_util::{assert_hv_return_t_ok, null_obj};

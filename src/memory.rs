@@ -5,7 +5,7 @@ use vm_memory::GuestMemoryMmap;
 use crate::{
     addresses::{GuestIpaAddress, GuestVaAddress, Offset},
     elf_loader::{self, LoadedElf, MemoryManager},
-    translation_table::{Aarch64TranslationGranule, TranslationTableManager},
+    translation_table::{new_ttbr_mgr, Aarch64TranslationGranule, TTMgr, TranslationTableManager},
     HvMemoryFlags,
 };
 use anyhow::{anyhow, bail, Context};
@@ -20,7 +20,7 @@ pub struct DramConfig {
 
 #[derive(Debug)]
 pub struct GuestMemoryManager {
-    translation_table_mgr: TranslationTableManager,
+    translation_table_mgr: Box<dyn TTMgr>,
     ttbr0: GuestIpaAddress,
     ttbr1: GuestIpaAddress,
     memory: Arc<GuestMemoryMmap>,
@@ -54,8 +54,7 @@ impl GuestMemoryManager {
                 .with_context(|| format!("error parsing envvar TXSZ={} as u8", &v))?,
             Err(_) => 28,
         };
-        let tmp_ttmgr =
-            TranslationTableManager::new(granule, txsz, GuestIpaAddress(0), GuestIpaAddress(0))?;
+        let tmp_ttmgr = new_ttbr_mgr(granule, txsz, GuestIpaAddress(0), GuestIpaAddress(0))?;
 
         let mut mm = Self {
             translation_table_mgr: tmp_ttmgr,
@@ -75,7 +74,7 @@ impl GuestMemoryManager {
 
         let (_, ttbr0) = mm.allocate_ipa(ttbr_layout, format_args!("TTBR0"))?;
         let (_, ttbr1) = mm.allocate_ipa(ttbr_layout, format_args!("TTBR1"))?;
-        mm.translation_table_mgr = TranslationTableManager::new(granule, txsz, ttbr0, ttbr1)?;
+        mm.translation_table_mgr = new_ttbr_mgr(granule, txsz, ttbr0, ttbr1)?;
         mm.ttbr0 = ttbr0;
         mm.ttbr1 = ttbr1;
 
@@ -213,8 +212,12 @@ impl GuestMemoryManager {
         size: usize,
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
-        // This is ridiculous, but a copy is needed here.
-        let mgr = self.translation_table_mgr;
+        // This is ridiculous on my part - but the API cannot be changed easily without copies.
+        // The brorrow checker is legit unhappy - that I'm passing &mut self in there,
+        // so this just silences the borrow checker so that it forgets the lifetimes.
+        let mgr = self.translation_table_mgr.as_ref() as *const dyn TTMgr;
+        let mgr = unsafe { &*mgr };
+
         mgr.setup(self, va, ipa, size, flags)
     }
 }
