@@ -271,11 +271,20 @@ impl TranslationTableManager {
             // where inputsize = 64 - TxSZ and top=55
             assert_eq!(
                 bits(va.0, 55, 64 - self.txsz as u64),
-                bits(u64::MAX, 55, 64 - self.txsz as u64)
+                bits(u64::MAX, 55, 64 - self.txsz as u64),
+                "bits [64:{}] should be 1, but they are not in {:?}",
+                (64 - self.txsz),
+                va
             )
         } else {
             // Make sure all bits up to TXSZ are zeroes.
-            assert_eq!(bits(va.0, 55, 64 - self.txsz as u64), 0)
+            assert_eq!(
+                bits(va.0, 55, 64 - self.txsz as u64),
+                0,
+                "bits [64:{}] should be zeroes, but they are not in {:?}",
+                (64 - self.txsz),
+                va
+            )
         }
 
         self.get_ttbr_at(memory_mgr, ipa)
