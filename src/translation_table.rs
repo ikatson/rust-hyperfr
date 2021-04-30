@@ -225,11 +225,38 @@ pub fn new_ttbr_mgr(
     ttbr1: GuestIpaAddress,
 ) -> anyhow::Result<Box<dyn TTMgr>> {
     use Aarch64TranslationGranule::*;
-    match (granule, txsz) {
-        (P16k, 28) => Ok(Box::new(TranslationTableManager::<{ P16k }, 28>::new(
-            ttbr0, ttbr1,
-        )?)),
-        _ => bail!(
+    macro_rules! mtxsz {
+        ($granule:tt, ($($val:literal),+)) => {
+            match txsz {
+                $(
+                    $val => Ok(Box::new(TranslationTableManager::<{ $granule }, $val>::new(
+                        ttbr0, ttbr1,
+                    )?)),
+                )+
+                _ => bail!(
+                    "unsupported granule/txsz combination: {:?}/{}",
+                    granule,
+                    txsz
+                )
+            }
+        }
+    }
+    match granule {
+        P4k => mtxsz!(
+            P4k,
+            (
+                16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
+                37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48
+            )
+        ),
+        P16k => mtxsz!(
+            P16k,
+            (
+                16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
+                37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48
+            )
+        ),
+        P64k => bail!(
             "unsupported granule/txsz combination: {:?}/{}",
             granule,
             txsz
