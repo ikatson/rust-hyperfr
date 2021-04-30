@@ -8,7 +8,7 @@ use crate::{aligner::Aligner, HvMemoryFlags};
 use anyhow::bail;
 use log::trace;
 
-pub const fn bits(val: u64, start_inclusive: u64, end_inclusive: u64) -> u64 {
+pub const fn bits(val: u64, start_inclusive: u8, end_inclusive: u8) -> u64 {
     let top_mask = match start_inclusive {
         63 => u64::MAX,
         0..=62 => (1u64 << (start_inclusive + 1)) - 1,
@@ -145,29 +145,20 @@ impl Aarch64TranslationGranule {
         }
     }
 
-    pub fn bits_range(&self, table_level: i8) -> (u64, u64) {
-        match self {
-            Aarch64TranslationGranule::P4k => match table_level {
-                3 => (20, 12),
-                2 => (29, 21),
-                1 => (38, 30),
-                0 => (47, 39),
-                _ => unimplemented!(),
-            },
-            Aarch64TranslationGranule::P16k => match table_level {
-                3 => (24, 14),
-                2 => (35, 25),
-                1 => (46, 36),
-                0 => (47, 47),
-                _ => unimplemented!(),
-            },
-            Aarch64TranslationGranule::P64k => match table_level {
-                3 => (28, 16),
-                2 => (41, 29),
-                1 => (47, 42),
-                _ => unimplemented!(),
-            },
-        }
+    pub fn bits_range(&self, table_level: i8, txsz: u8) -> (u8, u8) {
+        // Copied this code from TTBRWALK.txt
+        let initial_level = self.initial_level(txsz);
+
+        let grainsize = self.page_size_bits();
+        let stride = grainsize - 3;
+
+        let addrselectbottom = (3 - table_level) as u8 * stride + grainsize;
+        let addrselecttop = if table_level == initial_level {
+            (64 - txsz) - 1
+        } else {
+            addrselectbottom + stride - 1
+        };
+        (addrselecttop, addrselectbottom)
     }
 }
 
@@ -264,14 +255,14 @@ impl TranslationTableManager {
         // Just a double-check for debugging
         // In pseudo-code this was:
         // if !IsZero(baseregister < 47: outputsize > ) -> throw AddressFault
-        assert_eq!(bits(ipa.0, 47, self.ips_bits as u64), 0);
+        assert_eq!(bits(ipa.0, 47, self.ips_bits), 0);
 
         if top_bit {
             // Make sure all bits <top:inputsize> are ones.
             // where inputsize = 64 - TxSZ and top=55
             assert_eq!(
-                bits(va.0, 55, 64 - self.txsz as u64),
-                bits(u64::MAX, 55, 64 - self.txsz as u64),
+                bits(va.0, 55, 64 - self.txsz),
+                bits(u64::MAX, 55, 64 - self.txsz),
                 "bits [64:{}] should be 1, but they are not in {:?}",
                 (64 - self.txsz),
                 va
@@ -279,7 +270,7 @@ impl TranslationTableManager {
         } else {
             // Make sure all bits up to TXSZ are zeroes.
             assert_eq!(
-                bits(va.0, 55, 64 - self.txsz as u64),
+                bits(va.0, 55, 64 - self.txsz),
                 0,
                 "bits [64:{}] should be zeroes, but they are not in {:?}",
                 (64 - self.txsz),
@@ -336,7 +327,7 @@ impl TranslationTableManager {
     ) -> anyhow::Result<Option<GuestIpaAddress>> {
         let mut table = self.get_top_table(mm, va)?;
         loop {
-            let (bt, bb) = self.granule.bits_range(table.level);
+            let (bt, bb) = self.granule.bits_range(table.level, self.txsz);
             let index = bits(va.0, bt, bb) >> bb;
             let d = table.descriptor(index as usize);
             trace!(
@@ -348,7 +339,7 @@ impl TranslationTableManager {
             );
             match d.0 & 0b11 {
                 0b11 => {
-                    let psb = self.granule.page_size_bits() as u64;
+                    let psb = self.granule.page_size_bits();
                     let ipa = GuestIpaAddress(bits(d.0, 47, psb));
                     if table.level == 3 {
                         let offset = Offset(va.0 & ((1 << psb) - 1));
@@ -376,7 +367,7 @@ impl TranslationTableManager {
                             );
                         }
                     };
-                    let ipa = GuestIpaAddress(bits(d.0, 47, block_size_bits as u64));
+                    let ipa = GuestIpaAddress(bits(d.0, 47, block_size_bits));
                     let offset = Offset(va.0 & ((1 << block_size_bits) - 1));
                     return Ok(Some(ipa.add(offset)));
                 }
@@ -399,7 +390,7 @@ impl TranslationTableManager {
         debug_assert!(size > 0);
         debug_assert!(self.granule.aligner().is_aligned(size as u64));
 
-        let (bt, bl) = self.granule.bits_range(table.level);
+        let (bt, bl) = self.granule.bits_range(table.level, self.txsz);
 
         let start_index = bits(va.0, bt, bl) >> bl;
         let end_index = bits(va.add(Offset((size - 1) as u64)).0, bt, bl) >> bl;
@@ -552,7 +543,7 @@ impl TranslationTableManager {
                 bail!("already a block")
             }
             0b11 => {
-                let ipa = bits(descriptor.0, 47, self.granule.page_size_bits() as u64);
+                let ipa = bits(descriptor.0, 47, self.granule.page_size_bits());
                 let ipa = GuestIpaAddress(ipa);
                 let table_ptr = memory_mgr
                     .get_memory_slice_by_ipa(ipa, self.layout_for_level(level + 1).size())?
