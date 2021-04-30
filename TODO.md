@@ -11,6 +11,8 @@ Translation refactor todo:
   But for 64kb, 8192 entry tables might exist.
 
 - [x] Test with 4kb
-  - txsz 16 works, 25 works
-  for 16kb granule
-  - txsz 16 works, 17 works, 28 works
+  - fixed this bug in 65cad73
+    for 4kb granule
+    - txsz 16 works, 25 works
+    for 16kb granule
+    - txsz 16 works, 17 works, 28 works
