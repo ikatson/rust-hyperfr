@@ -12,7 +12,7 @@ use vm_memory::GuestMemoryMmap;
 use crate::{
     addresses::{GuestIpaAddress, GuestVaAddress, Offset},
     elf_loader::{self, LoadedElf, MemoryManager},
-    translation_table::{new_tt_mgr, Aarch64TranslationGranule, Granule, TtMgr},
+    translation_table::{Aarch64TranslationGranule, Granule, TranslationTableManager},
     HvMemoryFlags,
 };
 use anyhow::{anyhow, bail, Context};
@@ -26,8 +26,8 @@ pub struct DramConfig {
 }
 
 #[derive(Debug)]
-pub struct GuestMemoryManager {
-    translation_table_mgr: Box<dyn TtMgr>,
+pub struct GuestMemoryManager<G> {
+    translation_table_mgr: TranslationTableManager<G>,
     ttbr0: GuestIpaAddress,
     ttbr1: GuestIpaAddress,
     memory: Arc<GuestMemoryMmap>,
@@ -39,8 +39,9 @@ pub struct GuestMemoryManager {
     dram_config: Option<DramConfig>,
 }
 
-impl GuestMemoryManager {
+impl<G: Granule> GuestMemoryManager<G> {
     pub fn new(
+        granule: G,
         va_start: GuestVaAddress,
         ipa_start: GuestIpaAddress,
         size: usize,
@@ -50,18 +51,19 @@ impl GuestMemoryManager {
                 .context("error allocating guest memory")?,
         );
 
-        let granule = match std::env::var("GRANULE").as_deref().unwrap_or_default() {
-            "4" => Aarch64TranslationGranule::P4k,
-            "" | "16" => Aarch64TranslationGranule::P16k,
-            other => bail!("GRANULE={} is not supported, try 4,16 or 64", other),
-        };
+        // let granule = match std::env::var("GRANULE").as_deref().unwrap_or_default() {
+        //     "4" => Aarch64TranslationGranule::P4k,
+        //     "" | "16" => Aarch64TranslationGranule::P16k,
+        //     other => bail!("GRANULE={} is not supported, try 4,16 or 64", other),
+        // };
         let txsz: u8 = match std::env::var("TXSZ") {
             Ok(v) => v
                 .parse()
                 .with_context(|| format!("error parsing envvar TXSZ={} as u8", &v))?,
             Err(_) => 28,
         };
-        let tmp_ttmgr = new_tt_mgr(GuestIpaAddress(0), GuestIpaAddress(1), granule, txsz)?;
+        let tmp_ttmgr =
+            TranslationTableManager::new(granule, txsz, GuestIpaAddress(0), GuestIpaAddress(1))?;
 
         let mut mm = Self {
             translation_table_mgr: tmp_ttmgr,
@@ -81,7 +83,7 @@ impl GuestMemoryManager {
 
         let (_, ttbr0) = mm.allocate_ipa(ttbr_layout, format_args!("TTBR0"))?;
         let (_, ttbr1) = mm.allocate_ipa(ttbr_layout, format_args!("TTBR1"))?;
-        mm.translation_table_mgr = new_tt_mgr(ttbr0, ttbr1, granule, txsz)?;
+        mm.translation_table_mgr = TranslationTableManager::new(granule, txsz, ttbr0, ttbr1)?;
         mm.ttbr0 = ttbr0;
         mm.ttbr1 = ttbr1;
 
@@ -96,7 +98,7 @@ impl GuestMemoryManager {
         self.ttbr1
     }
 
-    pub fn get_granule(&self) -> &'static dyn Granule {
+    pub fn get_granule(&self) -> G {
         self.translation_table_mgr.get_granule()
     }
 
@@ -247,7 +249,7 @@ impl GuestMemoryManager {
     }
 }
 
-impl MemoryManager for GuestMemoryManager {
+impl<G: Granule> MemoryManager for GuestMemoryManager<G> {
     fn aligner(&self) -> crate::aligner::Aligner {
         self.translation_table_mgr.get_granule().aligner()
     }

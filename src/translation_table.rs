@@ -18,8 +18,7 @@ pub const fn bits(val: u64, start_inclusive: u8, end_inclusive: u8) -> u64 {
     val & top_mask & bottom_mask
 }
 
-pub trait Granule: core::fmt::Debug + Send + Sync {
-    fn get_dyn_self(&self) -> &'static dyn Granule;
+pub trait Granule: core::fmt::Debug + Send + Sync + Copy {
     fn tg0_bits(&self) -> u64;
     fn tg1_bits(&self) -> u64;
     fn page_size_bits(&self) -> u8;
@@ -63,18 +62,15 @@ pub trait Granule: core::fmt::Debug + Send + Sync {
     }
 }
 
-static GRANULE_4K: &'static dyn Granule = &Granule4k {};
-static GRANULE_16K: &'static dyn Granule = &Granule16k {};
+pub static GRANULE_4K: Granule4k = Granule4k {};
+pub static GRANULE_16K: Granule16k = Granule16k {};
 
-#[derive(Debug)]
-struct Granule4k {}
-#[derive(Debug)]
-struct Granule16k {}
+#[derive(Debug, Copy, Clone)]
+pub struct Granule4k {}
+#[derive(Debug, Copy, Clone)]
+pub struct Granule16k {}
 
 impl Granule for Granule4k {
-    fn get_dyn_self(&self) -> &'static dyn Granule {
-        GRANULE_4K
-    }
     fn tg0_bits(&self) -> u64 {
         0
     }
@@ -106,9 +102,6 @@ impl Granule for Granule4k {
 }
 
 impl Granule for Granule16k {
-    fn get_dyn_self(&self) -> &'static dyn Granule {
-        GRANULE_16K
-    }
     fn tg0_bits(&self) -> u64 {
         0b10 << 14
     }
@@ -166,81 +159,6 @@ impl TableMetadata {
     }
 }
 
-pub trait TtMgr: core::fmt::Debug + Send + Sync {
-    fn get_top_ttbr_layout(&self) -> anyhow::Result<Layout>;
-    fn setup(
-        &self,
-        memory_mgr: &GuestMemoryManager,
-        va: GuestVaAddress,
-        ipa: GuestIpaAddress,
-        size: usize,
-        flags: HvMemoryFlags,
-    ) -> anyhow::Result<()>;
-    fn simulate_address_lookup(
-        &self,
-        mm: &GuestMemoryManager,
-        va: GuestVaAddress,
-    ) -> anyhow::Result<Option<GuestIpaAddress>>;
-    fn get_granule(&self) -> &'static dyn Granule;
-    fn get_txsz(&self) -> u8;
-}
-
-impl<G: Granule + Send + Sync + core::fmt::Debug> TtMgr for TranslationTableManager<G> {
-    fn get_top_ttbr_layout(&self) -> anyhow::Result<Layout> {
-        Self::get_top_ttbr_layout(&self)
-    }
-
-    fn setup(
-        &self,
-        memory_mgr: &GuestMemoryManager,
-        va: GuestVaAddress,
-        ipa: GuestIpaAddress,
-        size: usize,
-        flags: HvMemoryFlags,
-    ) -> anyhow::Result<()> {
-        Self::setup(&self, memory_mgr, va, ipa, size, flags)
-    }
-
-    fn simulate_address_lookup(
-        &self,
-        mm: &GuestMemoryManager,
-        va: GuestVaAddress,
-    ) -> anyhow::Result<Option<GuestIpaAddress>> {
-        Self::simulate_address_lookup(&self, mm, va)
-    }
-
-    fn get_granule(&self) -> &'static dyn Granule {
-        Self::get_granule(&self)
-    }
-
-    fn get_txsz(&self) -> u8 {
-        Self::get_txsz(&self)
-    }
-}
-
-pub fn new_tt_mgr(
-    ttbr0: GuestIpaAddress,
-    ttbr1: GuestIpaAddress,
-    granule: Aarch64TranslationGranule,
-    txsz: u8,
-) -> anyhow::Result<Box<dyn TtMgr>> {
-    match granule {
-        Aarch64TranslationGranule::P4k => Ok(Box::new(TranslationTableManager::new(
-            Granule4k {},
-            txsz,
-            ttbr0,
-            ttbr1,
-        )?)),
-        Aarch64TranslationGranule::P16k => Ok(Box::new(TranslationTableManager::new(
-            Granule16k {},
-            txsz,
-            ttbr0,
-            ttbr1,
-        )?)),
-        Aarch64TranslationGranule::P64k => bail!("granule 64k not implemented"),
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct TranslationTableManager<G> {
     ttbr0: GuestIpaAddress,
@@ -252,7 +170,7 @@ pub struct TranslationTableManager<G> {
 }
 
 impl<G: Granule> TranslationTableManager<G> {
-    fn new(
+    pub fn new(
         granule: G,
         txsz: u8,
         ttbr0: GuestIpaAddress,
@@ -278,8 +196,8 @@ impl<G: Granule> TranslationTableManager<G> {
         self.granule.layout_for_level(level, self.txsz)
     }
 
-    pub fn get_granule(&self) -> &'static dyn Granule {
-        self.granule.get_dyn_self()
+    pub fn get_granule(&self) -> G {
+        self.granule
     }
 
     pub fn get_txsz(&self) -> u8 {
@@ -292,7 +210,7 @@ impl<G: Granule> TranslationTableManager<G> {
 
     fn get_ttbr_at(
         &self,
-        memory_mgr: &GuestMemoryManager,
+        memory_mgr: &GuestMemoryManager<G>,
         ipa: GuestIpaAddress,
     ) -> anyhow::Result<TableMetadata> {
         let sz = self.get_top_ttbr_layout()?.size();
@@ -306,7 +224,7 @@ impl<G: Granule> TranslationTableManager<G> {
 
     fn get_top_table(
         &self,
-        memory_mgr: &GuestMemoryManager,
+        memory_mgr: &GuestMemoryManager<G>,
         va: GuestVaAddress,
     ) -> anyhow::Result<TableMetadata> {
         let top_bit = (va.0 >> 55) & 1 == 1;
@@ -343,7 +261,7 @@ impl<G: Granule> TranslationTableManager<G> {
 
     pub fn setup(
         &self,
-        memory_mgr: &GuestMemoryManager,
+        memory_mgr: &GuestMemoryManager<G>,
         va: GuestVaAddress,
         ipa: GuestIpaAddress,
         size: usize,
@@ -382,7 +300,7 @@ impl<G: Granule> TranslationTableManager<G> {
 
     pub fn simulate_address_lookup(
         &self,
-        mm: &GuestMemoryManager,
+        mm: &GuestMemoryManager<G>,
         va: GuestVaAddress,
     ) -> anyhow::Result<Option<GuestIpaAddress>> {
         let mut table = self.get_top_table(mm, va)?;
@@ -439,7 +357,7 @@ impl<G: Granule> TranslationTableManager<G> {
     fn setup_internal(
         &self,
         table: TableMetadata,
-        memory_mgr: &GuestMemoryManager,
+        memory_mgr: &GuestMemoryManager<G>,
         va: GuestVaAddress,
         ipa: GuestIpaAddress,
         size: u64,
@@ -498,7 +416,7 @@ impl<G: Granule> TranslationTableManager<G> {
         &self,
         mut table: TableMetadata,
         index: u16,
-        memory_mgr: &GuestMemoryManager,
+        memory_mgr: &GuestMemoryManager<G>,
         va: GuestVaAddress,
         ipa: GuestIpaAddress,
         size: u64,
@@ -603,7 +521,7 @@ impl<G: Granule> TranslationTableManager<G> {
         &self,
         mut table: TableMetadata,
         index: u16,
-        memory_mgr: &GuestMemoryManager,
+        memory_mgr: &GuestMemoryManager<G>,
     ) -> anyhow::Result<TableMetadata> {
         let level = table.level;
         let descriptor = table.descriptor_mut(index as usize);

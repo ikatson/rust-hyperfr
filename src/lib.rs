@@ -6,6 +6,7 @@ use elf_loader::LoadedElf;
 use memory::GuestMemoryManager;
 use std::thread::JoinHandle;
 use std::{path::Path, sync::Arc};
+pub use translation_table::{Granule, GRANULE_16K, GRANULE_4K};
 
 use log::{debug, error, info, trace};
 
@@ -32,20 +33,20 @@ use layout::*;
 )]
 pub mod bindgen;
 
-pub struct HfVmBuilder {
+pub struct HfVmBuilder<G> {
     entrypoint: Option<GuestVaAddress>,
     vbar_el1: Option<GuestVaAddress>,
-    memory_manager: GuestMemoryManager,
+    memory_manager: GuestMemoryManager<G>,
 }
 
-pub struct HfVm {
+pub struct HfVm<G> {
     entrypoint: GuestVaAddress,
     vbar_el1: GuestVaAddress,
-    memory_manager: Arc<GuestMemoryManager>,
+    memory_manager: Arc<GuestMemoryManager<G>>,
 }
 
-impl HfVmBuilder {
-    pub fn new() -> anyhow::Result<Self> {
+impl<G: Granule> HfVmBuilder<G> {
+    pub fn new(granule: G) -> anyhow::Result<Self> {
         assert_hv_return_t_ok(unsafe { bindgen::hv_vm_create(null_obj()) }, "hv_vm_create")?;
 
         let ipa_start = DRAM_IPA_START;
@@ -55,7 +56,7 @@ impl HfVmBuilder {
             "allocating guest memory, IPA start: {:x?}, size: {}",
             ipa_start.0, size
         );
-        let memory_manager = GuestMemoryManager::new(va_start, ipa_start, size)?;
+        let memory_manager = GuestMemoryManager::new(granule, va_start, ipa_start, size)?;
         let vm = Self {
             memory_manager,
             entrypoint: None,
@@ -109,7 +110,7 @@ impl HfVmBuilder {
         Ok(elf)
     }
 
-    pub fn build(mut self) -> anyhow::Result<HfVm> {
+    pub fn build(mut self) -> anyhow::Result<HfVm<G>> {
         let entrypoint = self.entrypoint.ok_or_else(|| {
             anyhow!("entrypoint not set, probably ELF not loaded, or loaded incorrectly")
         })?;
@@ -127,7 +128,7 @@ impl HfVmBuilder {
     }
 }
 
-impl HfVm {
+impl<G: Granule + 'static> HfVm<G> {
     pub fn vcpu_create_and_run(
         &self,
         entrypoint: Option<GuestVaAddress>,
@@ -154,9 +155,9 @@ impl HfVm {
 }
 
 #[derive(Debug)]
-pub struct VCpu {
+pub struct VCpu<G> {
     id: u64,
-    memory_manager: Arc<GuestMemoryManager>,
+    memory_manager: Arc<GuestMemoryManager<G>>,
     exit_t: *mut bindgen::hv_vcpu_exit_t,
     next_breakpoint: u16,
 }
@@ -177,8 +178,8 @@ struct StartParams {
     log_level: u64,
 }
 
-impl VCpu {
-    fn new(memory_manager: Arc<GuestMemoryManager>) -> anyhow::Result<Self> {
+impl<G: Granule> VCpu<G> {
+    fn new(memory_manager: Arc<GuestMemoryManager<G>>) -> anyhow::Result<Self> {
         let mut vcpu = Self {
             id: 0,
             memory_manager,
@@ -576,7 +577,7 @@ impl VCpu {
 
         // self.enable_soft_debug()?;
 
-        let run = |vcpu: &mut VCpu| loop {
+        let run = |vcpu: &mut VCpu<G>| loop {
             assert_hv_return_t_ok(unsafe { bindgen::hv_vcpu_run(vcpu.id) }, "hv_vcpu_run")?;
 
             let exit_t = vcpu.exit_t();

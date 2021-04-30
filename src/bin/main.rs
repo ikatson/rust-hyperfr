@@ -1,11 +1,10 @@
-use anyhow::Context;
+use anyhow::{bail, Context};
 
+use hyperfr::{Granule, GRANULE_16K, GRANULE_4K};
 use log::error;
 
-fn main_result() -> anyhow::Result<()> {
-    pretty_env_logger::init();
-
-    let mut vmb = hyperfr::HfVmBuilder::new().context("error creating HfVmBuilder")?;
+fn main_granule<G: Granule + 'static>(granule: G) -> anyhow::Result<()> {
+    let mut vmb = hyperfr::HfVmBuilder::new(granule).context("error creating HfVmBuilder")?;
     let mut args = std::env::args_os();
     let image = args
         .nth(1)
@@ -21,6 +20,16 @@ fn main_result() -> anyhow::Result<()> {
         .unwrap()
         .context("error in the thread running vcpu")?;
     Ok(())
+}
+
+fn main_result() -> anyhow::Result<()> {
+    pretty_env_logger::init();
+
+    match std::env::var("GRANULE").as_deref().unwrap_or_default() {
+        "" | "16" => main_granule(GRANULE_16K),
+        "4" => main_granule(GRANULE_4K),
+        other => bail!("granule {} not recognized", other),
+    }
 }
 
 fn main() {
