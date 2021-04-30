@@ -18,110 +18,38 @@ pub const fn bits(val: u64, start_inclusive: u8, end_inclusive: u8) -> u64 {
     val & top_mask & bottom_mask
 }
 
-#[derive(Debug, Copy, Clone)]
-#[allow(dead_code)]
-pub enum Aarch64TranslationGranule {
-    P4k,
-    P16k,
-    P64k,
-}
-
-impl Aarch64TranslationGranule {
-    pub const fn tg0_bits(&self) -> u64 {
-        match self {
-            Aarch64TranslationGranule::P4k => 0,
-            Aarch64TranslationGranule::P16k => 0b10 << 14,
-            Aarch64TranslationGranule::P64k => 0b01 << 14,
-        }
-    }
-    pub const fn tg1_bits(&self) -> u64 {
-        match self {
-            Aarch64TranslationGranule::P4k => 0b10 << 30,
-            Aarch64TranslationGranule::P16k => 0b01 << 30,
-            Aarch64TranslationGranule::P64k => 0b11 << 30,
-        }
-    }
-    pub const fn page_size_bits(&self) -> u8 {
-        match self {
-            Aarch64TranslationGranule::P4k => 12,
-            Aarch64TranslationGranule::P16k => 14,
-            Aarch64TranslationGranule::P64k => 16,
-        }
-    }
-    pub const fn page_size(&self) -> u64 {
+pub trait Granule: core::fmt::Debug + Send + Sync {
+    fn get_dyn_self(&self) -> &'static dyn Granule;
+    fn tg0_bits(&self) -> u64;
+    fn tg1_bits(&self) -> u64;
+    fn page_size_bits(&self) -> u8;
+    fn page_size(&self) -> u64 {
         1 << self.page_size_bits()
     }
-
-    pub const fn aligner(&self) -> Aligner {
+    fn aligner(&self) -> Aligner {
         let mask = !(self.page_size() - 1);
         Aligner::new_from_mask(mask)
     }
-
-    pub const fn layout_for_level(&self, level: i8, txsz: u8) -> Layout {
+    fn layout_for_level(&self, level: i8, txsz: u8) -> Layout {
         let (bt, bl) = self.bits_range(level, txsz);
         let stride = bt - bl + 1;
         let size = core::mem::size_of::<Descriptor>() * (1 << stride);
         let align = 1 << self.page_size_bits();
         unsafe { Layout::from_size_align_unchecked(size, align) }
     }
-
-    pub const fn initial_level(&self, txsz: u8) -> i8 {
-        match self {
-            Aarch64TranslationGranule::P4k => match txsz {
-                12..=15 => -1,
-                16..=24 => 0,
-                25..=33 => 1,
-                34..=42 => 2,
-                43..=48 => 3,
-                _ => i8::MIN,
-            },
-            Aarch64TranslationGranule::P16k => match txsz {
-                12..=16 => 0,
-                17..=27 => 1,
-                28..=38 => 2,
-                39..=48 => 3,
-                _ => i8::MIN,
-            },
-            Aarch64TranslationGranule::P64k => match txsz {
-                12..=21 => 1,
-                22..=34 => 2,
-                35..=47 => 3,
-                _ => i8::MIN,
-            },
-        }
-    }
-
-    pub const fn block_size_bits(&self, table_level: i8) -> Option<u8> {
-        match self {
-            Aarch64TranslationGranule::P4k => match table_level {
-                2 => Some(21),
-                1 => Some(30),
-                _ => None,
-            },
-            Aarch64TranslationGranule::P16k => match table_level {
-                2 => Some(25),
-                _ => None,
-            },
-            Aarch64TranslationGranule::P64k => match table_level {
-                2 => Some(29),
-                _ => None,
-            },
-        }
-    }
-
-    pub const fn block_size(&self, table_level: i8) -> Option<u64> {
+    fn initial_level(&self, txsz: u8) -> i8;
+    fn block_size_bits(&self, table_level: i8) -> Option<u8>;
+    fn block_size(&self, table_level: i8) -> Option<u64> {
         // Can't use map in const fn.
         match self.block_size_bits(table_level) {
             Some(b) => Some(1 << b),
             None => None,
         }
     }
-
-    pub const fn max_stride(&self) -> u8 {
+    fn max_stride(&self) -> u8 {
         self.page_size_bits() - 3
     }
-
-    pub const fn bits_range(&self, table_level: i8, txsz: u8) -> (u8, u8) {
+    fn bits_range(&self, table_level: i8, txsz: u8) -> (u8, u8) {
         // Copied this code from TTBRWALK.txt
         let initial_level = self.initial_level(txsz);
 
@@ -138,6 +66,86 @@ impl Aarch64TranslationGranule {
     }
 }
 
+static GRANULE_4k: &'static dyn Granule = &Granule4k {};
+static GRANULE_16k: &'static dyn Granule = &Granule16k {};
+
+#[derive(Debug)]
+struct Granule4k {}
+#[derive(Debug)]
+struct Granule16k {}
+
+impl Granule for Granule4k {
+    fn get_dyn_self(&self) -> &'static dyn Granule {
+        GRANULE_4k
+    }
+    fn tg0_bits(&self) -> u64 {
+        0
+    }
+    fn tg1_bits(&self) -> u64 {
+        0b10 << 30
+    }
+    fn page_size_bits(&self) -> u8 {
+        14
+    }
+
+    fn initial_level(&self, txsz: u8) -> i8 {
+        match txsz {
+            12..=15 => -1,
+            16..=24 => 0,
+            25..=33 => 1,
+            34..=42 => 2,
+            43..=48 => 3,
+            _ => i8::MIN,
+        }
+    }
+
+    fn block_size_bits(&self, table_level: i8) -> Option<u8> {
+        match table_level {
+            2 => Some(21),
+            1 => Some(30),
+            _ => None,
+        }
+    }
+}
+
+impl Granule for Granule16k {
+    fn get_dyn_self(&self) -> &'static dyn Granule {
+        GRANULE_16k
+    }
+    fn tg0_bits(&self) -> u64 {
+        0b10 << 14
+    }
+    fn tg1_bits(&self) -> u64 {
+        0b01 << 30
+    }
+    fn page_size_bits(&self) -> u8 {
+        14
+    }
+
+    fn initial_level(&self, txsz: u8) -> i8 {
+        match txsz {
+            12..=16 => 0,
+            17..=27 => 1,
+            28..=38 => 2,
+            39..=48 => 3,
+            _ => i8::MIN,
+        }
+    }
+
+    fn block_size_bits(&self, table_level: i8) -> Option<u8> {
+        match table_level {
+            2 => Some(25),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum Aarch64TranslationGranule {
+    P4k,
+    P16k,
+    P64k,
+}
 struct Descriptor(u64);
 
 #[derive(Copy, Clone, Debug)]
@@ -160,19 +168,94 @@ impl TableMetadata {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct TranslationTableManager {
+pub trait TtMgr: core::fmt::Debug + Send + Sync {
+    fn get_top_ttbr_layout(&self) -> anyhow::Result<Layout>;
+    fn setup(
+        &self,
+        memory_mgr: &GuestMemoryManager,
+        va: GuestVaAddress,
+        ipa: GuestIpaAddress,
+        size: usize,
+        flags: HvMemoryFlags,
+    ) -> anyhow::Result<()>;
+    fn simulate_address_lookup(
+        &self,
+        mm: &GuestMemoryManager,
+        va: GuestVaAddress,
+    ) -> anyhow::Result<Option<GuestIpaAddress>>;
+    fn get_granule(&self) -> &'static dyn Granule;
+    fn get_txsz(&self) -> u8;
+}
+
+impl<G: Granule + Send + Sync + core::fmt::Debug> TtMgr for TranslationTableManager<G> {
+    fn get_top_ttbr_layout(&self) -> anyhow::Result<Layout> {
+        Self::get_top_ttbr_layout(&self)
+    }
+
+    fn setup(
+        &self,
+        memory_mgr: &GuestMemoryManager,
+        va: GuestVaAddress,
+        ipa: GuestIpaAddress,
+        size: usize,
+        flags: HvMemoryFlags,
+    ) -> anyhow::Result<()> {
+        Self::setup(&self, memory_mgr, va, ipa, size, flags)
+    }
+
+    fn simulate_address_lookup(
+        &self,
+        mm: &GuestMemoryManager,
+        va: GuestVaAddress,
+    ) -> anyhow::Result<Option<GuestIpaAddress>> {
+        Self::simulate_address_lookup(&self, mm, va)
+    }
+
+    fn get_granule(&self) -> &'static dyn Granule {
+        Self::get_granule(&self)
+    }
+
+    fn get_txsz(&self) -> u8 {
+        Self::get_txsz(&self)
+    }
+}
+
+pub fn new_tt_mgr(
     ttbr0: GuestIpaAddress,
     ttbr1: GuestIpaAddress,
     granule: Aarch64TranslationGranule,
+    txsz: u8,
+) -> anyhow::Result<Box<dyn TtMgr>> {
+    match granule {
+        Aarch64TranslationGranule::P4k => Ok(Box::new(TranslationTableManager::new(
+            Granule4k {},
+            txsz,
+            ttbr0,
+            ttbr1,
+        )?)),
+        Aarch64TranslationGranule::P16k => Ok(Box::new(TranslationTableManager::new(
+            Granule16k {},
+            txsz,
+            ttbr0,
+            ttbr1,
+        )?)),
+        Aarch64TranslationGranule::P64k => bail!("granule 64k not implemented"),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TranslationTableManager<G> {
+    ttbr0: GuestIpaAddress,
+    ttbr1: GuestIpaAddress,
+    granule: G,
     ips_size: u64,
     ips_bits: u8,
     txsz: u8,
 }
 
-impl TranslationTableManager {
-    pub fn new(
-        granule: Aarch64TranslationGranule,
+impl<G: Granule> TranslationTableManager<G> {
+    fn new(
+        granule: G,
         txsz: u8,
         ttbr0: GuestIpaAddress,
         ttbr1: GuestIpaAddress,
@@ -197,8 +280,8 @@ impl TranslationTableManager {
         self.granule.layout_for_level(level, self.txsz)
     }
 
-    pub fn get_granule(&self) -> Aarch64TranslationGranule {
-        self.granule
+    pub fn get_granule(&self) -> &'static dyn Granule {
+        self.granule.get_dyn_self()
     }
 
     pub fn get_txsz(&self) -> u8 {

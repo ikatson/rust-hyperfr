@@ -12,7 +12,9 @@ use vm_memory::GuestMemoryMmap;
 use crate::{
     addresses::{GuestIpaAddress, GuestVaAddress, Offset},
     elf_loader::{self, LoadedElf, MemoryManager},
-    translation_table::{Aarch64TranslationGranule, TranslationTableManager},
+    translation_table::{
+        new_tt_mgr, Aarch64TranslationGranule, Granule, TranslationTableManager, TtMgr,
+    },
     HvMemoryFlags,
 };
 use anyhow::{anyhow, bail, Context};
@@ -27,7 +29,7 @@ pub struct DramConfig {
 
 #[derive(Debug)]
 pub struct GuestMemoryManager {
-    translation_table_mgr: TranslationTableManager,
+    translation_table_mgr: Box<dyn TtMgr>,
     ttbr0: GuestIpaAddress,
     ttbr1: GuestIpaAddress,
     memory: Arc<GuestMemoryMmap>,
@@ -61,8 +63,7 @@ impl GuestMemoryManager {
                 .with_context(|| format!("error parsing envvar TXSZ={} as u8", &v))?,
             Err(_) => 28,
         };
-        let tmp_ttmgr =
-            TranslationTableManager::new(granule, txsz, GuestIpaAddress(0), GuestIpaAddress(0))?;
+        let tmp_ttmgr = new_tt_mgr(GuestIpaAddress(0), GuestIpaAddress(1), granule, txsz)?;
 
         let mut mm = Self {
             translation_table_mgr: tmp_ttmgr,
@@ -82,7 +83,7 @@ impl GuestMemoryManager {
 
         let (_, ttbr0) = mm.allocate_ipa(ttbr_layout, format_args!("TTBR0"))?;
         let (_, ttbr1) = mm.allocate_ipa(ttbr_layout, format_args!("TTBR1"))?;
-        mm.translation_table_mgr = TranslationTableManager::new(granule, txsz, ttbr0, ttbr1)?;
+        mm.translation_table_mgr = new_tt_mgr(ttbr0, ttbr1, granule, txsz)?;
         mm.ttbr0 = ttbr0;
         mm.ttbr1 = ttbr1;
 
@@ -97,7 +98,7 @@ impl GuestMemoryManager {
         self.ttbr1
     }
 
-    pub fn get_granule(&self) -> Aarch64TranslationGranule {
+    pub fn get_granule(&self) -> &'static dyn Granule {
         self.translation_table_mgr.get_granule()
     }
 
@@ -244,9 +245,7 @@ impl GuestMemoryManager {
         size: usize,
         flags: HvMemoryFlags,
     ) -> anyhow::Result<()> {
-        // This is ridiculous, but a copy is needed here.
-        let mgr = self.translation_table_mgr;
-        mgr.setup(self, va, ipa, size, flags)
+        self.translation_table_mgr.setup(self, va, ipa, size, flags)
     }
 }
 
