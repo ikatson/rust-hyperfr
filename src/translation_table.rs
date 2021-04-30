@@ -421,6 +421,7 @@ impl TranslationTableManager {
         debug_assert!(size > 0);
         debug_assert!(self.granule.aligner().is_aligned(size as u64));
 
+        // If a page table, just setup, i.e. end recursion.
         if table.level == 3 {
             let d = table.descriptor_mut(index as usize);
 
@@ -463,42 +464,46 @@ impl TranslationTableManager {
             return Ok(());
         }
 
-        if let Some(block_size) = self.granule.block_size(table.level) {
-            if size as u64 == block_size {
-                let level = table.level;
-                let d = table.descriptor_mut(index as usize);
+        // If size is equal to the block size required for this level, setup a block.
+        if self
+            .granule
+            .block_size(table.level)
+            .map(|bs| bs == size)
+            .unwrap_or_default()
+        {
+            let level = table.level;
+            let d = table.descriptor_mut(index as usize);
 
-                if d.0 & 0b11 != 0 {
-                    bail!("L{} table {} already set-up", level, index);
-                }
-
-                // Block
-                d.0 = 0b01;
-                d.0 |= 1 << 10; // AF=1
-                d.0 |= ipa.0;
-
-                d.0 |= 0b10 << 8; // SH
-                if !(flags.contains(HvMemoryFlags::HV_MEMORY_EXEC)) {
-                    d.0 |= 1 << 53; // Privileged execute never
-                    d.0 |= 1 << 54; // Unprivileged execute never
-                }
-
-                // AP bits AP[2:1], bits[7:6] Data Access Permissions bits, see Memory access control on page D5-2731.
-                if !flags.contains(HvMemoryFlags::HV_MEMORY_WRITE) {
-                    d.0 |= 0b10 << 6;
-                }
-
-                trace!(
-                    "writing block: l{}={}, val={:#x?}, va: {:#x?}, ipa: {:#x?}, flags: {:?}",
-                    level,
-                    index,
-                    d.0,
-                    va.0,
-                    ipa.0,
-                    flags
-                );
-                return Ok(());
+            if d.0 & 0b11 != 0 {
+                bail!("L{} table {} already set-up", level, index);
             }
+
+            // Block
+            d.0 = 0b01;
+            d.0 |= 1 << 10; // AF=1
+            d.0 |= ipa.0;
+
+            d.0 |= 0b10 << 8; // SH
+            if !(flags.contains(HvMemoryFlags::HV_MEMORY_EXEC)) {
+                d.0 |= 1 << 53; // Privileged execute never
+                d.0 |= 1 << 54; // Unprivileged execute never
+            }
+
+            // AP bits AP[2:1], bits[7:6] Data Access Permissions bits, see Memory access control on page D5-2731.
+            if !flags.contains(HvMemoryFlags::HV_MEMORY_WRITE) {
+                d.0 |= 0b10 << 6;
+            }
+
+            trace!(
+                "writing block: l{}={}, val={:#x?}, va: {:#x?}, ipa: {:#x?}, flags: {:?}",
+                level,
+                index,
+                d.0,
+                va.0,
+                ipa.0,
+                flags
+            );
+            return Ok(());
         }
 
         // Otherwise recurse into the next level.
