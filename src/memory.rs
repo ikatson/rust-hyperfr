@@ -1,4 +1,11 @@
-use std::{alloc::Layout, path::Path, sync::Arc};
+use std::{
+    alloc::Layout,
+    path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use vm_memory::GuestMemoryMmap;
 
@@ -27,8 +34,8 @@ pub struct GuestMemoryManager {
     dram_ipa_start: GuestIpaAddress,
     dram_va_start: GuestVaAddress,
     memory_size: usize,
-    used_ipa: Offset,
-    used_va: Offset,
+    used_ipa: AtomicU64,
+    used_va: AtomicU64,
     dram_config: Option<DramConfig>,
 }
 
@@ -63,8 +70,8 @@ impl GuestMemoryManager {
             dram_ipa_start: ipa_start,
             dram_va_start: va_start,
             memory_size: size,
-            used_ipa: Offset(0),
-            used_va: Offset(0),
+            used_ipa: AtomicU64::new(0),
+            used_va: AtomicU64::new(0),
             // This is temporary
             ttbr0: GuestIpaAddress(0),
             ttbr1: GuestIpaAddress(0),
@@ -99,52 +106,73 @@ impl GuestMemoryManager {
     }
 
     pub fn allocate_va(
-        &mut self,
+        &self,
         layout: Layout,
         purpose: core::fmt::Arguments<'_>,
     ) -> anyhow::Result<GuestVaAddress> {
-        let a = crate::aligner::Aligner::new_from_power_of_two(layout.align() as u64)?;
-        let offset = Offset(a.align_up(self.used_va.0));
-        let size = layout.size();
-        let va = self.dram_va_start.add(offset);
-        self.used_va = offset.add(Offset(size as u64));
-        trace!(
-            "allocated VA address space for {}, {:#x?}, layout size {:?}, align {:#x?}",
-            purpose,
-            va,
-            layout.size(),
-            layout.align()
-        );
-        Ok(va)
+        loop {
+            let used_va = self.used_va.load(Ordering::Relaxed);
+            let a = crate::aligner::Aligner::new_from_power_of_two(layout.align() as u64)?;
+            let offset = Offset(a.align_up(used_va));
+            let size = layout.size();
+            let va = self.dram_va_start.add(offset);
+            let new = offset.0 + size as u64;
+            if self
+                .used_va
+                .compare_exchange(used_va, new, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                trace!(
+                    "allocated VA address space for {}, {:#x?}, layout size {:?}, align {:#x?}",
+                    purpose,
+                    va,
+                    layout.size(),
+                    layout.align()
+                );
+                return Ok(va);
+            }
+        }
     }
 
     pub fn allocate_ipa(
-        &mut self,
+        &self,
         layout: Layout,
         purpose: core::fmt::Arguments<'_>,
     ) -> anyhow::Result<(*mut u8, GuestIpaAddress)> {
         let a = crate::aligner::Aligner::new_from_power_of_two(layout.align() as u64)?;
-        let offset = Offset(a.align_up(self.used_ipa.0));
-        let size = layout.size();
-        let ipa = self.dram_ipa_start.add(offset);
-        let host_ptr = self
-            .get_memory_slice_by_ipa(self.dram_ipa_start.add(offset), size)?
-            .as_mut_ptr();
-        self.used_ipa = offset.add(Offset(size as u64));
-        trace!(
-            "allocated IPA address space for {}, ipa {:#x?}, layout size {:?}, align {:#x?}",
-            purpose,
-            ipa.0,
-            layout.size(),
-            layout.align()
-        );
-        Ok((host_ptr, ipa))
+        loop {
+            let used_ipa = self.used_ipa.load(Ordering::Relaxed);
+            let offset = Offset(a.align_up(used_ipa));
+            let size = layout.size();
+            let ipa = self.dram_ipa_start.add(offset);
+            if self
+                .used_ipa
+                .compare_exchange(
+                    used_ipa,
+                    offset.0 + size as u64,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                let host_ptr = self
+                    .get_memory_slice_by_ipa(self.dram_ipa_start.add(offset), size)?
+                    .as_mut_ptr();
+
+                trace!(
+                    "allocated IPA address space for {}, ipa {:#x?}, layout size {:?}, align {:#x?}",
+                    purpose,
+                    ipa.0,
+                    layout.size(),
+                    layout.align()
+                );
+                return Ok((host_ptr, ipa));
+            }
+        }
     }
 
     pub fn load_elf<P: AsRef<Path>>(&mut self, filename: P) -> anyhow::Result<LoadedElf> {
-        let loaded = elf_loader::load_elf(self, filename)?;
-        self.used_ipa = self.used_ipa.add(Offset(loaded.used_dram_size));
-        Ok(loaded)
+        elf_loader::load_elf(self, filename)
     }
 
     pub fn get_dram_config(&self) -> Option<DramConfig> {
@@ -152,9 +180,12 @@ impl GuestMemoryManager {
     }
 
     pub fn configure_dram(&mut self) -> anyhow::Result<()> {
-        let ipa = self.dram_ipa_start.add(self.used_ipa);
-        let va = self.dram_va_start.add(self.used_va);
-        let usable_memory_size = (self.memory_size as u64 - self.used_ipa.0) as usize;
+        let used_ipa = Offset(self.used_ipa.load(Ordering::Relaxed));
+        let ipa = self.dram_ipa_start.add(used_ipa);
+        let va = self
+            .dram_va_start
+            .add(Offset(self.used_va.load(Ordering::Relaxed)));
+        let usable_memory_size = (self.memory_size as u64 - used_ipa.0) as usize;
         // This is the RAM that the kernel is free to use for whatever purpose, e.g. allocating.
         debug!(
             "configuring translation tables for DRAM, ipa {:#x?}, va {:#x?}, usable memory size {}",
