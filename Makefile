@@ -18,6 +18,16 @@ run: build
 	@ RUST_BACKTRACE=1 target/debug/main /Users/igor/projects/2021-04-os-hypervisor-framework/armos/target/aarch64-unknown-none/release/armos
 
 
+.PHONY: build
+build-release:
+	@ cargo build --release
+	@ codesign --entitlements vz.entitlements -s - target/release/main
+
+.PHONY: run
+run-release: build-release
+	@ RUST_BACKTRACE=1 target/release/main /Users/igor/projects/2021-04-os-hypervisor-framework/armos/target/aarch64-unknown-none/release/armos
+
+
 .PHONY: test
 test:
 	# This builds, codesigns and runs the test binary
