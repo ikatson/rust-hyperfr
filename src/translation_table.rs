@@ -315,27 +315,27 @@ impl<G: Granule> TranslationTableManager<G> {
         // Just a double-check for debugging
         // In pseudo-code this was:
         // if !IsZero(baseregister < 47: outputsize > ) -> throw AddressFault
-        assert_eq!(bits(ipa.0, 47, self.ips_bits), 0);
+        debug_assert_eq!(bits(ipa.0, 47, self.ips_bits), 0);
 
         if top_bit {
             // Make sure all bits <top:inputsize> are ones.
             // where inputsize = 64 - TxSZ and top=55
-            assert_eq!(
-                bits(va.0, 55, 64 - self.txsz),
-                bits(u64::MAX, 55, 64 - self.txsz),
-                "bits [64:{}] should be 1, but they are not in {:?}",
-                (64 - self.txsz),
-                va
-            )
+            if bits(va.0, 55, 64 - self.txsz) != bits(u64::MAX, 55, 64 - self.txsz) {
+                bail!(
+                    "bits [64:{}] should be 1, but they are not in {:?}",
+                    (64 - self.txsz),
+                    va
+                )
+            }
         } else {
             // Make sure all bits up to TXSZ are zeroes.
-            assert_eq!(
-                bits(va.0, 55, 64 - self.txsz),
-                0,
-                "bits [64:{}] should be zeroes, but they are not in {:?}",
-                (64 - self.txsz),
-                va
-            )
+            if bits(va.0, 55, 64 - self.txsz) != 0 {
+                bail!(
+                    "bits [64:{}] should be zeroes, but they are not in {:?}",
+                    (64 - self.txsz),
+                    va
+                )
+            }
         }
 
         self.get_ttbr_at(memory_mgr, ipa)
