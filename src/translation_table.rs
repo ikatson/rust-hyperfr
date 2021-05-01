@@ -9,12 +9,8 @@ use anyhow::bail;
 use log::trace;
 
 pub const fn bits(val: u64, start_inclusive: u8, end_inclusive: u8) -> u64 {
-    let top_mask = match start_inclusive {
-        63 => u64::MAX,
-        0..=62 => (1u64 << (start_inclusive + 1)) - 1,
-        _ => 0,
-    };
-    let bottom_mask = !((1 << end_inclusive) - 1);
+    let top_mask = u64::MAX >> (64 - start_inclusive - 1);
+    let bottom_mask = u64::MAX << end_inclusive;
     val & top_mask & bottom_mask
 }
 
@@ -185,7 +181,9 @@ pub trait TtMgr: core::fmt::Debug + Send + Sync {
     fn get_txsz(&self) -> u8;
 }
 
-impl<G: Granule + Send + Sync + core::fmt::Debug> TtMgr for TranslationTableManager<G> {
+impl<G: Granule + Send + Sync + core::fmt::Debug, const TXSZ: u8> TtMgr
+    for TranslationTableManager<G, TXSZ>
+{
     fn get_top_ttbr_layout(&self) -> anyhow::Result<Layout> {
         Self::get_top_ttbr_layout(&self)
     }
@@ -224,40 +222,44 @@ pub fn new_tt_mgr(
     granule: Aarch64TranslationGranule,
     txsz: u8,
 ) -> anyhow::Result<Box<dyn TtMgr>> {
-    match granule {
-        Aarch64TranslationGranule::P4k => Ok(Box::new(TranslationTableManager::new(
-            Granule4k {},
-            txsz,
-            ttbr0,
-            ttbr1,
-        )?)),
-        Aarch64TranslationGranule::P16k => Ok(Box::new(TranslationTableManager::new(
-            Granule16k {},
-            txsz,
-            ttbr0,
-            ttbr1,
-        )?)),
-        Aarch64TranslationGranule::P64k => bail!("granule 64k not implemented"),
+    macro_rules! boxdyn {
+        ($granule:expr, $txsz:literal) => {
+            Ok(Box::new(TranslationTableManager::<_, $txsz>::new(
+                $granule, ttbr0, ttbr1,
+            )?))
+        };
     }
+    match granule {
+        Aarch64TranslationGranule::P4k => {
+            if txsz == 25 {
+                return boxdyn!(Granule4k {}, 25);
+            }
+        }
+        Aarch64TranslationGranule::P16k => match txsz {
+            16 => return boxdyn!(Granule16k {}, 16),
+            28 => return boxdyn!(Granule16k {}, 28),
+            _ => {}
+        },
+        Aarch64TranslationGranule::P64k => {}
+    };
+    bail!(
+        "granule/txsz combination {:?}/{} not supported",
+        granule,
+        txsz
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct TranslationTableManager<G> {
+pub struct TranslationTableManager<G, const TXSZ: u8> {
     ttbr0: GuestIpaAddress,
     ttbr1: GuestIpaAddress,
     granule: G,
     ips_size: u64,
     ips_bits: u8,
-    txsz: u8,
 }
 
-impl<G: Granule> TranslationTableManager<G> {
-    fn new(
-        granule: G,
-        txsz: u8,
-        ttbr0: GuestIpaAddress,
-        ttbr1: GuestIpaAddress,
-    ) -> anyhow::Result<Self> {
+impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
+    fn new(granule: G, ttbr0: GuestIpaAddress, ttbr1: GuestIpaAddress) -> anyhow::Result<Self> {
         let ips_bits = 36;
         let ips_size = 1 << ips_bits;
         Ok(Self {
@@ -266,16 +268,15 @@ impl<G: Granule> TranslationTableManager<G> {
             granule,
             ips_size,
             ips_bits,
-            txsz,
         })
     }
 
     fn initial_level(&self) -> i8 {
-        self.granule.initial_level(self.txsz)
+        self.granule.initial_level(TXSZ)
     }
 
     fn layout_for_level(&self, level: i8) -> Layout {
-        self.granule.layout_for_level(level, self.txsz)
+        self.granule.layout_for_level(level, TXSZ)
     }
 
     pub fn get_granule(&self) -> &'static dyn Granule {
@@ -283,7 +284,7 @@ impl<G: Granule> TranslationTableManager<G> {
     }
 
     pub fn get_txsz(&self) -> u8 {
-        self.txsz
+        TXSZ
     }
 
     pub fn get_top_ttbr_layout(&self) -> anyhow::Result<Layout> {
@@ -320,19 +321,19 @@ impl<G: Granule> TranslationTableManager<G> {
         if top_bit {
             // Make sure all bits <top:inputsize> are ones.
             // where inputsize = 64 - TxSZ and top=55
-            if bits(va.0, 55, 64 - self.txsz) != bits(u64::MAX, 55, 64 - self.txsz) {
+            if bits(va.0, 55, 64 - TXSZ) != bits(u64::MAX, 55, 64 - TXSZ) {
                 bail!(
                     "bits [64:{}] should be 1, but they are not in {:?}",
-                    (64 - self.txsz),
+                    (64 - TXSZ),
                     va
                 )
             }
         } else {
             // Make sure all bits up to TXSZ are zeroes.
-            if bits(va.0, 55, 64 - self.txsz) != 0 {
+            if bits(va.0, 55, 64 - TXSZ) != 0 {
                 bail!(
                     "bits [64:{}] should be zeroes, but they are not in {:?}",
-                    (64 - self.txsz),
+                    (64 - TXSZ),
                     va
                 )
             }
@@ -387,7 +388,7 @@ impl<G: Granule> TranslationTableManager<G> {
     ) -> anyhow::Result<Option<GuestIpaAddress>> {
         let mut table = self.get_top_table(mm, va)?;
         loop {
-            let (bt, bb) = self.granule.bits_range(table.level, self.txsz);
+            let (bt, bb) = self.granule.bits_range(table.level, TXSZ);
             let index = bits(va.0, bt, bb) >> bb;
             let d = table.descriptor(index as usize);
             trace!(
@@ -450,7 +451,7 @@ impl<G: Granule> TranslationTableManager<G> {
         debug_assert!(size > 0);
         debug_assert!(self.granule.aligner().is_aligned(size as u64));
 
-        let (bt, bl) = self.granule.bits_range(table.level, self.txsz);
+        let (bt, bl) = self.granule.bits_range(table.level, TXSZ);
 
         let start_index = bits(va.0, bt, bl) >> bl;
         let end_index = bits(va.add(Offset((size - 1) as u64)).0, bt, bl) >> bl;
