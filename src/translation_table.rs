@@ -2,10 +2,10 @@ use std::alloc::Layout;
 
 use crate::{
     addresses::{GuestIpaAddress, GuestVaAddress, Offset},
+    error::Kind,
     memory::GuestMemoryManager,
 };
 use crate::{aligner::Aligner, HvMemoryFlags};
-use anyhow::bail;
 use log::trace;
 
 pub const fn bits(val: u64, start_inclusive: u8, end_inclusive: u8) -> u64 {
@@ -242,11 +242,7 @@ pub fn new_tt_mgr(
         },
         Aarch64TranslationGranule::P64k => {}
     };
-    bail!(
-        "granule/txsz combination {:?}/{} not supported",
-        granule,
-        txsz
-    )
+    Err(Kind::GranuleTxszNotSupported { granule, txsz }.into())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -322,20 +318,12 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
             // Make sure all bits <top:inputsize> are ones.
             // where inputsize = 64 - TxSZ and top=55
             if bits(va.0, 55, 64 - TXSZ) != bits(u64::MAX, 55, 64 - TXSZ) {
-                bail!(
-                    "bits [64:{}] should be 1, but they are not in {:?}",
-                    (64 - TXSZ),
-                    va
-                )
+                return Err(Kind::TopBitsShouldBeOne { top: 64 - TXSZ, va }.into());
             }
         } else {
             // Make sure all bits up to TXSZ are zeroes.
             if bits(va.0, 55, 64 - TXSZ) != 0 {
-                bail!(
-                    "bits [64:{}] should be zeroes, but they are not in {:?}",
-                    (64 - TXSZ),
-                    va
-                )
+                return Err(Kind::TopBitsShouldBeZero { top: 64 - TXSZ, va }.into());
             }
         }
 
@@ -355,27 +343,40 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
 
         let aligner = self.granule.aligner();
         if !aligner.is_aligned(va.0) {
-            bail!("{:?} is not aligned", va)
+            return Err(Kind::NotAligned {
+                value: va.0,
+                name: "va",
+            }
+            .into());
         }
         if !aligner.is_aligned(ipa.0) {
-            bail!("{:?} is not aligned", ipa)
+            return Err(Kind::NotAligned {
+                value: ipa.0,
+                name: "ipa",
+            }
+            .into());
         }
         if !aligner.is_aligned(size as u64) {
-            bail!("size {:#x?} is not aligned", size)
+            return Err(Kind::NotAligned {
+                value: size as u64,
+                name: "size",
+            }
+            .into());
         }
 
         match ipa.0.checked_add(size as u64) {
             Some(ipa_end) => {
                 if ipa_end >= self.ips_size {
-                    bail!(
-                        "ipa {:#x?} / and or ipa + size are too large, does not fit into the TXSZ
-                        space which is limited by address {:#x?}",
+                    return Err(Kind::IpaDoesNotFitIps {
                         ipa,
-                        self.ips_size - 1
-                    )
+                        ips_limit: GuestIpaAddress(self.ips_size - 1),
+                    }
+                    .into());
                 }
             }
-            None => bail!("ipa + size overflow, {:?}, size {:?}", ipa, size),
+            None => {
+                return Err(Kind::IpaPlusSizeOverflow { ipa, size }.into());
+            }
         };
 
         self.setup_internal(table, memory_mgr, va, ipa, size as u64, flags)
@@ -422,10 +423,15 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
                     let block_size_bits = match self.granule.block_size_bits(table.level) {
                         Some(bs) => bs,
                         None => {
-                            bail!(
-                                "saw a block on level {}, this should not have happened",
-                                table.level
-                            );
+                            return Err(Kind::ProgrammingError(
+                                // TODO: change this one?
+                                format!(
+                                    "saw a block on level {}, this should not have happened",
+                                    table.level
+                                )
+                                .into(),
+                            )
+                            .into());
                         }
                     };
                     let ipa = GuestIpaAddress(bits(d.0, 47, block_size_bits));
@@ -515,15 +521,17 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
             let d = table.descriptor_mut(index as usize);
 
             if d.0 & 0b11 != 0 {
-                bail!(
-                    "page already set up. Old value {:#x?}, l3={}, va={:#x?}, ipa={:#x?}, size={}, flags={:?}",
-                    d.0,
-                    index,
-                    va,
-                    ipa,
-                    size,
-                    flags
-                );
+                return Err(Kind::ProgrammingError(
+                    format!(
+                        "page already set up. Old value {:#x?}, l3={}, va={:#x?}, ipa={:#x?}, size={}, flags={:?}",
+                        d.0,
+                        index,
+                        va,
+                        ipa,
+                        size,
+                        flags
+                    ).into()
+                ).into());
             }
 
             trace!(
@@ -564,7 +572,10 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
             let d = table.descriptor_mut(index as usize);
 
             if d.0 & 0b11 != 0 {
-                bail!("L{} table {} already set-up", level, index);
+                return Err(Kind::ProgrammingError(
+                    format!("L{} table {} already set-up", level, index).into(),
+                )
+                .into());
             }
 
             // Block
@@ -610,7 +621,7 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
         let descriptor = table.descriptor_mut(index as usize);
         match descriptor.0 & 0b11 {
             0b01 => {
-                bail!("already a block")
+                return Err(Kind::ProgrammingError("already a block".into()).into());
             }
             0b11 => {
                 let ipa = bits(descriptor.0, 47, self.granule.page_size_bits());
@@ -638,7 +649,12 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
                     start: ipa,
                 })
             }
-            _ => bail!("memory is corrupted, this shouldn't have happened"),
+            _ => {
+                return Err(Kind::ProgrammingError(
+                    "memory is corrupted, this shouldn't have happened".into(),
+                )
+                .into());
+            }
         }
     }
 }

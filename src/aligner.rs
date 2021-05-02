@@ -1,4 +1,4 @@
-use anyhow::bail;
+use crate::error::Kind;
 
 pub const ALIGNER_16K: Aligner = Aligner::new_from_mask(!((1 << 14) - 1));
 
@@ -33,19 +33,19 @@ impl Aligner {
     }
 
     #[allow(dead_code)]
-    pub fn new_from_bits(bits: u8) -> anyhow::Result<Self> {
+    pub fn new_from_bits(bits: u8) -> crate::Result<Self> {
         match bits {
             1..=63 => Ok(Self {
                 mask: !((1 << (bits - 1)) - 1),
             }),
-            _ => bail!("bits should be >= 0 and =< 64"),
+            _ => return Err(Kind::ProgrammingError("bits should be >= 0 and =< 64".into()).into()),
         }
     }
 
     #[allow(dead_code)]
-    pub fn new_from_power_of_two(number: u64) -> anyhow::Result<Self> {
+    pub fn new_from_power_of_two(number: u64) -> crate::Result<Self> {
         if !(is_power_of_two(number)) {
-            bail!("{} is not a power of 2", number);
+            return Err(Kind::NotAPowerOfTwo { value: number }.into());
         }
         Ok(Self {
             mask: !(number - 1),

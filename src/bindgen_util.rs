@@ -1,8 +1,8 @@
 use crate::{
     aarch64_debug::Syndrome,
     bindgen::{self, hv_exit_reason_t, NSObject},
+    error::Kind,
 };
-use anyhow::{anyhow, bail};
 use bitflags::bitflags;
 use std::convert::{TryFrom, TryInto};
 
@@ -99,16 +99,19 @@ impl TryFrom<bindgen::hv_return_t> for HVReturnT {
     }
 }
 
-pub fn assert_hv_return_t_ok(v: bindgen::hv_return_t, name: &str) -> anyhow::Result<()> {
-    let ret = HVReturnT::try_from(v).map_err(|e| {
-        anyhow!(
-            "unexpected hv_return_t value {:#x} from {}",
-            e as usize,
-            name
-        )
+pub fn assert_hv_return_t_ok(v: bindgen::hv_return_t, name: &'static str) -> crate::Result<()> {
+    let ret = HVReturnT::try_from(v).map_err(|e| Kind::HvReturnTUnrecognized {
+        value: e,
+        function_name: name,
     })?;
     match ret {
         HVReturnT::HV_SUCCESS => Ok(()),
-        err => bail!("{}() returned {:?}", name, err),
+        err => {
+            return Err(Kind::HvReturnTNotSuccess {
+                value: ret,
+                function_name: name,
+            }
+            .into())
+        }
     }
 }

@@ -92,21 +92,96 @@ pub mod smallvec {
     }
 }
 
+use std::borrow::Cow;
+
 use smallvec::SmallVec;
 
-use crate::addresses::GuestIpaAddress;
+use crate::{
+    addresses::{GuestIpaAddress, GuestVaAddress},
+    translation_table::Aarch64TranslationGranule,
+};
 
 #[derive(Debug)]
 pub enum Kind {
+    ProgrammingError(Cow<'static, str>),
     Mmap(std::io::Error),
     InvalidGuestIpaAddress(GuestIpaAddress),
-    InvalidGuestMemorySlice { ipa: GuestIpaAddress, size: usize },
+    InvalidGuestMemorySlice {
+        ipa: GuestIpaAddress,
+        size: usize,
+    },
+    GranuleTxszNotSupported {
+        granule: Aarch64TranslationGranule,
+        txsz: u8,
+    },
+    TopBitsShouldBeOne {
+        top: u8,
+        va: GuestVaAddress,
+    },
+    TopBitsShouldBeZero {
+        top: u8,
+        va: GuestVaAddress,
+    },
+    NotAligned {
+        value: u64,
+        name: &'static str,
+    },
+    IpaDoesNotFitIps {
+        ipa: GuestIpaAddress,
+        ips_limit: GuestIpaAddress,
+    },
+    IpaPlusSizeOverflow {
+        ipa: GuestIpaAddress,
+        size: usize,
+    },
+    NotAPowerOfTwo {
+        value: u64,
+    },
+    HvReturnTUnrecognized {
+        value: crate::bindgen::hv_return_t,
+        function_name: &'static str,
+    },
+    HvReturnTNotSuccess {
+        value: crate::bindgen_util::HVReturnT,
+        function_name: &'static str,
+    },
 }
 
 impl core::fmt::Display for Kind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Kind::Mmap(e) => f.write_fmt(format_args!("error doing mmap: {}", e)),
+            Kind::InvalidGuestIpaAddress(addr) => {
+                f.write_fmt(format_args!("invalid guest address: {:?}", addr))
+            }
+            Kind::InvalidGuestMemorySlice { ipa, size } => f.write_fmt(format_args!(
+                "invalid guest memory slice (out of bounds): ipa {:?}, size {}",
+                ipa, size
+            )),
+            Kind::GranuleTxszNotSupported { granule, txsz } => f.write_fmt(format_args!(
+                "granule/txsz combination {:?}/{} not supported",
+                granule, txsz
+            )),
+            Kind::TopBitsShouldBeOne { top, va } => f.write_fmt(format_args!(
+                "bits [64:{}] should be 1, but they are not in {:?}",
+                top, va
+            )),
+            Kind::TopBitsShouldBeZero { top, va } => f.write_fmt(format_args!(
+                "bits [64:{}] should be 0, but they are not in {:?}",
+                top, va
+            )),
+            Kind::NotAligned { value, name } => f.write_fmt(format_args!("\"{}\" ({}) is not aligned", name, value)),
+            Kind::IpaDoesNotFitIps { ipa, ips_limit } => f.write_fmt(format_args!(
+                "ipa {:#x?} / and or ipa + size are too large, does not fit into the TXSZ space which is limited by address {:#x?}",
+                ipa, ips_limit
+            )),
+            Kind::IpaPlusSizeOverflow { ipa, size } => f.write_fmt(format_args!(
+                "ipa + size overflow, {:?}, size {:?}", ipa, size
+            )),
+            Kind::ProgrammingError(v) => f.write_fmt(format_args!("{}", v)),
+            Kind::NotAPowerOfTwo { value } => f.write_fmt(format_args!("{} is not a power of 2", value)),
+            Kind::HvReturnTUnrecognized { value, function_name } => f.write_fmt(format_args!("can't map return value of \"{}\" = {} to HvReturnT", function_name, value)),
+            Kind::HvReturnTNotSuccess { value, function_name } => f.write_fmt(format_args!("\"{}\" returned {:?}", function_name, value))
         }
     }
 }
@@ -115,6 +190,7 @@ impl std::error::Error for Kind {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Kind::Mmap(e) => Some(e),
+            _ => None,
         }
     }
 }

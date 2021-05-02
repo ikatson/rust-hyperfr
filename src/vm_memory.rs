@@ -1,7 +1,5 @@
 use std::cell::UnsafeCell;
 
-use anyhow::{anyhow, bail};
-
 use crate::{
     addresses::{GuestIpaAddress, Offset},
     error::{Error, Kind},

@@ -1,7 +1,6 @@
 use std::{alloc::Layout, path::Path};
 
 use crate::{addresses::GuestIpaAddress, GuestVaAddress, HvMemoryFlags, Offset};
-use anyhow::{anyhow, bail, Context};
 use log::{debug, trace};
 
 #[derive(Default)]
