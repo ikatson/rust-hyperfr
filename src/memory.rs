@@ -40,7 +40,7 @@ impl GuestMemoryManager {
         va_start: GuestVaAddress,
         ipa_start: GuestIpaAddress,
         size: usize,
-    ) -> anyhow::Result<Self> {
+    ) -> crate::Result<Self> {
         let memory =
             GuestMemoryMmap::new(ipa_start, size).context("error allocating guest memory")?;
 
@@ -102,7 +102,7 @@ impl GuestMemoryManager {
         &self,
         layout: Layout,
         purpose: core::fmt::Arguments<'_>,
-    ) -> anyhow::Result<GuestVaAddress> {
+    ) -> crate::Result<GuestVaAddress> {
         loop {
             let used_va = self.used_va.load(Ordering::Relaxed);
             let a = crate::aligner::Aligner::new_from_power_of_two(layout.align() as u64)?;
@@ -131,7 +131,7 @@ impl GuestMemoryManager {
         &self,
         layout: Layout,
         purpose: core::fmt::Arguments<'_>,
-    ) -> anyhow::Result<(*mut u8, GuestIpaAddress)> {
+    ) -> crate::Result<(*mut u8, GuestIpaAddress)> {
         let a = crate::aligner::Aligner::new_from_power_of_two(layout.align() as u64)?;
         loop {
             let used_ipa = self.used_ipa.load(Ordering::Relaxed);
@@ -164,7 +164,7 @@ impl GuestMemoryManager {
         }
     }
 
-    pub fn load_elf<P: AsRef<Path>>(&mut self, filename: P) -> anyhow::Result<LoadedElf> {
+    pub fn load_elf<P: AsRef<Path>>(&mut self, filename: P) -> crate::Result<LoadedElf> {
         elf_loader::load_elf(self, filename)
     }
 
@@ -172,7 +172,7 @@ impl GuestMemoryManager {
         self.dram_config
     }
 
-    pub fn configure_dram(&mut self) -> anyhow::Result<()> {
+    pub fn configure_dram(&mut self) -> crate::Result<()> {
         let used_ipa = Offset(self.used_ipa.load(Ordering::Relaxed));
         let ipa = self.dram_ipa_start.add(used_ipa);
         let va = self
@@ -206,11 +206,13 @@ impl GuestMemoryManager {
         &self,
         ipa: GuestIpaAddress,
         size: usize,
-    ) -> anyhow::Result<&mut [u8]> {
-        self.memory.get_slice(ipa, size)
+    ) -> crate::Result<&mut [u8]> {
+        self.memory
+            .get_slice(ipa, size)
+            .ok_or_else(|| anyhow!("cannot get memory at address {:?}", ipa))
     }
 
-    pub fn get_memory_slice(&self, va: GuestVaAddress, size: usize) -> anyhow::Result<&mut [u8]> {
+    pub fn get_memory_slice(&self, va: GuestVaAddress, size: usize) -> crate::Result<&mut [u8]> {
         let ipa = self
             .simulate_address_lookup(va)?
             .ok_or_else(|| anyhow!("cannot find address {:#x?} in translation tables", va.0))?;
@@ -220,7 +222,7 @@ impl GuestMemoryManager {
     pub fn simulate_address_lookup(
         &self,
         va: GuestVaAddress,
-    ) -> anyhow::Result<Option<GuestIpaAddress>> {
+    ) -> crate::Result<Option<GuestIpaAddress>> {
         let maybe_ipa = self
             .translation_table_mgr
             .simulate_address_lookup(self, va)?;
@@ -234,7 +236,7 @@ impl GuestMemoryManager {
         va: GuestVaAddress,
         size: usize,
         flags: HvMemoryFlags,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         self.translation_table_mgr.setup(self, va, ipa, size, flags)
     }
 }
@@ -246,7 +248,7 @@ impl MemoryManager for GuestMemoryManager {
     fn simulate_address_lookup(
         &self,
         va: GuestVaAddress,
-    ) -> anyhow::Result<Option<GuestIpaAddress>> {
+    ) -> crate::Result<Option<GuestIpaAddress>> {
         GuestMemoryManager::simulate_address_lookup(self, va)
     }
     fn configure_page_tables(
@@ -255,10 +257,10 @@ impl MemoryManager for GuestMemoryManager {
         va: GuestVaAddress,
         size: usize,
         flags: HvMemoryFlags,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         GuestMemoryManager::configure_page_tables(self, ipa, va, size, flags)
     }
-    fn get_memory_slice(&mut self, va: GuestVaAddress, size: usize) -> anyhow::Result<&mut [u8]> {
+    fn get_memory_slice(&mut self, va: GuestVaAddress, size: usize) -> crate::Result<&mut [u8]> {
         GuestMemoryManager::get_memory_slice(self, va, size)
     }
 
@@ -266,7 +268,7 @@ impl MemoryManager for GuestMemoryManager {
         &mut self,
         layout: Layout,
         purpose: core::fmt::Arguments<'_>,
-    ) -> anyhow::Result<(*mut u8, GuestIpaAddress)> {
+    ) -> crate::Result<(*mut u8, GuestIpaAddress)> {
         GuestMemoryManager::allocate_ipa(self, layout, purpose)
     }
 
@@ -274,7 +276,7 @@ impl MemoryManager for GuestMemoryManager {
         &mut self,
         layout: Layout,
         purpose: core::fmt::Arguments<'_>,
-    ) -> anyhow::Result<GuestVaAddress> {
+    ) -> crate::Result<GuestVaAddress> {
         GuestMemoryManager::allocate_va(self, layout, purpose)
     }
 }

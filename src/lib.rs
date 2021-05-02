@@ -14,10 +14,13 @@ pub mod addresses;
 pub mod aligner;
 pub mod bindgen_util;
 pub mod elf_loader;
+pub mod error;
 mod layout;
 pub mod memory;
 pub mod translation_table;
 pub mod vm_memory;
+
+pub use error::Result;
 
 use addresses::{GuestIpaAddress, GuestVaAddress, Offset};
 use layout::*;

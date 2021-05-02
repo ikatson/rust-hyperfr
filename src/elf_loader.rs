@@ -16,30 +16,28 @@ pub trait MemoryManager {
         &mut self,
         layout: Layout,
         purpose: core::fmt::Arguments<'_>,
-    ) -> anyhow::Result<GuestVaAddress>;
+    ) -> crate::Result<GuestVaAddress>;
     fn allocate_ipa(
         &mut self,
         layout: Layout,
         purpose: core::fmt::Arguments<'_>,
-    ) -> anyhow::Result<(*mut u8, GuestIpaAddress)>;
-    fn simulate_address_lookup(
-        &self,
-        va: GuestVaAddress,
-    ) -> anyhow::Result<Option<GuestIpaAddress>>;
+    ) -> crate::Result<(*mut u8, GuestIpaAddress)>;
+    fn simulate_address_lookup(&self, va: GuestVaAddress)
+        -> crate::Result<Option<GuestIpaAddress>>;
     fn configure_page_tables(
         &mut self,
         ipa: GuestIpaAddress,
         va: GuestVaAddress,
         size: usize,
         flags: HvMemoryFlags,
-    ) -> anyhow::Result<()>;
-    fn get_memory_slice(&mut self, va: GuestVaAddress, size: usize) -> anyhow::Result<&mut [u8]>;
+    ) -> crate::Result<()>;
+    fn get_memory_slice(&mut self, va: GuestVaAddress, size: usize) -> crate::Result<&mut [u8]>;
 }
 
 pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
     mm: &mut MM,
     filename: P,
-) -> anyhow::Result<LoadedElf> {
+) -> crate::Result<LoadedElf> {
     let file = std::fs::File::open(filename)?;
     let map =
         unsafe { memmap::MmapOptions::default().map(&file) }.context("error mmmapping ELF file")?;

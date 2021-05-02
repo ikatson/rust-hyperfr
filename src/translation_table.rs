@@ -163,7 +163,7 @@ impl TableMetadata {
 }
 
 pub trait TtMgr: core::fmt::Debug + Send + Sync {
-    fn get_top_ttbr_layout(&self) -> anyhow::Result<Layout>;
+    fn get_top_ttbr_layout(&self) -> crate::Result<Layout>;
     fn setup(
         &self,
         memory_mgr: &GuestMemoryManager,
@@ -171,12 +171,12 @@ pub trait TtMgr: core::fmt::Debug + Send + Sync {
         ipa: GuestIpaAddress,
         size: usize,
         flags: HvMemoryFlags,
-    ) -> anyhow::Result<()>;
+    ) -> crate::Result<()>;
     fn simulate_address_lookup(
         &self,
         mm: &GuestMemoryManager,
         va: GuestVaAddress,
-    ) -> anyhow::Result<Option<GuestIpaAddress>>;
+    ) -> crate::Result<Option<GuestIpaAddress>>;
     fn get_granule(&self) -> &'static dyn Granule;
     fn get_txsz(&self) -> u8;
 }
@@ -184,7 +184,7 @@ pub trait TtMgr: core::fmt::Debug + Send + Sync {
 impl<G: Granule + Send + Sync + core::fmt::Debug, const TXSZ: u8> TtMgr
     for TranslationTableManager<G, TXSZ>
 {
-    fn get_top_ttbr_layout(&self) -> anyhow::Result<Layout> {
+    fn get_top_ttbr_layout(&self) -> crate::Result<Layout> {
         Self::get_top_ttbr_layout(&self)
     }
 
@@ -195,7 +195,7 @@ impl<G: Granule + Send + Sync + core::fmt::Debug, const TXSZ: u8> TtMgr
         ipa: GuestIpaAddress,
         size: usize,
         flags: HvMemoryFlags,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         Self::setup(&self, memory_mgr, va, ipa, size, flags)
     }
 
@@ -203,7 +203,7 @@ impl<G: Granule + Send + Sync + core::fmt::Debug, const TXSZ: u8> TtMgr
         &self,
         mm: &GuestMemoryManager,
         va: GuestVaAddress,
-    ) -> anyhow::Result<Option<GuestIpaAddress>> {
+    ) -> crate::Result<Option<GuestIpaAddress>> {
         Self::simulate_address_lookup(&self, mm, va)
     }
 
@@ -221,7 +221,7 @@ pub fn new_tt_mgr(
     ttbr1: GuestIpaAddress,
     granule: Aarch64TranslationGranule,
     txsz: u8,
-) -> anyhow::Result<Box<dyn TtMgr>> {
+) -> crate::Result<Box<dyn TtMgr>> {
     macro_rules! boxdyn {
         ($granule:expr, $txsz:literal) => {
             Ok(Box::new(TranslationTableManager::<_, $txsz>::new(
@@ -259,7 +259,7 @@ pub struct TranslationTableManager<G, const TXSZ: u8> {
 }
 
 impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
-    fn new(granule: G, ttbr0: GuestIpaAddress, ttbr1: GuestIpaAddress) -> anyhow::Result<Self> {
+    fn new(granule: G, ttbr0: GuestIpaAddress, ttbr1: GuestIpaAddress) -> crate::Result<Self> {
         let ips_bits = 36;
         let ips_size = 1 << ips_bits;
         Ok(Self {
@@ -287,7 +287,7 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
         TXSZ
     }
 
-    pub fn get_top_ttbr_layout(&self) -> anyhow::Result<Layout> {
+    pub fn get_top_ttbr_layout(&self) -> crate::Result<Layout> {
         Ok(self.layout_for_level(self.initial_level()))
     }
 
@@ -295,7 +295,7 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
         &self,
         memory_mgr: &GuestMemoryManager,
         ipa: GuestIpaAddress,
-    ) -> anyhow::Result<TableMetadata> {
+    ) -> crate::Result<TableMetadata> {
         let sz = self.get_top_ttbr_layout()?.size();
         let slice = memory_mgr.get_memory_slice_by_ipa(ipa, sz)?;
         Ok(TableMetadata {
@@ -309,7 +309,7 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
         &self,
         memory_mgr: &GuestMemoryManager,
         va: GuestVaAddress,
-    ) -> anyhow::Result<TableMetadata> {
+    ) -> crate::Result<TableMetadata> {
         let top_bit = (va.0 >> 55) & 1 == 1;
         let ipa = if top_bit { self.ttbr1 } else { self.ttbr0 };
 
@@ -349,7 +349,7 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
         ipa: GuestIpaAddress,
         size: usize,
         flags: HvMemoryFlags,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         // check invariants, then call into setup_internal
         let table = self.get_top_table(memory_mgr, va)?;
 
@@ -385,7 +385,7 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
         &self,
         mm: &GuestMemoryManager,
         va: GuestVaAddress,
-    ) -> anyhow::Result<Option<GuestIpaAddress>> {
+    ) -> crate::Result<Option<GuestIpaAddress>> {
         let mut table = self.get_top_table(mm, va)?;
         loop {
             let (bt, bb) = self.granule.bits_range(table.level, TXSZ);
@@ -445,7 +445,7 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
         ipa: GuestIpaAddress,
         size: u64,
         flags: HvMemoryFlags,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         debug_assert!(self.granule.aligner().is_aligned(va.0));
         debug_assert!(self.granule.aligner().is_aligned(ipa.0));
         debug_assert!(size > 0);
@@ -504,7 +504,7 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
         ipa: GuestIpaAddress,
         size: u64,
         flags: HvMemoryFlags,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         debug_assert!(self.granule.aligner().is_aligned(va.0));
         debug_assert!(self.granule.aligner().is_aligned(ipa.0));
         debug_assert!(size > 0);
@@ -605,7 +605,7 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
         mut table: TableMetadata,
         index: u16,
         memory_mgr: &GuestMemoryManager,
-    ) -> anyhow::Result<TableMetadata> {
+    ) -> crate::Result<TableMetadata> {
         let level = table.level;
         let descriptor = table.descriptor_mut(index as usize);
         match descriptor.0 & 0b11 {
