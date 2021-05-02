@@ -1,15 +1,16 @@
-use anyhow::Context;
-
+use hyperfr::error::{ErrorContext, Kind};
 use log::error;
 
-fn main_result() -> anyhow::Result<()> {
+fn main_result() -> hyperfr::error::Result<()> {
     pretty_env_logger::init();
 
     let mut vmb = hyperfr::HfVmBuilder::new().context("error creating HfVmBuilder")?;
     let mut args = std::env::args_os();
-    let image = args
-        .nth(1)
-        .context("first argument missing, required filename of the ELF image of the kernel")?;
+    let image = args.nth(1).ok_or_else(|| {
+        Kind::String(
+            "first argument missing, required filename of the ELF image of the kernel".into(),
+        )
+    })?;
 
     vmb.load_elf(&image)
         .with_context(|| format!("error loading ELF image from filename {:?}", &image))?;

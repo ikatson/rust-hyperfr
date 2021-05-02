@@ -144,7 +144,7 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
             ss.flags,
         );
         mm.configure_page_tables(ss.ipa, ss.va, ss.aligned_size as usize, ss.flags)
-            .map_err(|e| {
+            .map_err(|mut e| {
                 let context_kind = Kind::TranslationForLoadSegment {
                     idx,
                     segment_address: ss.segment.address(),
@@ -161,7 +161,7 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
 
     for section in obj.sections() {
         let section_name = section.name().map_err(|e| {
-            let e = crate::error::Error::from(e);
+            let mut e = crate::error::Error::from(e);
             let kind = Kind::ErrorReadingSectionName {
                 address: section.address(),
             };
@@ -193,7 +193,7 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
             };
             let data = section.data().map_err(|e| {
                 error!("error getting section data for section {}", section_name);
-                let e = crate::error::Error::from(e);
+                let mut e = crate::error::Error::from(e);
                 e.push_kind(Kind::ErrorReadingSectionData {
                     section_address: section.address(),
                 });

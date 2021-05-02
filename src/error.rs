@@ -20,7 +20,7 @@ pub mod smallvec {
                 // wrap around
                 true_idx -= S;
             };
-            return Some(unsafe { &*self.items[true_idx].as_ptr() });
+            Some(unsafe { &*self.items[true_idx].as_ptr() })
         }
 
         pub fn iter(&self) -> impl DoubleEndedIterator<Item = &T> {
@@ -90,9 +90,15 @@ pub mod smallvec {
             self.start += 1;
         }
     }
+
+    impl<T: Sized, const S: usize> Default for SmallVec<T, S> {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
 }
 
-use std::{alloc::LayoutError, borrow::Cow};
+use std::{alloc::LayoutError, borrow::Cow, str::Utf8Error};
 
 use smallvec::SmallVec;
 
@@ -103,6 +109,8 @@ use crate::{
 
 #[derive(Debug)]
 pub enum Kind {
+    String(Cow<'static, str>),
+    Context(Cow<'static, str>),
     UnsupportedInput(Cow<'static, str>),
     ProgrammingError(Cow<'static, str>),
     MmapGuestMemory(std::io::Error),
@@ -112,6 +120,7 @@ pub enum Kind {
     ObjectLibrary(object::Error),
     InvalidGuestIpaAddress(GuestIpaAddress),
     Layout(LayoutError),
+    Utf8Error(Utf8Error),
     TranslationForLoadSegment {
         idx: usize,
         segment_address: u64,
@@ -173,6 +182,9 @@ pub enum Kind {
         segment_idx: usize,
     },
     NoExceptionVectorTable,
+    SimulateTranslationError {
+        va: GuestVaAddress,
+    },
 }
 
 impl core::fmt::Display for Kind {
@@ -237,7 +249,13 @@ impl core::fmt::Display for Kind {
                     segment_idx
                 ))
             }
-            Kind::NoExceptionVectorTable => f.write_str("cound not find symbol \"exception_vector_table\"")
+            Kind::NoExceptionVectorTable => f.write_str("cound not find symbol \"exception_vector_table\""),
+            Kind::Context(v) => f.write_str(&v),
+            Kind::UnsupportedInput(v) => f.write_str(&v),
+            Kind::ByteOrderWriteError(e) => f.write_fmt(format_args!("error writing to slice: {}", e)),
+            Kind::SimulateTranslationError { va } => f.write_fmt(format_args!("cannot find address {:?} in translation tables", va)),
+            Kind::String(s) => f.write_str(s),
+            Kind::Utf8Error(e) => f.write_fmt(format_args!("{}", e))
         }
     }
 }
@@ -259,7 +277,7 @@ pub struct Error {
 
 impl Error {
     pub fn from_kind(kind: Kind) -> Self {
-        let e = Self {
+        let mut e = Self {
             kinds: SmallVec::new(),
         };
         e.kinds.push_wrapping(kind);
@@ -303,5 +321,37 @@ impl From<object::Error> for Error {
 impl From<LayoutError> for Error {
     fn from(e: LayoutError) -> Self {
         Self::from_kind(Kind::Layout(e))
+    }
+}
+
+impl From<Utf8Error> for Error {
+    fn from(e: Utf8Error) -> Self {
+        Self::from_kind(Kind::Utf8Error(e))
+    }
+}
+
+pub trait ErrorContext<T> {
+    fn context<C: Into<Cow<'static, str>>>(self, value: C) -> Result<T>;
+    fn with_context<C: Into<Cow<'static, str>>, F: FnOnce() -> C>(self, cb: F) -> Result<T>;
+}
+
+impl<T, E> ErrorContext<T> for core::result::Result<T, E>
+where
+    E: Into<Error>,
+{
+    fn context<C: Into<Cow<'static, str>>>(self, value: C) -> Result<T> {
+        self.map_err(|e| {
+            let mut err = e.into();
+            err.push_kind(Kind::Context(value.into()));
+            err
+        })
+    }
+
+    fn with_context<C: Into<Cow<'static, str>>, F: FnOnce() -> C>(self, cb: F) -> Result<T> {
+        self.map_err(|e| {
+            let mut err = e.into();
+            err.push_kind(Kind::Context(cb().into()));
+            err
+        })
     }
 }

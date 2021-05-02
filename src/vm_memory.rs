@@ -20,7 +20,7 @@ impl GuestMemoryMmap {
         let map = memmap::MmapOptions::default()
             .len(size)
             .map_anon()
-            .map_err(|e| Error::from_kind(Kind::Mmap(e)))?;
+            .map_err(|e| Error::from_kind(Kind::MmapGuestMemory(e)))?;
         Ok(Self {
             start_addr,
             size,

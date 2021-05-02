@@ -104,7 +104,7 @@ pub fn assert_hv_return_t_ok(v: bindgen::hv_return_t, name: &'static str) -> cra
         value: e,
         function_name: name,
     })?;
-    match ret {
+    match &ret {
         HVReturnT::HV_SUCCESS => Ok(()),
         err => {
             return Err(Kind::HvReturnTNotSuccess {

@@ -4,7 +4,10 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::vm_memory::GuestMemoryMmap;
+use crate::{
+    error::{ErrorContext, Kind},
+    vm_memory::GuestMemoryMmap,
+};
 
 use crate::{
     addresses::{GuestIpaAddress, GuestVaAddress, Offset},
@@ -12,7 +15,6 @@ use crate::{
     translation_table::{new_tt_mgr, Aarch64TranslationGranule, Granule, TtMgr},
     HvMemoryFlags,
 };
-use anyhow::{anyhow, bail, Context};
 use log::{debug, trace};
 
 #[derive(Debug, Clone, Copy)]
@@ -41,18 +43,21 @@ impl GuestMemoryManager {
         ipa_start: GuestIpaAddress,
         size: usize,
     ) -> crate::Result<Self> {
-        let memory =
-            GuestMemoryMmap::new(ipa_start, size).context("error allocating guest memory")?;
+        let memory = GuestMemoryMmap::new(ipa_start, size)?;
 
         let granule = match std::env::var("GRANULE").as_deref().unwrap_or_default() {
             "4" => Aarch64TranslationGranule::P4k,
             "" | "16" => Aarch64TranslationGranule::P16k,
-            other => bail!("GRANULE={} is not supported, try 4,16 or 64", other),
+            other => {
+                return Err(Kind::UnsupportedInput(
+                    "Given GRANULE value is not supported, try 4 or 16".into(),
+                ))?;
+            }
         };
         let txsz: u8 = match std::env::var("TXSZ") {
             Ok(v) => v
                 .parse()
-                .with_context(|| format!("error parsing envvar TXSZ={} as u8", &v))?,
+                .map_err(|_| Kind::UnsupportedInput("error parsing envvar TXSZ as u8".into()))?,
             Err(_) => 28,
         };
         let tmp_ttmgr = new_tt_mgr(GuestIpaAddress(0), GuestIpaAddress(1), granule, txsz)?;
@@ -207,15 +212,13 @@ impl GuestMemoryManager {
         ipa: GuestIpaAddress,
         size: usize,
     ) -> crate::Result<&mut [u8]> {
-        self.memory
-            .get_slice(ipa, size)
-            .ok_or_else(|| anyhow!("cannot get memory at address {:?}", ipa))
+        self.memory.get_slice(ipa, size)
     }
 
     pub fn get_memory_slice(&self, va: GuestVaAddress, size: usize) -> crate::Result<&mut [u8]> {
         let ipa = self
             .simulate_address_lookup(va)?
-            .ok_or_else(|| anyhow!("cannot find address {:#x?} in translation tables", va.0))?;
+            .ok_or_else(|| Kind::SimulateTranslationError { va })?;
         self.get_memory_slice_by_ipa(ipa, size)
     }
 
