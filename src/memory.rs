@@ -1,13 +1,10 @@
 use std::{
     alloc::Layout,
     path::Path,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
-use vm_memory::GuestMemoryMmap;
+use crate::vm_memory::GuestMemoryMmap;
 
 use crate::{
     addresses::{GuestIpaAddress, GuestVaAddress, Offset},
@@ -17,7 +14,6 @@ use crate::{
 };
 use anyhow::{anyhow, bail, Context};
 use log::{debug, trace};
-use vm_memory::GuestMemory;
 
 #[derive(Debug, Clone, Copy)]
 pub struct DramConfig {
@@ -30,7 +26,7 @@ pub struct GuestMemoryManager {
     translation_table_mgr: Box<dyn TtMgr>,
     ttbr0: GuestIpaAddress,
     ttbr1: GuestIpaAddress,
-    memory: Arc<GuestMemoryMmap>,
+    memory: GuestMemoryMmap,
     dram_ipa_start: GuestIpaAddress,
     dram_va_start: GuestVaAddress,
     memory_size: usize,
@@ -45,10 +41,8 @@ impl GuestMemoryManager {
         ipa_start: GuestIpaAddress,
         size: usize,
     ) -> anyhow::Result<Self> {
-        let memory = Arc::new(
-            GuestMemoryMmap::from_ranges(&[(ipa_start.as_guest_address(), size)])
-                .context("error allocating guest memory")?,
-        );
+        let memory =
+            GuestMemoryMmap::new(ipa_start, size).context("error allocating guest memory")?;
 
         let granule = match std::env::var("GRANULE").as_deref().unwrap_or_default() {
             "4" => Aarch64TranslationGranule::P4k,
@@ -213,9 +207,7 @@ impl GuestMemoryManager {
         ipa: GuestIpaAddress,
         size: usize,
     ) -> anyhow::Result<&mut [u8]> {
-        let vslice = self.memory.get_slice(ipa.as_guest_address(), size)?;
-        let ptr = vslice.as_ptr();
-        Ok(unsafe { core::slice::from_raw_parts_mut(ptr, size) })
+        self.memory.get_slice(ipa, size)
     }
 
     pub fn get_memory_slice(&self, va: GuestVaAddress, size: usize) -> anyhow::Result<&mut [u8]> {
