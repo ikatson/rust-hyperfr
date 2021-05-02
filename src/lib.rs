@@ -9,14 +9,14 @@ use std::{path::Path, sync::Arc};
 
 use log::{debug, error, info, trace};
 
-mod aarch64_debug;
-mod addresses;
-mod aligner;
-mod bindgen_util;
-mod elf_loader;
+pub mod aarch64_debug;
+pub mod addresses;
+pub mod aligner;
+pub mod bindgen_util;
+pub mod elf_loader;
 mod layout;
-mod memory;
-mod translation_table;
+pub mod memory;
+pub mod translation_table;
 
 use addresses::{GuestIpaAddress, GuestVaAddress, Offset};
 use layout::*;
@@ -30,7 +30,7 @@ use layout::*;
     improper_ctypes,
     clippy::all
 )]
-pub mod bindgen;
+mod bindgen;
 
 pub struct HfVmBuilder {
     entrypoint: Option<GuestVaAddress>,
