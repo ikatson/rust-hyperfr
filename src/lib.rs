@@ -17,6 +17,7 @@ pub mod elf_loader;
 mod layout;
 pub mod memory;
 pub mod translation_table;
+pub mod vm_memory;
 
 use addresses::{GuestIpaAddress, GuestVaAddress, Offset};
 use layout::*;

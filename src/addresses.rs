@@ -1,13 +1,8 @@
-use vm_memory::GuestAddress;
-
 #[derive(Copy, Clone)]
 pub struct GuestIpaAddress(pub u64);
 impl GuestIpaAddress {
     pub const fn add(&self, offset: Offset) -> GuestIpaAddress {
         GuestIpaAddress(self.0 + offset.0)
-    }
-    pub const fn as_guest_address(&self) -> GuestAddress {
-        GuestAddress(self.0)
     }
 }
 
