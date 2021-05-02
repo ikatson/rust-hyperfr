@@ -92,7 +92,7 @@ pub mod smallvec {
     }
 }
 
-use std::borrow::Cow;
+use std::{alloc::LayoutError, borrow::Cow};
 
 use smallvec::SmallVec;
 
@@ -103,9 +103,31 @@ use crate::{
 
 #[derive(Debug)]
 pub enum Kind {
+    UnsupportedInput(Cow<'static, str>),
     ProgrammingError(Cow<'static, str>),
-    Mmap(std::io::Error),
+    MmapGuestMemory(std::io::Error),
+    ByteOrderWriteError(std::io::Error),
+    MmapElfFile(std::io::Error),
+    FileOpen(std::io::Error),
+    ObjectLibrary(object::Error),
     InvalidGuestIpaAddress(GuestIpaAddress),
+    Layout(LayoutError),
+    TranslationForLoadSegment {
+        idx: usize,
+        segment_address: u64,
+        segment_size: u64,
+        aligned_size: u64,
+        ipa: u64,
+        va: u64,
+        flags: crate::HvMemoryFlags,
+    },
+    ErrorReadingSectionName {
+        address: u64,
+    },
+    ErrorReadingSectionData {
+        section_address: u64,
+    },
+
     InvalidGuestMemorySlice {
         ipa: GuestIpaAddress,
         size: usize,
@@ -145,12 +167,18 @@ pub enum Kind {
         value: crate::bindgen_util::HVReturnT,
         function_name: &'static str,
     },
+    ElfLoaderCannotSimulateAddressLookupInSection {
+        va: GuestVaAddress,
+        section_address: u64,
+        segment_idx: usize,
+    },
+    NoExceptionVectorTable,
 }
 
 impl core::fmt::Display for Kind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Kind::Mmap(e) => f.write_fmt(format_args!("error doing mmap: {}", e)),
+            Kind::MmapGuestMemory(e) => f.write_fmt(format_args!("error mmap'ing guest memory: {}", e)),
             Kind::InvalidGuestIpaAddress(addr) => {
                 f.write_fmt(format_args!("invalid guest address: {:?}", addr))
             }
@@ -181,7 +209,35 @@ impl core::fmt::Display for Kind {
             Kind::ProgrammingError(v) => f.write_fmt(format_args!("{}", v)),
             Kind::NotAPowerOfTwo { value } => f.write_fmt(format_args!("{} is not a power of 2", value)),
             Kind::HvReturnTUnrecognized { value, function_name } => f.write_fmt(format_args!("can't map return value of \"{}\" = {} to HvReturnT", function_name, value)),
-            Kind::HvReturnTNotSuccess { value, function_name } => f.write_fmt(format_args!("\"{}\" returned {:?}", function_name, value))
+            Kind::HvReturnTNotSuccess { value, function_name } => f.write_fmt(format_args!("\"{}\" returned {:?}", function_name, value)),
+            Kind::MmapElfFile(e) => f.write_fmt(format_args!("error mmap'ing ELF file: {}", e)),
+            Kind::FileOpen(e) => f.write_fmt(format_args!("error opening file: {}", e)),
+            Kind::ObjectLibrary(e) => f.write_fmt(format_args!("error from \"object\" crate: {}", e)),
+            Kind::Layout(l) => f.write_fmt(format_args!("layout error: {}", l)),
+            Kind::TranslationForLoadSegment { idx, segment_address, segment_size, aligned_size, ipa, va, flags } => {
+                f.write_fmt(
+                    format_args!(
+                        "configuring translation tables for LOAD segment {}, address {:#x?}, size {}, aligned size {}, IPA {:#x?}, VA {:#x?}, flags: {:?}",
+                        idx,
+                        segment_address,
+                        segment_size,
+                        aligned_size,
+                        ipa,
+                        va,
+                        flags,
+                    ))
+            }
+            Kind::ErrorReadingSectionName { address } => f.write_fmt(format_args!("error reading section name at {:#x?}", address)),
+            Kind::ErrorReadingSectionData { section_address } => f.write_fmt(format_args!("error reading section data at {:#x?}", section_address)),
+            Kind::ElfLoaderCannotSimulateAddressLookupInSection { va, section_address, segment_idx } => {
+                f.write_fmt(format_args!(
+                    "couldn't lookup address {:?} for section at {:#x?}, it should have been mapped together with segment {}",
+                    va,
+                    section_address,
+                    segment_idx
+                ))
+            }
+            Kind::NoExceptionVectorTable => f.write_str("cound not find symbol \"exception_vector_table\"")
         }
     }
 }
@@ -189,7 +245,8 @@ impl core::fmt::Display for Kind {
 impl std::error::Error for Kind {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Kind::Mmap(e) => Some(e),
+            Kind::MmapGuestMemory(e) => Some(e),
+            Kind::MmapElfFile(e) => Some(e),
             _ => None,
         }
     }
@@ -207,6 +264,9 @@ impl Error {
         };
         e.kinds.push_wrapping(kind);
         e
+    }
+    pub fn push_kind(&mut self, kind: Kind) {
+        self.kinds.push_wrapping(kind);
     }
     fn iter_causes(&self) -> impl Iterator<Item = &Kind> {
         self.kinds.iter().rev()
@@ -231,5 +291,17 @@ impl std::error::Error for Error {
 impl From<Kind> for Error {
     fn from(k: Kind) -> Self {
         Self::from_kind(k)
+    }
+}
+
+impl From<object::Error> for Error {
+    fn from(e: object::Error) -> Self {
+        Self::from_kind(Kind::ObjectLibrary(e))
+    }
+}
+
+impl From<LayoutError> for Error {
+    fn from(e: LayoutError) -> Self {
+        Self::from_kind(Kind::Layout(e))
     }
 }

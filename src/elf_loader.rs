@@ -1,7 +1,7 @@
 use std::{alloc::Layout, path::Path};
 
-use crate::{addresses::GuestIpaAddress, GuestVaAddress, HvMemoryFlags, Offset};
-use log::{debug, trace};
+use crate::{addresses::GuestIpaAddress, error::Kind, GuestVaAddress, HvMemoryFlags, Offset};
+use log::{debug, error, trace};
 
 #[derive(Default)]
 pub struct LoadedElf {
@@ -37,9 +37,11 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
     mm: &mut MM,
     filename: P,
 ) -> crate::Result<LoadedElf> {
-    let file = std::fs::File::open(filename)?;
-    let map =
-        unsafe { memmap::MmapOptions::default().map(&file) }.context("error mmmapping ELF file")?;
+    let file = std::fs::File::open(filename).map_err(|e| Kind::FileOpen(e))?;
+    let map = match unsafe { memmap::MmapOptions::default().map(&file) } {
+        Ok(map) => map,
+        Err(e) => return Err(Kind::MmapElfFile(e).into()),
+    };
     let obj = object::read::File::parse(&map)?;
     use object::{Object, ObjectSection, ObjectSegment};
 
@@ -131,31 +133,40 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
     }
 
     for (idx, ss) in segments.iter().enumerate() {
-        macro_rules! _tt_msg {
-            () => {
-                format_args!(
-                    "configuring translation tables for LOAD segment {}, address {:#x?}, size {}, aligned size {}, IPA {:#x?}, VA {:#x?}, flags: {:?}",
-                    idx,
-                    ss.segment.address(),
-                    ss.segment.size(),
-                    ss.aligned_size,
-                    ss.ipa.0,
-                    ss.va.0,
-                    ss.flags,
-                );
-            }
-        }
-        debug!("{}", _tt_msg!());
+        debug!(
+            "configuring translation tables for LOAD segment {}, address {:#x?}, size {}, aligned size {}, IPA {:#x?}, VA {:#x?}, flags: {:?}",
+            idx,
+            ss.segment.address(),
+            ss.segment.size(),
+            ss.aligned_size,
+            ss.ipa.0,
+            ss.va.0,
+            ss.flags,
+        );
         mm.configure_page_tables(ss.ipa, ss.va, ss.aligned_size as usize, ss.flags)
-            .with_context(|| anyhow!("error {}", _tt_msg!()))?;
+            .map_err(|e| {
+                let context_kind = Kind::TranslationForLoadSegment {
+                    idx,
+                    segment_address: ss.segment.address(),
+                    segment_size: ss.segment.size(),
+                    aligned_size: ss.aligned_size,
+                    ipa: ss.ipa.0,
+                    va: ss.va.0,
+                    flags: ss.flags,
+                };
+                e.push_kind(context_kind);
+                e
+            })?
     }
 
     for section in obj.sections() {
-        let section_name = section.name().with_context(|| {
-            format!(
-                "error determining section name at {:#x?}",
-                section.address()
-            )
+        let section_name = section.name().map_err(|e| {
+            let e = crate::error::Error::from(e);
+            let kind = Kind::ErrorReadingSectionName {
+                address: section.address(),
+            };
+            e.push_kind(kind);
+            e
         })?;
         if let Ok(segment_idx) = segments.binary_search_by(|seg| {
             use std::cmp::Ordering as O;
@@ -180,8 +191,13 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
                     continue;
                 }
             };
-            let data = section.data().with_context(|| {
-                format!("error getting section data for section {}", section_name)
+            let data = section.data().map_err(|e| {
+                error!("error getting section data for section {}", section_name);
+                let e = crate::error::Error::from(e);
+                e.push_kind(Kind::ErrorReadingSectionData {
+                    section_address: section.address(),
+                });
+                e
             })?;
 
             let va = {
@@ -191,12 +207,11 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
             };
 
             let ipa = mm.simulate_address_lookup(va)?.ok_or_else(|| {
-                anyhow!(
-                    "couldn't lookup address {:?} for section \"{}\", it should have been mapped together with segment {}",
+                Kind::ElfLoaderCannotSimulateAddressLookupInSection {
                     va,
-                    section_name,
-                    segment_idx
-                )
+                    section_address: section.address(),
+                    segment_idx,
+                }
             })?;
             if !data.is_empty() {
                 debug!(
@@ -208,14 +223,7 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
                     va.0,
                     ipa.0,
                 );
-                let slice = mm
-                    .get_memory_slice(va, section.size() as usize)
-                    .with_context(|| {
-                        format!(
-                            "error getting the slice of memory for section \"{}\" at {:?}",
-                            section_name, va
-                        )
-                    })?;
+                let slice = mm.get_memory_slice(va, section.size() as usize)?;
                 slice.copy_from_slice(data);
             }
         } else {
@@ -232,8 +240,7 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
             vbar_el1 = Some(va_offset.add(Offset(symbol.address())));
         }
     }
-    let vbar_el1 =
-        vbar_el1.ok_or_else(|| anyhow!("could not find symbol \"exception_vector_table\""))?;
+    let vbar_el1 = vbar_el1.ok_or_else(|| Kind::NoExceptionVectorTable)?;
 
     if let Some(relocs) = obj.dynamic_relocations() {
         for (offset, reloc) in relocs {
@@ -249,23 +256,31 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
                         rel: &reloc,
                     };
                     let va = va_offset.add(Offset(offset));
-                    let mut relocation_mem =
-                        mm.get_memory_slice(va, core::mem::size_of::<u64>())
-                            .with_context(|| format!("error getting memory for {:?}", &d))?;
+                    let mut relocation_mem = mm
+                        .get_memory_slice(va, core::mem::size_of::<u64>())
+                        .map_err(|e| {
+                        error!("error getting memory for {:?}: {}", &d, &e);
+                        e
+                    })?;
                     let relocation_value = if reloc.addend() >= 0 {
                         va_offset.add(Offset(reloc.addend() as u64))
                     } else {
-                        bail!("relocation addend negative, not supported: {:?}", &d)
+                        error!("relocation addend negative, not supported: {:?}", &d);
+                        return Err(Kind::UnsupportedInput(
+                            "relocation addend negative, not supported".into(),
+                        )
+                        .into());
                     };
                     use byteorder::WriteBytesExt;
 
                     relocation_mem
                         .write_u64::<byteorder::LittleEndian>(relocation_value.0)
-                        .with_context(|| {
-                            format!(
+                        .map_err(|e| {
+                            error!(
                                 "error writing value {:#x?} at VA {:#x?} for {:?}",
                                 relocation_value.0, va.0, &d
-                            )
+                            );
+                            Kind::ByteOrderWriteError(e)
                         })?;
                     trace!(
                         "wrote value {:#x?} at VA {:#x?} for {:?}",
@@ -275,7 +290,11 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
                     );
                 }
                 _ => {
-                    bail!("unsupported relocation offset {:#x?}, {:?}", offset, reloc)
+                    error!("unsupported relocation offset {:#x?}, {:?}", offset, reloc);
+                    return Err(Kind::UnsupportedInput(
+                        "relocation configuration unsupported".into(),
+                    )
+                    .into());
                 }
             }
         }
