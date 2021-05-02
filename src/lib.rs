@@ -31,7 +31,7 @@ use layout::*;
     improper_ctypes,
     clippy::all
 )]
-mod bindgen;
+pub mod bindgen;
 
 pub struct HfVmBuilder {
     entrypoint: Option<GuestVaAddress>,

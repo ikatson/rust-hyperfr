@@ -22,4 +22,6 @@ byteorder = "1"
 rayon = "1"
 
 [profile.release]
-debug = true
+# debug = true
+# opt-level = "s"
+lto = true
