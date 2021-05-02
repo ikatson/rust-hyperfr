@@ -41,6 +41,6 @@ impl GuestMemoryMmap {
         let map = unsafe { &mut *self.map.get() };
         Ok(map
             .get_mut(offset..(offset + size))
-            .ok_or_else(|| Kind::InvalidGuestMemorySlice { ipa: addr, size })?)
+            .ok_or(Kind::InvalidGuestMemorySlice { ipa: addr, size })?)
     }
 }

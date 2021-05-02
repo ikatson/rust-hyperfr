@@ -28,7 +28,7 @@ fn main() {
     match main_result() {
         Ok(_) => {}
         Err(err) => {
-            error!("Error running the hypervisor: {:?}", err);
+            error!("Error running the hypervisor: {}", err);
             std::process::exit(1);
         }
     };

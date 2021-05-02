@@ -6,7 +6,7 @@ use crate::{
     memory::GuestMemoryManager,
 };
 use crate::{aligner::Aligner, HvMemoryFlags};
-use log::trace;
+use log::{error, trace};
 
 pub const fn bits(val: u64, start_inclusive: u8, end_inclusive: u8) -> u64 {
     let top_mask = u64::MAX >> (64 - start_inclusive - 1);
@@ -423,13 +423,13 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
                     let block_size_bits = match self.granule.block_size_bits(table.level) {
                         Some(bs) => bs,
                         None => {
+                            error!(
+                                "saw a block on level {}, this should not have happened",
+                                table.level
+                            );
                             return Err(Kind::ProgrammingError(
-                                // TODO: change this one?
-                                format!(
-                                    "saw a block on level {}, this should not have happened",
-                                    table.level
-                                )
-                                .into(),
+                                "did not expect to see a block during translation table walk"
+                                    .into(),
                             )
                             .into());
                         }

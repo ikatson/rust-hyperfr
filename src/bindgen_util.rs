@@ -106,12 +106,10 @@ pub fn assert_hv_return_t_ok(v: bindgen::hv_return_t, name: &'static str) -> cra
     })?;
     match &ret {
         HVReturnT::HV_SUCCESS => Ok(()),
-        err => {
-            return Err(Kind::HvReturnTNotSuccess {
-                value: ret,
-                function_name: name,
-            }
-            .into())
+        _ => Err(Kind::HvReturnTNotSuccess {
+            value: ret,
+            function_name: name,
         }
+        .into()),
     }
 }

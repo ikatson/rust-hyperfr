@@ -48,10 +48,11 @@ impl GuestMemoryManager {
         let granule = match std::env::var("GRANULE").as_deref().unwrap_or_default() {
             "4" => Aarch64TranslationGranule::P4k,
             "" | "16" => Aarch64TranslationGranule::P16k,
-            other => {
+            _ => {
                 return Err(Kind::UnsupportedInput(
                     "Given GRANULE value is not supported, try 4 or 16".into(),
-                ))?;
+                )
+                .into());
             }
         };
         let txsz: u8 = match std::env::var("TXSZ") {
@@ -218,7 +219,7 @@ impl GuestMemoryManager {
     pub fn get_memory_slice(&self, va: GuestVaAddress, size: usize) -> crate::Result<&mut [u8]> {
         let ipa = self
             .simulate_address_lookup(va)?
-            .ok_or_else(|| Kind::SimulateTranslationError { va })?;
+            .ok_or(Kind::SimulateTranslationError { va })?;
         self.get_memory_slice_by_ipa(ipa, size)
     }
 

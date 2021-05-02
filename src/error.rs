@@ -296,7 +296,14 @@ impl Error {
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{}", self.kind()))
+        let mut causes = self.iter_causes();
+        if let Some(kind) = causes.next() {
+            f.write_fmt(format_args!("{}", kind))?;
+        }
+        for cause in causes {
+            f.write_fmt(format_args!("\n    Caused by: {}", cause))?;
+        }
+        Ok(())
     }
 }
 
