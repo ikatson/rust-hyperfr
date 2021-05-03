@@ -1,6 +1,6 @@
 pub type Result<T> = core::result::Result<T, Error>;
 
-use std::{alloc::LayoutError, borrow::Cow, str::Utf8Error};
+use std::{alloc::LayoutError, backtrace::Backtrace, borrow::Cow, str::Utf8Error};
 
 use crate::{
     addresses::{GuestIpaAddress, GuestVaAddress},
@@ -158,23 +158,31 @@ impl std::error::Error for Kind {
 pub struct Error {
     kind: Kind,
     previous: Option<Box<Error>>,
+    backtrace: Option<Backtrace>,
 }
 
 impl Error {
     pub fn string<S: Into<Cow<'static, str>>>(s: S) -> Self {
         Self::from_kind(Kind::String(s.into()))
     }
+    pub fn from_kind_no_backtrace(kind: Kind) -> Self {
+        Self {
+            kind,
+            previous: None,
+            backtrace: None,
+        }
+    }
     pub fn from_kind(kind: Kind) -> Self {
         Self {
             kind,
             previous: None,
+            backtrace: Some(Backtrace::capture()),
         }
     }
     pub fn push_kind(self, kind: Kind) -> Self {
-        Self {
-            kind,
-            previous: Some(Box::new(self)),
-        }
+        let mut new_self = Self::from_kind_no_backtrace(kind);
+        new_self.previous = Some(Box::new(self));
+        new_self
     }
     fn kind(&self) -> &Kind {
         &self.kind
@@ -187,7 +195,10 @@ impl core::fmt::Display for Error {
 
         let mut next = self.previous.as_ref();
         while let Some(next_v) = next.map(|v| v.as_ref()) {
-            f.write_fmt(format_args!("\n    Caused by: {}", next_v.kind()))?;
+            write!(f, "\n    Caused by: {}", next_v.kind())?;
+            if let Some(bt) = next_v.backtrace.as_ref() {
+                write!(f, "Backtrace:\n{}", bt)?;
+            }
             next = next_v.previous.as_ref();
         }
         Ok(())

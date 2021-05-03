@@ -1,3 +1,5 @@
+#![feature(backtrace)]
+
 use aarch64_debug::{DataAbortFlags, Syndrome};
 use bindgen_util::{assert_hv_return_t_ok, null_obj};
 pub use bindgen_util::{HfVcpuExit, HvExitReason, HvMemoryFlags};
