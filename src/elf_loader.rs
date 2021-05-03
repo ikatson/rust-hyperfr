@@ -41,9 +41,9 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
     filename: P,
 ) -> anyhow::Result<LoadedElf> {
     let file = std::fs::File::open(filename)?;
-    let map =
+    let map: memmap::Mmap =
         unsafe { memmap::MmapOptions::default().map(&file) }.context("error mmmapping ELF file")?;
-    let obj = object::read::File::parse(&map)?;
+    let obj = object::read::File::parse(map.as_ref())?;
     use object::{Object, ObjectSection, ObjectSegment};
 
     struct SegmentState<'a, 'b> {
