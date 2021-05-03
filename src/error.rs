@@ -21,11 +21,6 @@ pub enum Kind {
     TranslationForLoadSegment {
         idx: usize,
         segment_address: u64,
-        segment_size: u64,
-        aligned_size: u64,
-        ipa: u64,
-        va: u64,
-        flags: crate::HvMemoryFlags,
     },
     ErrorReadingSectionName {
         address: u64,
@@ -122,17 +117,12 @@ impl core::fmt::Display for Kind {
             Kind::FileOpen(e) => f.write_fmt(format_args!("error opening file: {}", e)),
             Kind::ObjectLibrary(e) => f.write_fmt(format_args!("error from \"object\" crate: {}", e)),
             Kind::Layout(l) => f.write_fmt(format_args!("layout error: {}", l)),
-            Kind::TranslationForLoadSegment { idx, segment_address, segment_size, aligned_size, ipa, va, flags } => {
+            Kind::TranslationForLoadSegment { idx, segment_address } => {
                 f.write_fmt(
                     format_args!(
-                        "configuring translation tables for LOAD segment {}, address {:#x?}, size {}, aligned size {}, IPA {:#x?}, VA {:#x?}, flags: {:?}",
+                        "configuring translation tables for LOAD segment {}, address {:#x?}",
                         idx,
                         segment_address,
-                        segment_size,
-                        aligned_size,
-                        ipa,
-                        va,
-                        flags,
                     ))
             }
             Kind::ErrorReadingSectionName { address } => f.write_fmt(format_args!("error reading section name at {:#x?}", address)),

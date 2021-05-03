@@ -152,11 +152,6 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
                 let context_kind = Kind::TranslationForLoadSegment {
                     idx,
                     segment_address: ss.segment.address(),
-                    segment_size: ss.segment.size(),
-                    aligned_size: ss.aligned_size,
-                    ipa: ss.ipa.0,
-                    va: ss.va.0,
-                    flags: ss.flags,
                 };
                 e.push_kind(context_kind)
             })?
