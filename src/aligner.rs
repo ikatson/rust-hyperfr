@@ -1,4 +1,4 @@
-use crate::error::Kind;
+use crate::error::{Error, Kind};
 
 pub const ALIGNER_16K: Aligner = Aligner::new_from_mask(!((1 << 14) - 1));
 
@@ -38,7 +38,7 @@ impl Aligner {
             1..=63 => Ok(Self {
                 mask: !((1 << (bits - 1)) - 1),
             }),
-            _ => return Err(Kind::ProgrammingError("bits should be >= 0 and =< 64".into()).into()),
+            _ => Err(Error::string("bits should be >= 0 and =< 64")),
         }
     }
 

@@ -1,6 +1,10 @@
 use std::{alloc::Layout, path::Path};
 
-use crate::{addresses::GuestIpaAddress, error::Kind, GuestVaAddress, HvMemoryFlags, Offset};
+use crate::{
+    addresses::GuestIpaAddress,
+    error::{Error, Kind},
+    GuestVaAddress, HvMemoryFlags, Offset,
+};
 use log::{debug, error, trace};
 
 #[derive(Default)]
@@ -37,7 +41,7 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
     mm: &mut MM,
     filename: P,
 ) -> crate::Result<LoadedElf> {
-    let file = std::fs::File::open(filename).map_err(|e| Kind::FileOpen(e))?;
+    let file = std::fs::File::open(filename).map_err(Kind::FileOpen)?;
     let map = match unsafe { memmap::MmapOptions::default().map(&file) } {
         Ok(map) => map,
         Err(e) => return Err(Kind::MmapElfFile(e).into()),
@@ -144,7 +148,7 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
             ss.flags,
         );
         mm.configure_page_tables(ss.ipa, ss.va, ss.aligned_size as usize, ss.flags)
-            .map_err(|mut e| {
+            .map_err(|e| {
                 let context_kind = Kind::TranslationForLoadSegment {
                     idx,
                     segment_address: ss.segment.address(),
@@ -154,19 +158,17 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
                     va: ss.va.0,
                     flags: ss.flags,
                 };
-                e.push_kind(context_kind);
-                e
+                e.push_kind(context_kind)
             })?
     }
 
     for section in obj.sections() {
         let section_name = section.name().map_err(|e| {
-            let mut e = crate::error::Error::from(e);
+            let e = crate::error::Error::from(e);
             let kind = Kind::ErrorReadingSectionName {
                 address: section.address(),
             };
-            e.push_kind(kind);
-            e
+            e.push_kind(kind)
         })?;
         if let Ok(segment_idx) = segments.binary_search_by(|seg| {
             use std::cmp::Ordering as O;
@@ -193,11 +195,10 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
             };
             let data = section.data().map_err(|e| {
                 error!("error getting section data for section {}", section_name);
-                let mut e = crate::error::Error::from(e);
+                let e = crate::error::Error::from(e);
                 e.push_kind(Kind::ErrorReadingSectionData {
                     section_address: section.address(),
-                });
-                e
+                })
             })?;
 
             let va = {
@@ -240,7 +241,7 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
             vbar_el1 = Some(va_offset.add(Offset(symbol.address())));
         }
     }
-    let vbar_el1 = vbar_el1.ok_or_else(|| Kind::NoExceptionVectorTable)?;
+    let vbar_el1 = vbar_el1.ok_or(Kind::NoExceptionVectorTable)?;
 
     if let Some(relocs) = obj.dynamic_relocations() {
         for (offset, reloc) in relocs {
@@ -266,10 +267,7 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
                         va_offset.add(Offset(reloc.addend() as u64))
                     } else {
                         error!("relocation addend negative, not supported: {:?}", &d);
-                        return Err(Kind::UnsupportedInput(
-                            "relocation addend negative, not supported".into(),
-                        )
-                        .into());
+                        return Err(Error::string("relocation addend negative, not supported"));
                     };
                     use byteorder::WriteBytesExt;
 
@@ -291,10 +289,7 @@ pub fn load_elf<MM: MemoryManager, P: AsRef<Path>>(
                 }
                 _ => {
                     error!("unsupported relocation offset {:#x?}, {:?}", offset, reloc);
-                    return Err(Kind::UnsupportedInput(
-                        "relocation configuration unsupported".into(),
-                    )
-                    .into());
+                    return Err(Error::string("relocation configuration unsupported"));
                 }
             }
         }

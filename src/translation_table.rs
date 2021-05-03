@@ -2,7 +2,7 @@ use std::alloc::Layout;
 
 use crate::{
     addresses::{GuestIpaAddress, GuestVaAddress, Offset},
-    error::Kind,
+    error::{Error, Kind},
     memory::GuestMemoryManager,
 };
 use crate::{aligner::Aligner, HvMemoryFlags};
@@ -427,11 +427,9 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
                                 "saw a block on level {}, this should not have happened",
                                 table.level
                             );
-                            return Err(Kind::ProgrammingError(
-                                "did not expect to see a block during translation table walk"
-                                    .into(),
-                            )
-                            .into());
+                            return Err(Error::string(
+                                "did not expect to see a block during translation table walk",
+                            ));
                         }
                     };
                     let ipa = GuestIpaAddress(bits(d.0, 47, block_size_bits));
@@ -521,7 +519,7 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
             let d = table.descriptor_mut(index as usize);
 
             if d.0 & 0b11 != 0 {
-                return Err(Kind::ProgrammingError(
+                return Err(Error::string(
                     format!(
                         "page already set up. Old value {:#x?}, l3={}, va={:#x?}, ipa={:#x?}, size={}, flags={:?}",
                         d.0,
@@ -530,8 +528,8 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
                         ipa,
                         size,
                         flags
-                    ).into()
-                ).into());
+                    )
+                ));
             }
 
             trace!(
@@ -572,10 +570,10 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
             let d = table.descriptor_mut(index as usize);
 
             if d.0 & 0b11 != 0 {
-                return Err(Kind::ProgrammingError(
-                    format!("L{} table {} already set-up", level, index).into(),
-                )
-                .into());
+                return Err(Error::string(format!(
+                    "L{} table {} already set-up",
+                    level, index
+                )));
             }
 
             // Block
@@ -620,9 +618,7 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
         let level = table.level;
         let descriptor = table.descriptor_mut(index as usize);
         match descriptor.0 & 0b11 {
-            0b01 => {
-                return Err(Kind::ProgrammingError("already a block".into()).into());
-            }
+            0b01 => Err(Error::string("already a block")),
             0b11 => {
                 let ipa = bits(descriptor.0, 47, self.granule.page_size_bits());
                 let ipa = GuestIpaAddress(ipa);
@@ -649,12 +645,9 @@ impl<G: Granule, const TXSZ: u8> TranslationTableManager<G, TXSZ> {
                     start: ipa,
                 })
             }
-            _ => {
-                return Err(Kind::ProgrammingError(
-                    "memory is corrupted, this shouldn't have happened".into(),
-                )
-                .into());
-            }
+            _ => Err(Error::string(
+                "memory is corrupted, this shouldn't have happened",
+            )),
         }
     }
 }

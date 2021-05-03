@@ -2,7 +2,7 @@ use aarch64_debug::{DataAbortFlags, Syndrome};
 use bindgen_util::{assert_hv_return_t_ok, null_obj};
 pub use bindgen_util::{HfVcpuExit, HvExitReason, HvMemoryFlags};
 use elf_loader::LoadedElf;
-use error::{ErrorContext, Kind};
+use error::{Error, ErrorContext, Kind};
 use memory::GuestMemoryManager;
 use std::thread::JoinHandle;
 use std::{path::Path, sync::Arc};
@@ -89,19 +89,22 @@ impl HfVmBuilder {
             return Err(Kind::NotAligned {
                 value: addr as u64,
                 name: "addr",
-            })?;
+            }
+            .into());
         }
         if !aligner::ALIGNER_16K.is_aligned(ipa.0) {
             return Err(Kind::NotAligned {
                 value: ipa.0,
                 name: "ipa",
-            })?;
+            }
+            .into());
         }
         if !aligner::ALIGNER_16K.is_aligned(size as u64) {
             return Err(Kind::NotAligned {
                 value: size as u64,
                 name: "size",
-            })?;
+            }
+            .into());
         }
 
         debug!(
@@ -124,14 +127,10 @@ impl HfVmBuilder {
 
     pub fn build(mut self) -> crate::Result<HfVm> {
         let entrypoint = self.entrypoint.ok_or_else(|| {
-            Kind::ProgrammingError(
-                "entrypoint not set, probably ELF not loaded, or loaded incorrectly".into(),
-            )
+            Error::string("entrypoint not set, probably ELF not loaded, or loaded incorrectly")
         })?;
         let vbar_el1 = self.vbar_el1.ok_or_else(|| {
-            Kind::ProgrammingError(
-                "vbar_el1 not set, probably ELF not loaded, or loaded incorrectly".into(),
-            )
+            Error::string("vbar_el1 not set, probably ELF not loaded, or loaded incorrectly")
         })?;
         self.memory_manager
             .configure_dram()
@@ -606,9 +605,10 @@ impl VCpu {
                 match exit_t.reason {
                     HvExitReason::HV_EXIT_REASON_EXCEPTION => {}
                     other => {
-                        return Err(Kind::String(
-                            format!("unsupported HvExitReason {:?}", other).into(),
-                        ))?
+                        return Err(Error::string(format!(
+                            "unsupported HvExitReason {:?}",
+                            other
+                        )))
                     }
                 };
 
@@ -639,7 +639,7 @@ impl VCpu {
                             }
                             PANIC => {
                                 vcpu.dump_all_registers()?;
-                                return Err(Kind::String("guest panicked".into()))?;
+                                return Err(Error::string("guest panicked"));
                             }
                             EXCEPTION | SYNCHRONOUS_EXCEPTION | IRQ => {
                                 let mut name = match iss as u8 {
@@ -685,9 +685,10 @@ impl VCpu {
                                 }
                                 vcpu.dump_all_registers()?;
                                 vcpu.print_stack()?;
-                                Err(Kind::String(
-                                    format!("HVC EL1 -> EL1 exception: {}", name).into(),
-                                ))?;
+                                return Err(Error::string(format!(
+                                    "HVC EL1 -> EL1 exception: {}",
+                                    name
+                                )));
                             }
                             PRINT_STRING => {
                                 let addr = vcpu.get_reg(bindgen::hv_reg_t_HV_REG_X0)?;
@@ -706,9 +707,10 @@ impl VCpu {
                                 print!("{}", value);
                             }
                             other => {
-                                Err(Kind::String(
+                                return Err(Kind::String(
                                     format!("unsupported HVC value {:x}", other).into(),
-                                ))?;
+                                )
+                                .into());
                             }
                         }
                     }
@@ -717,7 +719,7 @@ impl VCpu {
                         vcpu.dump_all_registers()?;
                         vcpu.print_stack()?;
                         error!("{:#x?}", vcpu.exit_t());
-                        Err(Kind::String("instruction abort".into()))?;
+                        return Err(Error::string("instruction abort"));
                     }
                     ad::EXC_SOFT_STEP_LOWER => {
                         let instruction_ipa = exit_t.exception.virtual_address;
@@ -737,16 +739,17 @@ impl VCpu {
                     }
                     ad::EXC_DATA_ABORT_LOWER => {
                         vcpu.debug_data_abort(vcpu.exit_t().decoded_syndrome.iss)?;
-                        Err(Kind::String("data abort EL1 -> EL2".into()))?;
+                        return Err(Kind::String("data abort EL1 -> EL2".into()).into());
                     }
                     _ => {
-                        Err(Kind::String(
+                        return Err(Kind::String(
                             format!(
                                 "unsupported exception class {:#x?}",
                                 exit_t.decoded_syndrome
                             )
                             .into(),
-                        ))?;
+                        )
+                        .into());
                     }
                 }
             }
@@ -805,7 +808,7 @@ impl VCpu {
                         paste!([<hv_sys_reg_t_HV_SYS_REG_DBGBCR $reg_number _EL1>]),
                         paste!([<hv_sys_reg_t_HV_SYS_REG_DBGBVR $reg_number _EL1>]),
                     )),+,
-                    _ => Err(Kind::String("no more hardware breakpoints available".into()))?
+                    _ => return Err(Error::string("no more hardware breakpoints available"))
                 }
             }
         }

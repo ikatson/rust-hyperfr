@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    error::{ErrorContext, Kind},
+    error::{Error, ErrorContext, Kind},
     vm_memory::GuestMemoryMmap,
 };
 
@@ -49,16 +49,15 @@ impl GuestMemoryManager {
             "4" => Aarch64TranslationGranule::P4k,
             "" | "16" => Aarch64TranslationGranule::P16k,
             _ => {
-                return Err(Kind::UnsupportedInput(
-                    "Given GRANULE value is not supported, try 4 or 16".into(),
-                )
-                .into());
+                return Err(Error::string(
+                    "Given GRANULE value is not supported, try 4 or 16",
+                ));
             }
         };
         let txsz: u8 = match std::env::var("TXSZ") {
             Ok(v) => v
                 .parse()
-                .map_err(|_| Kind::UnsupportedInput("error parsing envvar TXSZ as u8".into()))?,
+                .map_err(|_| Error::string("error parsing envvar TXSZ as u8"))?,
             Err(_) => 28,
         };
         let tmp_ttmgr = new_tt_mgr(GuestIpaAddress(0), GuestIpaAddress(1), granule, txsz)?;
