@@ -82,51 +82,48 @@ pub enum Kind {
 impl core::fmt::Display for Kind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Kind::MmapGuestMemory(e) => f.write_fmt(format_args!("error mmap'ing guest memory: {}", e)),
+            Kind::MmapGuestMemory(e) => write!(f, "error mmap'ing guest memory: {}", e),
             Kind::InvalidGuestIpaAddress(addr) => {
                 f.write_fmt(format_args!("invalid guest address: {:?}", addr))
             }
-            Kind::InvalidGuestMemorySlice { ipa, size } => f.write_fmt(format_args!(
+            Kind::InvalidGuestMemorySlice { ipa, size } => write!(f,
                 "invalid guest memory slice (out of bounds): ipa {:?}, size {}",
                 ipa, size
-            )),
-            Kind::GranuleTxszNotSupported { granule, txsz } => f.write_fmt(format_args!(
+            ),
+            Kind::GranuleTxszNotSupported { granule, txsz } => write!(f,
                 "granule/txsz combination {:?}/{} not supported",
                 granule, txsz
-            )),
-            Kind::TopBitsShouldBeOne { top, va } => f.write_fmt(format_args!(
+            ),
+            Kind::TopBitsShouldBeOne { top, va } => write!(f,
                 "bits [64:{}] should be 1, but they are not in {:?}",
                 top, va
-            )),
-            Kind::TopBitsShouldBeZero { top, va } => f.write_fmt(format_args!(
+            ),
+            Kind::TopBitsShouldBeZero { top, va } => write!(f,
                 "bits [64:{}] should be 0, but they are not in {:?}",
                 top, va
-            )),
-            Kind::NotAligned { value, name } => f.write_fmt(format_args!("\"{}\" ({}) is not aligned", name, value)),
-            Kind::IpaDoesNotFitIps { ipa, ips_limit } => f.write_fmt(format_args!(
+            ),
+            Kind::NotAligned { value, name } => write!(f, "\"{}\" ({}) is not aligned", name, value),
+            Kind::IpaDoesNotFitIps { ipa, ips_limit } => write!(f,
                 "ipa {:#x?} / and or ipa + size are too large, does not fit into the TXSZ space which is limited by address {:#x?}",
                 ipa, ips_limit
-            )),
-            Kind::IpaPlusSizeOverflow { ipa, size } => f.write_fmt(format_args!(
+            ),
+            Kind::IpaPlusSizeOverflow { ipa, size } => write!(f,
                 "ipa + size overflow, {:?}, size {:?}", ipa, size
-            )),
-            Kind::NotAPowerOfTwo { value } => f.write_fmt(format_args!("{} is not a power of 2", value)),
-            Kind::HvReturnTUnrecognized { value, function_name } => f.write_fmt(format_args!("can't map return value of \"{}\" = {} to HvReturnT", function_name, value)),
-            Kind::HvReturnTNotSuccess { value, function_name } => f.write_fmt(format_args!("\"{}\" returned {:?}", function_name, value)),
-            Kind::MmapElfFile(e) => f.write_fmt(format_args!("error mmap'ing ELF file: {}", e)),
-            Kind::FileOpen(e) => f.write_fmt(format_args!("error opening file: {}", e)),
-            Kind::ObjectLibrary(e) => f.write_fmt(format_args!("error from \"object\" crate: {}", e)),
-            Kind::Layout(l) => f.write_fmt(format_args!("layout error: {}", l)),
-            Kind::TranslationForLoadSegment { idx, segment_address } => {
-                f.write_fmt(
-                    format_args!(
-                        "configuring translation tables for LOAD segment {}, address {:#x?}",
-                        idx,
-                        segment_address,
-                    ))
-            }
-            Kind::ErrorReadingSectionName { address } => f.write_fmt(format_args!("error reading section name at {:#x?}", address)),
-            Kind::ErrorReadingSectionData { section_address } => f.write_fmt(format_args!("error reading section data at {:#x?}", section_address)),
+            ),
+            Kind::NotAPowerOfTwo { value } => write!(f, "{} is not a power of 2", value),
+            Kind::HvReturnTUnrecognized { value, function_name } => write!(f, "can't map return value of \"{}\" = {} to HvReturnT", function_name, value),
+            Kind::HvReturnTNotSuccess { value, function_name } => write!(f, "\"{}\" returned {:?}", function_name, value),
+            Kind::MmapElfFile(e) => write!(f, "error mmap'ing ELF file: {}", e),
+            Kind::FileOpen(e) => write!(f, "error opening file: {}", e),
+            Kind::ObjectLibrary(e) => write!(f, "error from \"object\" crate: {}", e),
+            Kind::Layout(l) => write!(f, "layout error: {}", l),
+            Kind::TranslationForLoadSegment { idx, segment_address } => write!(f,
+                "configuring translation tables for LOAD segment {}, address {:#x?}",
+                idx,
+                segment_address,
+            ),
+            Kind::ErrorReadingSectionName { address } => write!(f, "error reading section name at {:#x?}", address),
+            Kind::ErrorReadingSectionData { section_address } => write!(f, "error reading section data at {:#x?}", section_address),
             Kind::ElfLoaderCannotSimulateAddressLookupInSection { va, section_address, segment_idx } => {
                 f.write_fmt(format_args!(
                     "couldn't lookup address {:?} for section at {:#x?}, it should have been mapped together with segment {}",
@@ -136,8 +133,8 @@ impl core::fmt::Display for Kind {
                 ))
             }
             Kind::NoExceptionVectorTable => f.write_str("cound not find symbol \"exception_vector_table\""),
-            Kind::ByteOrderWriteError(e) => f.write_fmt(format_args!("error writing to slice: {}", e)),
-            Kind::SimulateTranslationError { va } => f.write_fmt(format_args!("cannot find address {:?} in translation tables", va)),
+            Kind::ByteOrderWriteError(e) => write!(f, "error writing to slice: {}", e),
+            Kind::SimulateTranslationError { va } => write!(f, "cannot find address {:?} in translation tables", va),
             Kind::String(s) => f.write_str(s),
             Kind::Utf8Error(e) => f.write_fmt(format_args!("{}", e))
         }
@@ -191,13 +188,13 @@ impl Error {
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{}", self.kind))?;
+        write!(f, "{}", self.kind)?;
 
         let mut next = self.previous.as_ref();
         while let Some(next_v) = next.map(|v| v.as_ref()) {
             write!(f, "\n    Caused by: {}", next_v.kind())?;
             if let Some(bt) = next_v.backtrace.as_ref() {
-                write!(f, "Backtrace:\n{}", bt)?;
+                write!(f, "\n\nBacktrace:\n{}", bt)?;
             }
             next = next_v.previous.as_ref();
         }

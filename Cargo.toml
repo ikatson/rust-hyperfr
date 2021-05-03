@@ -21,6 +21,9 @@ byteorder = "1"
 rayon = "1"
 
 [profile.release]
-# debug = true
-# opt-level = "s"
-lto = true
+debug = true
+split-debuginfo = "unpacked"
+opt-level = "s"
+
+# We don't care about handling panics, so abort is fine.
+panic = "abort"

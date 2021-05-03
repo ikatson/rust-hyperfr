@@ -1,4 +1,5 @@
 #![feature(backtrace)]
+#![feature(rustc_attrs)]
 
 use aarch64_debug::{DataAbortFlags, Syndrome};
 use bindgen_util::{assert_hv_return_t_ok, null_obj};

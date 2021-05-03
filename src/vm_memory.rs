@@ -35,12 +35,10 @@ impl GuestMemoryMmap {
         Ok(Offset(addr.0 - self.start_addr.0))
     }
 
-    #[inline(never)]
     pub fn get_slice(&self, addr: GuestIpaAddress, size: usize) -> crate::error::Result<&mut [u8]> {
         let offset = self.get_offset_from_start(addr)?.0 as usize;
         let map = unsafe { &mut *self.map.get() };
-        Ok(map
-            .get_mut(offset..(offset + size))
-            .ok_or(Kind::InvalidGuestMemorySlice { ipa: addr, size })?)
+        map.get_mut(offset..(offset + size))
+            .ok_or_else(|| Error::from_kind(Kind::InvalidGuestMemorySlice { ipa: addr, size }))
     }
 }
